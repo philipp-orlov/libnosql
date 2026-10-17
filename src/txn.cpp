@@ -545,16 +545,19 @@ void commitNested(TxnImpl* t)
     t->owned.clear();
     p->pool.insert(p->pool.end(), t->pool.begin(), t->pool.end());
 
-    // Ancestor pages the child copied away from are now unreachable everywhere.
+    // Pages the child copied away from. One of the parent's own private pages
+    // is now unreachable everywhere and can be reused at once. A page private
+    // to an older ancestor is still reachable from that ancestor -- the parent
+    // may yet abort -- so it stays retired until the parent commits into the
+    // level that owns it.
     for (PageNo pgno : t->retiredLocal) {
-        for (TxnImpl* a = p; a; a = a->parent) {
-            if (Page* buf = a->dirty.find(pgno)) {
-                a->pool.push_back(buf);
-                a->dirty.erase(pgno);
-                break;
-            }
+        if (Page* buf = p->dirty.find(pgno)) {
+            p->pool.push_back(buf);
+            p->dirty.erase(pgno);
+            p->loose.push_back(pgno);
+        } else {
+            p->retiredLocal.push_back(pgno);
         }
-        p->loose.push_back(pgno);
     }
     p->loose.insert(p->loose.end(), t->loose.begin(), t->loose.end());
     p->pending.insert(p->pending.end(), t->pending.begin(), t->pending.end());

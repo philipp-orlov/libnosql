@@ -249,7 +249,8 @@ hand you a move-only `Txn` that aborts in its destructor unless you
 `commit()`.
 
 Only one write transaction exists at a time; `writeTxn()` blocks until the
-current one finishes. `Txn::nested()` opens a child transaction — a savepoint.
+current one finishes, and `writeTxn(timeout)` gives up with `ErrorCode::Busy`
+if the writer slot is still taken when the timeout runs out. `Txn::nested()` opens a child transaction — a savepoint.
 The parent is frozen until the child commits (changes fold in) or aborts
 (changes vanish). Nesting is unlimited in depth.
 
@@ -263,6 +264,10 @@ front.
 
 Sub-database descriptors live in a separate catalog tree, not in the main tree, so
 they never show up as rows in it and a user key and a sub-database may share a name.
+On a read transaction, `Txn::db(name)` is answered from a small per-snapshot
+cache of descriptors once any reader of that snapshot has looked the name up, so
+reopening the same sub-database in every short read transaction costs no catalog
+walk.
 
 ### Reading and writing
 
@@ -298,6 +303,10 @@ for (auto [k, v] : d.all())               { }
 for (auto [k, v] : d.between("a", "m"))   { }   // half-open
 for (auto [k, v] : d.prefix("user:"))     { }
 ```
+
+`first(k, v)`, `next(k, v)` and `seek(key, k, v)` move and hand back the entry
+in one call, which is what a tight scan wants: stepping to the next entry of
+the same leaf in a read transaction then costs a few nanoseconds.
 
 `Cursor::erase()` removes the current entry and advances, so deleting while
 iterating is a normal thing to do. Cursors also survive writes made through

@@ -160,3 +160,63 @@ int main()
 {
     return tst::runAll("nested");
 }
+
+// A grandchild that copies away from a page the root dirtied, committed into
+// its parent, which then aborts: the root's page must survive untouched. (It
+// used to be released into the parent's reuse list at the grandchild's
+// commit, so the abort left the root pointing at a recycled page.)
+TEST(grandchildCommitThenParentAbortKeepsRootPages)
+{
+    tst::Scratch s("nested");
+    Env e = Env::configure().open(s.file());
+    e.write([](Txn& t) { t.db("a", DbFlags::Create).put("x", "10"); });
+    e.write([](Txn& t) {
+        t.nested([](Txn& n) { n.db("a").put("q", "1"); });
+        for (int round = 0; round < 3; ++round) {
+            Txn savepoint = t.nested();
+            {
+                Txn statement = savepoint.nested();
+                statement.db("a").put("r", "2");
+                statement.db("a").erase("x");
+                statement.commit();
+            }
+            CHECK(savepoint.db("a").contains("r"));
+            savepoint.abort();
+            CHECK(t.db("a").contains("q"));
+            CHECK(t.db("a").contains("x"));
+            CHECK(!t.db("a").contains("r"));
+            checkIntegrity(t);
+        }
+    });
+    e.read([](Txn& t) {
+        CHECK(t.db("a").contains("q"));
+        CHECK(t.db("a").contains("x"));
+        CHECK(!t.db("a").contains("r"));
+        checkIntegrity(t);
+    });
+}
+
+// Three levels committing upwards still free each level's own copies.
+TEST(deepNestedCommitsReleaseCopiedPages)
+{
+    tst::Scratch s("nested");
+    Env e = Env::configure().open(s.file());
+    e.write([](Txn& t) {
+        auto d = t.db("a", DbFlags::Create);
+        for (int i = 0; i < 200; ++i)
+            d.put("k" + std::to_string(i), std::string(100, 'v'));
+    });
+    e.write([](Txn& t) {
+        for (int round = 0; round < 50; ++round) {
+            Txn a = t.nested();
+            Txn b = a.nested();
+            Txn c = b.nested();
+            c.db("a").put("k" + std::to_string(round), std::string(100, char('a' + round % 26)));
+            c.commit();
+            b.commit();
+            a.commit();
+        }
+        checkIntegrity(t);
+    });
+    e.read([](Txn& t) { checkIntegrity(t); });
+}

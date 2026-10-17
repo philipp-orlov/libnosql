@@ -70,6 +70,32 @@ TEST(readOnlyStoresRejectWriters)
     });
 }
 
+TEST(aTimedWriterGivesUpWhileTheSlotIsTaken)
+{
+    tst::Scratch s("env");
+    Env e = Env::configure().open(s.file());
+    Txn held = e.writeTxn();
+    const auto t0 = std::chrono::steady_clock::now();
+    std::thread other([&] { CHECK_THROWS(e.writeTxn(std::chrono::milliseconds(50)), ErrorCode::Busy); });
+    other.join();
+    CHECK(std::chrono::steady_clock::now() - t0 >= std::chrono::milliseconds(45));
+    held.commit();
+    // Free again: a timed writer gets the slot at once.
+    Txn w = e.writeTxn(std::chrono::milliseconds(50));
+    w.mainDb().put("k", "v");
+    w.commit();
+    // A waiter is woken when the holder finishes inside its timeout.
+    Txn again = e.writeTxn();
+    std::thread waiter([&] {
+        Txn mine = e.writeTxn(std::chrono::seconds(10));
+        CHECK_EQ(mine.mainDb().at("k").string(), std::string("v"));
+        mine.abort();
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    again.abort();
+    waiter.join();
+}
+
 TEST(aSecondProcessStyleOpenIsRefused)
 {
     tst::Scratch s("env");

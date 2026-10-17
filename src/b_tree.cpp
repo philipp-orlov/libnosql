@@ -722,7 +722,7 @@ CompareFn comparatorFor(std::uint32_t flags) noexcept
     return &cmpLexicographic;
 }
 
-Slice leafValue(TxnImpl* t, const Page* p, unsigned i)
+Slice leafValueOverflow(TxnImpl* t, const Page* p, unsigned i)
 {
     const LeafNode* n = lnode(p, i);
     const auto* body = reinterpret_cast<const std::byte*>(n) + sizeof(LeafNode) + n->ksize;

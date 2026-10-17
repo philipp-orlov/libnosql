@@ -138,8 +138,24 @@ Txn Env::writeTxn()
     EnvImpl* e = &openEnv(impl_);
     if (e->readOnly)
         throw Error(ErrorCode::ReadOnly, "store was opened read-only");
-
     e->writeMtx.lock();
+    return beginWriter();
+}
+
+Txn Env::writeTxn(std::chrono::milliseconds timeout)
+{
+    EnvImpl* e = &openEnv(impl_);
+    if (e->readOnly)
+        throw Error(ErrorCode::ReadOnly, "store was opened read-only");
+    if (!e->writeMtx.try_lock_for(timeout))
+        throw Error(ErrorCode::Busy, "another write transaction held the store for " +
+                                         std::to_string(timeout.count()) + " ms");
+    return beginWriter();
+}
+
+Txn Env::beginWriter()
+{
+    EnvImpl* e = &openEnv(impl_);
     std::shared_ptr<TxnImpl> t;
     try {
         if (e->failed.load())
@@ -336,7 +352,35 @@ Db Txn::db(Slice name, DbFlags flags)
 
     Tree tr{};
     bool created = false;
-    if (!treeGetSubdb(t, name, &tr)) {
+    bool found = false;
+    if (t->readOnly) {
+        auto& cache = e->subdbs;
+        std::lock_guard<std::mutex> lk(cache.mtx);
+        if (cache.txnid == t->txnid) {
+            for (const auto& entry : cache.trees) {
+                if (entry.first == name.view()) {
+                    tr = entry.second;
+                    found = true;
+                    break;
+                }
+            }
+        }
+    }
+    if (!found && treeGetSubdb(t, name, &tr)) {
+        found = true;
+        if (t->readOnly) {
+            auto& cache = e->subdbs;
+            std::lock_guard<std::mutex> lk(cache.mtx);
+            if (cache.txnid < t->txnid) {
+                // A newer snapshot: the old entries describe the past.
+                cache.txnid = t->txnid;
+                cache.trees.clear();
+            }
+            if (cache.txnid == t->txnid && cache.trees.size() < cache.kMax)
+                cache.trees.emplace_back(name.string(), tr);
+        }
+    }
+    if (!found) {
         if (!(flags & DbFlags::Create))
             throw Error(ErrorCode::NotFound, "no sub-database named '" + name.string() + "'");
         if (t->readOnly)
@@ -598,6 +642,52 @@ bool Cursor::last()
 bool Cursor::next()
 {
     return cursorNext(attached(impl_));
+}
+
+namespace {
+
+bool landed(CursorImpl& c, bool ok, Slice& key, Slice& value)
+{
+    if (!ok)
+        return false;
+    key = nodeKey(c.pg[c.top], c.idx[c.top]);
+    value = leafValue(c.txn, c.pg[c.top], c.idx[c.top]);
+    return true;
+}
+
+}  // namespace
+
+bool Cursor::first(Slice& key, Slice& value)
+{
+    CursorImpl& c = attached(impl_);
+    return landed(c, cursorFirst(c), key, value);
+}
+
+bool Cursor::next(Slice& key, Slice& value)
+{
+    // The step a scan takes almost every time -- to the next slot of the same
+    // leaf, in a usable transaction nothing has changed under -- without the
+    // checks and re-anchoring the general path does.
+    CursorImpl* c = impl_;
+    if (c && c->positioned && c->top >= 0 && c->txn && !c->txn->finished && !c->txn->child &&
+        (c->txn->readOnly || !c->track) && c->seqSeen == c->txn->root()->seq) {
+        const Page* p = c->pg[c->top];
+        const unsigned i = c->idx[c->top] + 1u;
+        if (i < p->nkeys) {
+            c->idx[c->top] = std::uint16_t(i);
+            key = nodeKey(p, i);
+            value = leafValue(c->txn, p, i);
+            return true;
+        }
+    }
+    CursorImpl& ci = attached(impl_);
+    return landed(ci, cursorNext(ci), key, value);
+}
+
+bool Cursor::seek(Slice k, Slice& key, Slice& value)
+{
+    CursorImpl& c = attached(impl_);
+    return landed(c, cursorSeek(c, k), key, value);
 }
 
 bool Cursor::prev()

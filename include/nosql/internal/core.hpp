@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstring>
@@ -91,10 +92,24 @@ struct EnvImpl
     std::vector<std::shared_ptr<MappedRegion>> staleRegions;
     Meta meta{};  ///< newest committed snapshot
 
+    /// Named sub-database roots as of one committed snapshot. A snapshot's
+    /// directory never changes, so read transactions on the same snapshot
+    /// share their lookups instead of each searching the directory tree --
+    /// one search per sub-database per snapshot, not per transaction. Valid
+    /// only for readers, which pin the snapshot and so its pages.
+    struct SubdbCache
+    {
+        std::mutex mtx;
+        TxnId txnid = 0;
+        std::vector<std::pair<std::string, Tree>> trees;
+        static constexpr std::size_t kMax = 256;
+    } subdbs;
+
     /// Guards `meta`, `region` and the reader table.
     mutable std::mutex mtx;
     /// Serializes write transactions (one writer at a time, in-process).
-    std::mutex writeMtx;
+    /// Timed, so a writer can give up after Env::writeTxn(timeout).
+    std::timed_mutex writeMtx;
 
     /// Id of the newest published commit, mirrored out of `meta` so a waiter
     /// can sample it without taking `mtx`. Waiters block on `mtx`, never on
@@ -373,7 +388,15 @@ void cursorRevalidate(CursorImpl& c);
 
 Slice cursorKey(CursorImpl& c);
 Slice cursorValue(CursorImpl& c);
-Slice leafValue(TxnImpl* t, const Page* p, unsigned i);
+/// The value of leaf node `i`; out of line only for overflow values.
+Slice leafValueOverflow(TxnImpl* t, const Page* p, unsigned i);
+inline Slice leafValue(TxnImpl* t, const Page* p, unsigned i)
+{
+    const LeafNode* n = lnode(p, i);
+    if (!(n->flags & N_BIGDATA))
+        return Slice(reinterpret_cast<const std::byte*>(n) + sizeof(LeafNode) + n->ksize, n->vsize);
+    return leafValueOverflow(t, p, i);
+}
 
 /// Insert or overwrite. `out` (optional) receives the writable value area,
 /// which is what powers Db::reserve. Returns false for the benign

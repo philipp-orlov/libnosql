@@ -23,7 +23,7 @@ enum class ErrorCode
     Incompatible,    ///< sub-database reopened with conflicting flags
     BadTransaction,  ///< operation on a finished/misused transaction
     ReadOnly,
-    Busy,  ///< store already locked by another process
+    Busy,  ///< store locked by another process, or the writer slot stayed taken past a timeout
     IoError,
     OutOfMemory,
 };

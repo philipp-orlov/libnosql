@@ -198,6 +198,13 @@ public:
     /// Position on `k` exactly. False (and unpositioned) if absent.
     bool seekExact(Slice k);
 
+    // Move and read in one call: on success `key` and `value` hold the entry
+    // the cursor landed on, valid as key() and value() would be. Cheaper than
+    // moving and then asking, which a scan does once per entry.
+    bool first(Slice& key, Slice& value);
+    bool next(Slice& key, Slice& value);
+    bool seek(Slice k, Slice& key, Slice& value);
+
     bool put(Slice key, Slice value, PutMode mode = PutMode::Upsert);
     /// Erase the current entry and advance to the next one. False at the end.
     bool erase();
@@ -521,6 +528,9 @@ public:
     /// Begin an explicit transaction. Only one write transaction may be live
     /// at a time; `writeTxn()` blocks until the current one finishes.
     Txn writeTxn();
+    /// The same, but gives up with ErrorCode::Busy if the writer slot is still
+    /// taken after `timeout`.
+    Txn writeTxn(std::chrono::milliseconds timeout);
     Txn readTxn();
 
     /// Scoped form: commits when `fn` returns, aborts if it throws.
@@ -585,6 +595,7 @@ public:
     Env share() const;
 
 private:
+    Txn beginWriter();  // the writer slot is held
     friend class Options;
     friend class Txn;
     explicit Env(std::shared_ptr<internal::EnvImpl> e) noexcept : impl_(std::move(e)) {}

@@ -35,6 +35,28 @@ TEST(iteratesInKeyOrder)
     });
 }
 
+TEST(movingAndReadingInOneCall)
+{
+    tst::Scratch s("cursor");
+    Env e = Env::configure().open(s.file());
+    e.write([](Txn& t) {
+        Db d = t.mainDb();
+        for (const char* k : {"a", "c", "e"})
+            d.put(k, std::string(k) + "!");
+    });
+    e.read([](Txn& t) {
+        Cursor c = t.mainDb().cursor();
+        Slice k, v;
+        std::string seen;
+        for (bool ok = c.first(k, v); ok; ok = c.next(k, v))
+            seen += k.string() + "=" + v.string() + ";";
+        CHECK_EQ(seen, std::string("a=a!;c=c!;e=e!;"));
+        CHECK(c.seek(Slice("b"), k, v));
+        CHECK_EQ(k.string() + v.string(), std::string("cc!"));
+        CHECK(!c.seek(Slice("f"), k, v));
+    });
+}
+
 TEST(reverseIteration)
 {
     tst::Scratch s("cursor");
