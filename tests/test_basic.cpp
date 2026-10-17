@@ -167,7 +167,7 @@ TEST(valuesSurviveManyUpdates)
 TEST(appendModeDemandsAscendingKeys)
 {
     tst::Scratch s("basic");
-    Env e = Env::configure().pageSize(512).open(s.file());
+    Env e = Env::configure().pageSize(1024).open(s.file());
     e.write([](Txn& t) {
         auto d = t.mainDb();
         for (int i = 0; i < 2000; ++i)

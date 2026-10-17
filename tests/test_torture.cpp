@@ -86,11 +86,11 @@ TEST(mixedWorkload4kPages)
     mixedWorkload(4096, 12345, 25, 400, 64);
 }
 
-TEST(mixedWorkload512bPages)
+TEST(mixedWorkloadSmallestPages)
 {
-    // The smallest legal page size: two entries per page, so nearly every write
-    // splits and nearly every erase rebalances.
-    mixedWorkload(512, 987654, 25, 250, 40);
+    // The smallest legal page size: few entries per page, so nearly every
+    // write splits and nearly every erase rebalances.
+    mixedWorkload(1024, 987654, 25, 250, 400);
 }
 
 TEST(mixedWorkloadWithOverflowValues)
@@ -140,7 +140,7 @@ TEST(ascendingBulkLoadThenFullDelete)
 TEST(descendingInsertOrder)
 {
     tst::Scratch s("torture");
-    Env e = Env::configure().pageSize(512).open(s.file());
+    Env e = Env::configure().pageSize(1024).open(s.file());
     e.write([&](Txn& t) {
         auto d = t.mainDb();
         for (int i = 4000; i >= 0; --i)

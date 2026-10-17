@@ -86,6 +86,8 @@ struct CursorPool
         c->anchor.clear();
         c->allowSubdb = false;
         c->track = false;
+        c->hintMisses = 0;
+        c->hintSkip = 0;
         if (count < kCap)
             items[count++] = c;
         else
@@ -226,8 +228,9 @@ EnvStats Env::stats() const
             s.captureFailures = e->ship->failures();
             s.capturedTxnid = e->ship->capturedTxnid();
         }
-        // Pages a commit freed too late to list; the next writer records them.
-        s.freePages = e->carryOver.size();
+        // Pages a commit freed too late to list (the next writer records
+        // them), and the free-list entry kept in the meta page.
+        s.freePages = e->carryOver.size() + e->meta.inlineCount;
     }
 
     Txn rt = const_cast<Env*>(this)->readTxn();
@@ -469,6 +472,16 @@ std::uint64_t Db::count() const
     return t->dbs[dbi_].tree.entries;
 }
 
+std::uint64_t Db::countRange(Slice lo, Slice hi) const
+{
+    TxnImpl* t = live(txn_.get());
+    CursorImpl c = probe(t, dbi_);
+    const std::uint64_t total = t->dbs[dbi_].tree.entries;
+    const std::uint64_t from = lo.empty() ? 0 : treeRank(c, lo);
+    const std::uint64_t to = hi.empty() ? total : treeRank(c, hi);
+    return to > from ? to - from : 0;
+}
+
 TreeStats Db::stats() const
 {
     TxnImpl* t = live(txn_.get());
@@ -528,6 +541,13 @@ DbFlags Db::flags() const
 {
     live(txn_.get());
     return DbFlags(txn_->dbs[dbi_].tree.flags & 0xffffu);
+}
+
+bool Cursor::boundTo(const Db& db) const noexcept
+{
+    // The cursor keeps its transaction alive, so the object cannot have been
+    // recycled for another transaction while the pointers match.
+    return impl_ && db.txn_ && impl_->txn == db.txn_.get() && impl_->dbi == db.dbi_ && !impl_->txn->finished;
 }
 
 Cursor Db::cursor() const
@@ -682,6 +702,30 @@ bool Cursor::next(Slice& key, Slice& value)
     }
     CursorImpl& ci = attached(impl_);
     return landed(ci, cursorNext(ci), key, value);
+}
+
+bool Cursor::skip(std::uint64_t n)
+{
+    CursorImpl& c = attached(impl_);
+    if (n == 0) {
+        cursorRevalidate(c);
+        return c.positioned;
+    }
+    const std::uint64_t at = cursorRank(c);
+    if (at + n < at) {
+        c.unposition();
+        return false;
+    }
+    return treeSelect(c, at + n);
+}
+
+bool Cursor::seekExact(Slice k, Slice& value)
+{
+    CursorImpl& c = attached(impl_);
+    if (!cursorSeekExact(c, k))
+        return false;
+    value = leafValue(c.txn, c.pg[c.top], c.idx[c.top]);
+    return true;
 }
 
 bool Cursor::seek(Slice k, Slice& key, Slice& value)

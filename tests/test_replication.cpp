@@ -463,7 +463,7 @@ TEST(everyCommitShipsEverythingItChanged)
 
     // Small pages, so splits, merges and overflow pages all happen within a
     // few hundred keys.
-    Env e = Env::configure().pageSize(512).sync(Durability::None).shipTo(ship).open(store);
+    Env e = Env::configure().pageSize(1024).sync(Durability::None).shipTo(ship).open(store);
     put(e, 0, 200);
     baseImage(e, replica);
     Checkpoint at = checkpointOf(replica);

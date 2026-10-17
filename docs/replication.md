@@ -1,8 +1,8 @@
 # Replication
 
 Replication ships committed page images from a primary to a closed replica.
-Only store format 6 is supported; bundles and segments carry their own
-version field (5), which is independent of the store format. The public interface is
+Only store format 7 is supported; bundles and segments carry their own
+version field (6), which is independent of the store format. The public interface is
 [replication.hpp](../include/nosql/replication.hpp); wire declarations are in
 [replication_format.hpp](../include/nosql/internal/replication_format.hpp).
 No network transport, leader election, automatic failover or archive transfer
@@ -85,7 +85,7 @@ Readers stop at torn or invalid entries and select a contiguous history with
 checked ancestry. Segments are disposable shipping history, not a recovery log:
 losing them requires a new base, not rolling back a committed primary transaction.
 
-A `.seg.idx` sidecar stores one 512-byte row per complete transaction:
+A `.seg.idx` sidecar stores one 1000-byte row per complete transaction:
 `offset:u64, pageCount:u64, Meta:480, frameChecksum:u64, checksum:u64`.
 XXH3-64 covers the first 504 bytes. Rows follow frame publication. Length,
 contiguous offsets, row checksums and ancestry are checked; missing, torn or

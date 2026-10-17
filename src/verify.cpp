@@ -141,6 +141,8 @@ struct Checker
         for (unsigned i = 0; i < p->nkeys; ++i) {
             const Span sub =
                 walk(branchChild(p, i), tr, cmp, depth + 1, branchPages, leafPages, overflowPages);
+            if (branchCount(p, i) != sub.entries)
+                bad("branch slot's entry count differs from its subtree", pgno);
             span.entries += sub.entries;
             if (sub.lo.empty() && sub.hi.empty())
                 continue;  // empty subtree
@@ -206,6 +208,20 @@ void checkIntegrity(Txn& t)
     c.catalog = false;
     if (c.named.size() != impl->namedDbs)
         throw Error(ErrorCode::Corrupted, "named database count mismatch");
+    // A meta root slot's record overrides the catalog's, which is stale; a
+    // slot must name a tree the catalog has.
+    std::size_t slotted = 0;
+    for (auto& [name, tree] : c.named) {
+        if (const RootSlot* s = findRootSlot(impl->root()->meta, Slice(name))) {
+            tree = s->tree;
+            ++slotted;
+        }
+    }
+    std::size_t slots = 0;
+    for (const RootSlot& s : impl->root()->meta.roots)
+        slots += s.length != 0;
+    if (slotted != slots)
+        throw Error(ErrorCode::Corrupted, "integrity: a meta root slot names no catalog entry");
     for (auto& [name, tree] : c.named) {
         for (const DbSlot& slot : impl->dbs)
             if (slot.loaded && slot.name == name)
@@ -236,9 +252,9 @@ void checkIntegrity(Txn& t)
         }
     }
     if (impl->readOnly) {
-        if (impl->meta.deferredCount > impl->meta.deferredPages.size())
+        if (std::uint64_t(impl->meta.deferredCount) + impl->meta.inlineCount > impl->meta.deferredPages.size())
             throw Error(ErrorCode::Corrupted, "invalid deferred free-page count");
-        for (std::uint64_t index = 0; index < impl->meta.deferredCount; ++index)
+        for (std::uint64_t index = 0; index < std::uint64_t(impl->meta.deferredCount) + impl->meta.inlineCount; ++index)
             c.claim(impl->meta.deferredPages[index]);
         for (PageNo page = 0; page <= impl->lastPgno; ++page)
             if (!(c.seen[page / 64] & (std::uint64_t(1) << (page % 64))))

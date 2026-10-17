@@ -127,6 +127,10 @@ public:
     Slice at(Slice key) const;  ///< throws ErrorCode::NotFound
     bool contains(Slice key) const;
     std::uint64_t count() const;  ///< number of entries
+    /// Entries with keys in [lo, hi); an empty `lo` counts from the first
+    /// entry and an empty `hi` to the last. O(log n): every branch slot
+    /// carries the entry count of its subtree.
+    std::uint64_t countRange(Slice lo, Slice hi) const;
     bool empty() const { return count() == 0; }
     TreeStats stats() const;
 
@@ -204,12 +208,25 @@ public:
     bool first(Slice& key, Slice& value);
     bool next(Slice& key, Slice& value);
     bool seek(Slice k, Slice& key, Slice& value);
+    /// Position on `k` exactly and hand back its value; false (and
+    /// unpositioned) if absent.
+    bool seekExact(Slice k, Slice& value);
 
     bool put(Slice key, Slice value, PutMode mode = PutMode::Upsert);
     /// Erase the current entry and advance to the next one. False at the end.
     bool erase();
 
     class Db db() const;
+
+    /// Moves `n` entries forward without visiting them, in O(log n). False
+    /// (and unpositioned) when that runs past the last entry.
+    bool skip(std::uint64_t n);
+
+    /// True while this cursor reads `db` in its still-open transaction.
+    /// Keeping such a cursor instead of asking `db` for a new one keeps its
+    /// position: a seek near it then stays within the current leaf rather
+    /// than descending from the root.
+    bool boundTo(const class Db& db) const noexcept;
 
 private:
     friend class Db;

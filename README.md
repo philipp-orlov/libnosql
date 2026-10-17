@@ -2,9 +2,11 @@
 
 A single-file, embedded, ACID key/value store in C++17.
 
-**Format 6:** little-endian metadata, in-tree XXH3-64 page/run checksums, a separate database catalog,
-persistent identities, deferred free-page state, and a free list kept in leaf-sized chunks.
-Only format 6 is supported; a format-5 file is rejected as incompatible rather than misread.
+**Format 7:** little-endian metadata, in-tree XXH3-64 page/run checksums, a separate database catalog,
+persistent identities, deferred free-page state, a free list kept in leaf-sized chunks, entry counts
+in every branch slot, and a meta page that carries a small free-list entry and the roots of recently
+written sub-databases. Pages are 1 KiB to 64 KiB. Only format 7 is supported; an older file is rejected
+as incompatible rather than misread (replication bundles and segments moved to version 6 with it).
 `nosql compact source.db compacted.db` builds a separate compacted store;
 archives must be handled separately and physical replication restarts from a new base.
 `Blob::storedChecksum()` returns the 64-bit digest; use
@@ -117,7 +119,7 @@ tar -cf - CMakeLists.txt cmake include src tests examples tools | \
 container such as `std::vector<Slice>`, `std::array<Slice, N>` or a C array.
 Container forwarding does not allocate or copy the input. A null pointer is
 valid only with a zero count. Rebuild consumers after this API change; persisted
-format-6 bytes and checksum values are unchanged.
+format-7 bytes and checksum values are unchanged.
 
 ## Testing in CI/CD
 
@@ -204,7 +206,7 @@ default, so `nosql::Env store("app.db")` works too.
 
 | setting | default | meaning |
 |---|---|---|
-| `pageSize(n)` | 4096 (new store) | power of two in [512, 65536]. An existing store's page size is adopted automatically; pinning a different one is an error. |
+| `pageSize(n)` | 4096 (new store) | power of two in [1024, 65536]. An existing store's page size is adopted automatically; pinning a different one is an error. |
 | `maxSize(n)` | 64 GiB | hard ceiling; exceeding it raises `MapFull`. Address space is *not* reserved up front. A ceiling for a database that owns its disk, not a budget: set it from your own capacity if the volume is shared. |
 | `initialSize(n)` | 16 pages | pre-size the file to avoid early growth. |
 | `growthStep(n)` | max(1 MiB, 64 pages) | minimum growth increment; growth is also geometric. |
@@ -238,7 +240,7 @@ minute), and `Env::invalidateReadCache()` drops them on demand. Write
 transactions and `checkIntegrity(txn)` always verify. The bitmap costs one bit
 per page number of `maxSize` (2 MiB for the 64 GiB default at 4 KiB pages,
 capped at 4 MiB); pages beyond the cap verify on every access. The default keeps
-every-read verification. This option does not change format-6 files, checksum
+every-read verification. This option does not change format-7 files, checksum
 values, durability, or replication.
 
 ### Transactions
@@ -268,6 +270,11 @@ On a read transaction, `Txn::db(name)` is answered from a small per-snapshot
 cache of descriptors once any reader of that snapshot has looked the name up, so
 reopening the same sub-database in every short read transaction costs no catalog
 walk.
+
+The descriptors of up to six recently written sub-databases (names up to 23
+bytes) are kept in the meta page instead, which every commit writes anyway, so
+a commit to one of them rewrites no catalog page; the catalog keeps the name,
+and a descriptor goes back to it when a busier sub-database takes its slot.
 
 ### Reading and writing
 
@@ -304,9 +311,18 @@ for (auto [k, v] : d.between("a", "m"))   { }   // half-open
 for (auto [k, v] : d.prefix("user:"))     { }
 ```
 
-`first(k, v)`, `next(k, v)` and `seek(key, k, v)` move and hand back the entry
-in one call, which is what a tight scan wants: stepping to the next entry of
-the same leaf in a read transaction then costs a few nanoseconds.
+`first(k, v)`, `next(k, v)`, `seek(key, k, v)` and `seekExact(key, v)` move and
+hand back the entry in one call, which is what a tight scan wants: stepping to
+the next entry of the same leaf in a read transaction then costs a few
+nanoseconds. A seek that lands in the leaf the cursor is already on is
+answered there, without descending from the root -- keep the cursor
+(`Cursor::boundTo(db)` says whether it still reads `db` in a live transaction)
+and a run of nearby lookups gets cheaper; a cursor whose seeks keep missing
+stops trying for a while.
+
+Every branch slot records how many entries lie under it, so
+`Db::countRange(lo, hi)` counts a key range and `Cursor::skip(n)` moves `n`
+entries forward in O(log n) instead of visiting them.
 
 `Cursor::erase()` removes the current entry and advances, so deleting while
 iterating is a normal thing to do. Cursors also survive writes made through
@@ -590,8 +606,8 @@ Things worth knowing before relying on it:
 
 * Capture is **off by default** and roughly doubles the bytes a commit writes.
 * Bundle metadata is little-endian and page-size specific. User payload bytes
-  are not schema-converted. The store must be format 6; bundles and segments carry
-  their own version (5), independent of the store format.
+  are not schema-converted. The store must be format 7; bundles and segments carry
+  their own version (6), independent of the store format.
 * `applyBundle` needs the replica **closed** — it takes the same exclusive
   lock opening the store does — and validates the whole bundle before writing
   a temporary replacement. It copies the entire replica, applies pages to the
@@ -634,7 +650,10 @@ version:
   rather than the whole entry. A page becomes reusable once no live snapshot
   predates the transaction that freed it — which is also exactly the rule that
   keeps the *previous* meta page valid, so a torn write always has something
-  good to fall back on.
+  good to fall back on. A commit that freed only a few pages (up to 16) lists
+  them in the meta page instead; the next commit takes them from there first,
+  so a run of small commits writes no free-list page at all. If a reader still
+  pins that entry, the next commit moves it into the tree.
 * The file is mapped read/write and, by default, written by `memcpy` into the map,
   then flushed with a data barrier before meta publication (compile with
   `-DNOSQL_WRITE_THROUGH_MAPPING=0` to write runs with `pwritev` instead). Growing the

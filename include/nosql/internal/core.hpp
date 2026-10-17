@@ -239,6 +239,7 @@ struct TxnImpl
 
     /// Free-list update scratch, kept here so a commit reuses its capacity.
     std::vector<GcKey> gcKeys;
+    std::vector<PageNo> gcRemainder;  ///< updateFreelist scratch, kept between commits
     std::vector<PageNo> gcAdd, gcAcc;
 
     // --- reclaim state, root write transaction only ---
@@ -249,6 +250,12 @@ struct TxnImpl
     std::uint64_t reclaimNextChunk = 0;  ///< ... and the chunk to resume at
     TxnId oldest = 0;             ///< newest GC key we may touch
     bool reclaimDrained = false;
+    /// The snapshot's inline free-list entry (Meta::inlineTxn) went into
+    /// `reclaim`, so the slot is free for this commit's own entry.
+    bool inlineAbsorbed = false;
+    /// This commit's entry went inline: these pages under our txnid.
+    bool inlineOurs = false;
+    std::vector<PageNo> inlinePages;
     /// Set while the commit rewrites the GC tree. It stops the allocator
     /// absorbing *new* GC entries (which would need deleting after the delete
     /// pass has already run), but pages already absorbed stay spendable -- if
@@ -357,6 +364,10 @@ struct CursorImpl
     bool allowSubdb = false;
     /// Transient cursors (single lookups) skip anchor bookkeeping entirely.
     bool track = false;
+    /// Seeks within the current leaf (b_tree.cpp, seekInLeaf): consecutive
+    /// misses, and how many seeks to skip trying after a run of them.
+    std::uint8_t hintMisses = 0;
+    std::uint8_t hintSkip = 0;
 
     Tree& tree() const
     {
@@ -376,6 +387,12 @@ struct CursorImpl
 /// Descend to the leaf that would hold `key`. Sets `*exact` when the key is
 /// present. Returns false only for an empty tree.
 bool treeSearch(CursorImpl& c, Slice key, bool* exact);
+/// Entries whose keys sort before `key`.
+std::uint64_t treeRank(CursorImpl& c, Slice key);
+/// Positions on the entry with zero-based rank `rank`; false past the end.
+bool treeSelect(CursorImpl& c, std::uint64_t rank);
+/// Rank of the entry the cursor is on.
+std::uint64_t cursorRank(CursorImpl& c);
 /// Position on the first key >= `key` / on `key` exactly.
 bool cursorSeek(CursorImpl& c, Slice key);
 bool cursorSeekExact(CursorImpl& c, Slice key);
@@ -411,6 +428,11 @@ void treeDrop(TxnImpl* txn, unsigned dbi);
 /// Named database descriptors live in the catalog.
 bool treeGetSubdb(TxnImpl* t, Slice name, Tree* out);
 void treePutSubdb(TxnImpl* t, Slice name, const Tree& tr);
+/// Commit-time write of a named tree's record: into its meta root slot
+/// when it has or can take one, else into the catalog.
+void treeFlushSubdb(TxnImpl* t, Slice name, const Tree& tr);
+/// The meta root slot holding `name`, if any.
+RootSlot* findRootSlot(Meta& m, Slice name) noexcept;
 bool treeDelSubdb(TxnImpl* t, Slice name);
 std::vector<std::string> treeListSubdbs(TxnImpl* t);
 

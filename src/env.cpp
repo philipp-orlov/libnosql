@@ -258,7 +258,7 @@ void loadMeta(EnvImpl& e)
     if (!best)
         throw Error(ErrorCode::Corrupted, "no usable meta page in " + e.path.string());
     e.meta = *best;
-    if (e.meta.deferredCount > e.meta.deferredPages.size())
+    if (std::uint64_t(e.meta.deferredCount) + e.meta.inlineCount > e.meta.deferredPages.size())
         throw Error(ErrorCode::Corrupted, "invalid deferred free-page count");
     e.carryOver.assign(e.meta.deferredPages.begin(),
                       e.meta.deferredPages.begin() + std::ptrdiff_t(e.meta.deferredCount));
@@ -277,7 +277,7 @@ Env Env::Options::open(const std::filesystem::path& path) const
     using namespace internal;
 
     if (pageSize_ && !legalPageSize(pageSize_))
-        throw Error(ErrorCode::InvalidArgument, "pageSize must be a power of two in [512, 65536]");
+        throw Error(ErrorCode::InvalidArgument, "pageSize must be a power of two in [1024, 65536]");
     if (maxDbs_ < 1)
         throw Error(ErrorCode::InvalidArgument, "maxDbs must be at least 1");
 

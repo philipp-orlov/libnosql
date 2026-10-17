@@ -108,6 +108,9 @@ void TxnImpl::reset()
     reclaimNextChunk = 0;
     oldest = 0;
     reclaimDrained = false;
+    inlineAbsorbed = false;
+    inlineOurs = false;
+    inlinePages.clear();
     noAbsorb = false;
     noSpend = false;
     seq = 1;
@@ -165,7 +168,24 @@ namespace {
 /// transaction no live snapshot can still see are eligible.
 bool reclaimMore(TxnImpl* t)
 {
-    if (t->reclaimDrained || t->noAbsorb)
+    if (t->noAbsorb)
+        return false;
+    // The snapshot's inline entry first: absorbing it costs no tree access.
+    if (!t->inlineAbsorbed && t->meta.inlineCount && t->meta.inlineTxn <= t->oldest) {
+        const std::size_t d = t->meta.deferredCount, n = t->meta.inlineCount;
+        if (d + n > t->meta.deferredPages.size())
+            throw Error(ErrorCode::Corrupted, "invalid inline free-list count");
+        const std::size_t joined = t->reclaim.size();
+        t->reclaim.resize(joined + n);
+        for (std::size_t i = 0; i < n; ++i)
+            t->reclaim[joined + i] = t->meta.deferredPages[d + i];
+        std::sort(t->reclaim.begin() + std::ptrdiff_t(joined), t->reclaim.end());
+        std::inplace_merge(t->reclaim.begin() + std::ptrdiff_t(t->reclaimPos),
+                           t->reclaim.begin() + std::ptrdiff_t(joined), t->reclaim.end());
+        t->inlineAbsorbed = true;
+        return true;
+    }
+    if (t->reclaimDrained)
         return false;
     CursorImpl c;
     c.txn = t;
@@ -198,8 +218,9 @@ bool reclaimMore(TxnImpl* t)
     std::inplace_merge(t->reclaim.begin() + std::ptrdiff_t(t->reclaimPos),
                        t->reclaim.begin() + std::ptrdiff_t(joined), t->reclaim.end());
     t->consumed.emplace_back(key, chunk);
-    t->reclaimNext = key;
-    t->reclaimNextChunk = chunk + 1;
+    // Resume after this chunk; past the last chunk number, at the next id.
+    t->reclaimNext = chunk == kInlineChunk ? key + 1 : key;
+    t->reclaimNextChunk = chunk == kInlineChunk ? 0 : chunk + 1;
     return n > 0;
 }
 
@@ -298,7 +319,7 @@ void flushNamedTrees(TxnImpl* t)
         const DbSlot& slot = t->dbs[i];
         if (!slot.loaded)
             continue;
-        treePutSubdb(t, Slice(slot.name), slot.tree);
+        treeFlushSubdb(t, Slice(slot.name), slot.tree);
         t->dbs[i].dirty = 0;
     }
 }
@@ -330,6 +351,25 @@ void updateFreelist(TxnImpl* t)
     for (const TxnImpl::GcKey& key : t->gcKeys)
         treeDel(c, freeKey(key.first, key.second).slice());
 
+    // An inline entry a reader still pins moves into the tree as an ordinary
+    // entry, freeing the inline slot for ours. Its transaction may have tree
+    // chunks of its own (0, 1, ...), so it takes a chunk number no commit
+    // writes.
+    if (!t->inlineAbsorbed && t->meta.inlineCount) {
+        const std::size_t d = t->meta.deferredCount, n = t->meta.inlineCount;
+        if (d + n > t->meta.deferredPages.size())
+            throw Error(ErrorCode::Corrupted, "invalid inline free-list count");
+        WritableSlice w;
+        if (!treePut(c, freeKey(t->meta.inlineTxn, kInlineChunk).slice(), Slice(nullptr, n * sizeof(PageNo)),
+                     PutMode::InsertUnique, &w))
+            throw Error(ErrorCode::Corrupted, "inline free-list entry is already in the tree");
+        for (std::size_t i = 0; i < n; ++i)
+            writeLittle(w.data() + i * sizeof(PageNo), PageNo(t->meta.deferredPages[d + i]));
+        t->inlineAbsorbed = true;
+    }
+    t->inlineOurs = false;
+    t->inlinePages.clear();
+
     // Record, under this transaction's id, everything it retired plus whatever
     // it absorbed and did not spend, in chunks small enough to sit inline in a
     // leaf. Both sets move while we write them -- writing the entries
@@ -341,6 +381,11 @@ void updateFreelist(TxnImpl* t)
     const std::size_t chunkPages = freeChunkPages(t->pageSize());
     std::size_t written = 0;  ///< chunks currently recorded under our id
     constexpr int kMaxRounds = 8;
+    // At most this many of our retired pages go inline, leaving room in the
+    // meta page's shared array for pages a commit frees too late (deferred).
+    constexpr std::size_t kInlineMax = 16;
+    bool inlineFreed = false;
+    std::vector<PageNo>& remainder = t->gcRemainder;
     for (int round = 0;; ++round) {
         freed.insert(freed.end(), t->pending.begin(), t->pending.end());
         t->pending.clear();
@@ -365,15 +410,24 @@ void updateFreelist(TxnImpl* t)
         if (round + 1 >= kMaxRounds)
             t->noSpend = true;
 
-        const std::size_t chunks = (acc.size() + chunkPages - 1) / chunkPages;
+        // The pages this transaction retired go into the meta page when there
+        // are few of them -- every commit writes that page anyway -- and only
+        // the unspent remainder of what it absorbed goes into the tree. The
+        // next small commit then absorbs the inline entry, needs nothing from
+        // the tree, and writes no free-list page at all.
+        inlineFreed = !freed.empty() && freed.size() <= kInlineMax;
+        const std::vector<PageNo>& record =
+            inlineFreed ? remainder.assign(remainderBegin, t->reclaim.end()), remainder : acc;
+
+        const std::size_t chunks = (record.size() + chunkPages - 1) / chunkPages;
         for (std::size_t i = 0; i < chunks; ++i) {
             const std::size_t first = i * chunkPages;
-            const std::size_t n = std::min(chunkPages, acc.size() - first);
+            const std::size_t n = std::min(chunkPages, record.size() - first);
             WritableSlice w;
             treePut(c, freeKey(t->txnid, i).slice(), Slice(nullptr, n * sizeof(PageNo)),
                     PutMode::Upsert, &w);
             for (std::size_t index = 0; index < n; ++index)
-                writeLittle(w.data() + index * sizeof(PageNo), acc[first + index]);
+                writeLittle(w.data() + index * sizeof(PageNo), record[first + index]);
         }
         // A previous round may have needed more chunks than this one.
         for (std::size_t i = chunks; i < written; ++i)
@@ -387,6 +441,10 @@ void updateFreelist(TxnImpl* t)
         if (settled || round + 1 >= kMaxRounds)
             break;
     }
+    if (inlineFreed) {
+        t->inlinePages.assign(freed.begin(), freed.end());
+        t->inlineOurs = true;
+    }
 
     // Pages freed too late to make it into the entry above roll into the next
     // writer, which records them then. Until then they are referenced by
@@ -394,6 +452,14 @@ void updateFreelist(TxnImpl* t)
     auto& carry = t->env->carryOver;
     carry.insert(carry.end(), t->pending.begin(), t->pending.end());
     carry.insert(carry.end(), t->loose.begin(), t->loose.end());
+    // Both lists share the meta page's array: if they would not fit
+    // together, our retired pages join the deferred ones instead (the next
+    // writer records them under its own id, which is only more cautious).
+    if (t->inlineOurs && carry.size() + t->inlinePages.size() > t->meta.deferredPages.size()) {
+        carry.insert(carry.end(), t->inlinePages.begin(), t->inlinePages.end());
+        t->inlinePages.clear();
+        t->inlineOurs = false;
+    }
     t->pending.clear();
     t->loose.clear();
     t->reclaim.clear();
@@ -510,11 +576,27 @@ void writeMeta(TxnImpl* t)
     m.parentId = t->meta.commitId;
     m.parentChecksum = t->meta.checksum;
     m.commitId = newIdentity();
-    if (e->carryOver.size() > m.deferredPages.size())
+    // The inline slot: ours, or still the snapshot's entry if nothing
+    // absorbed or moved it (then it carries forward unchanged), or empty.
+    std::vector<PageNo> inlineKeep;
+    TxnId inlineTxn = 0;
+    if (t->inlineOurs) {
+        inlineKeep = t->inlinePages;
+        inlineTxn = t->txnid;
+    } else if (!t->inlineAbsorbed && t->meta.inlineCount) {
+        const std::size_t d = t->meta.deferredCount;
+        for (std::size_t i = 0; i < t->meta.inlineCount; ++i)
+            inlineKeep.push_back(t->meta.deferredPages[d + i]);
+        inlineTxn = t->meta.inlineTxn;
+    }
+    if (e->carryOver.size() + inlineKeep.size() > m.deferredPages.size())
         throw Error(ErrorCode::MapFull, "deferred free-page budget exceeded; reduce transaction size");
-    m.deferredCount = e->carryOver.size();
+    m.deferredCount = std::uint32_t(e->carryOver.size());
+    m.inlineCount = std::uint32_t(inlineKeep.size());
+    m.inlineTxn = inlineTxn;
     m.deferredPages = {};
     std::copy(e->carryOver.begin(), e->carryOver.end(), m.deferredPages.begin());
+    std::copy(inlineKeep.begin(), inlineKeep.end(), m.deferredPages.begin() + std::ptrdiff_t(e->carryOver.size()));
     m.checksum = metaChecksum(m);
 
     const unsigned slot = metaSlotFor(t->txnid);

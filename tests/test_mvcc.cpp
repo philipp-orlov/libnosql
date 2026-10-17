@@ -166,7 +166,7 @@ static void checkReadersAcrossGrowth(bool cached)
     // A tiny initial file guarantees several remaps during the run.
     Env e = Env::configure()
                 .cacheReadChecksums(cached)
-                .pageSize(512)
+                .pageSize(1024)
                 .initialSize(8192)
                 .growthStep(4096)
                 .maxSize(1ull << 28)
@@ -202,6 +202,73 @@ TEST(readersStayValidAcrossAStoreGrowth)
 {
     checkReadersAcrossGrowth(false);
     checkReadersAcrossGrowth(true);
+}
+
+namespace {
+
+/// Small commits under now-and-then pinned readers, optionally with large
+/// commits mixed in; integrity checked as it goes and after a reopen.
+/// Returns the store's page count after warm-up and at the end.
+std::pair<std::uint64_t, std::uint64_t> smallCommitWorkload(bool largeToo)
+{
+    tst::Scratch s("mvcc");
+    Env e = Env::configure().open(s.file());
+    e.write([](Txn& t) {
+        Db d = t.mainDb();
+        for (int i = 0; i < 3000; ++i)
+            d.put(tst::keyOf(i), std::string(40, 'v'));
+    });
+    std::vector<Txn> pinned;
+    std::uint64_t usedAfterWarmup = 0;
+    for (int round = 0; round < 3000; ++round) {
+        // Now and then readers hold old snapshots for a while, so a commit
+        // finds the inline entry pinned and has to move it into the tree.
+        if (round % 97 == 0)
+            pinned.push_back(e.readTxn());
+        if (round % 97 == 13)
+            pinned.clear();
+        e.write([&](Txn& t) { t.mainDb().put(tst::keyOf(round % 3000), "u" + std::to_string(round)); });
+        // A large commit leaves a big chunk in the free tree for the small
+        // ones after it to work through.
+        if (largeToo && round % 311 == 7)
+            e.write([&](Txn& t) {
+                Db d = t.mainDb();
+                for (int i = 0; i < 1500; ++i)
+                    d.put(tst::keyOf((i * 7) % 3000), std::string(40, char('a' + round % 26)));
+            });
+        if (round % 250 == 0) {
+            Txn r = e.readTxn();
+            checkIntegrity(r);
+        }
+        if (round == 500)
+            usedAfterWarmup = e.stats().usedPages;
+    }
+    pinned.clear();
+    {
+        Txn r = e.readTxn();
+        checkIntegrity(r);
+        CHECK_EQ(r.mainDb().get(tst::keyOf(2999)).value().string(), std::string("u2999"));
+    }
+    const std::uint64_t usedAtEnd = e.stats().usedPages;
+    e.close();
+    Env again = Env::configure().open(s.file());
+    Txn r = again.readTxn();
+    checkIntegrity(r);
+    return {usedAfterWarmup, usedAtEnd};
+}
+
+}  // namespace
+
+TEST(smallCommitsKeepTheirFreeListInTheMetaPage)
+{
+    // Space is reused: steady small commits do not grow the store.
+    const auto [warm, end] = smallCommitWorkload(false);
+    CHECK(end <= warm + 16);
+}
+
+TEST(smallCommitsAfterLargeOnesStayConsistent)
+{
+    smallCommitWorkload(true);
 }
 
 int main()

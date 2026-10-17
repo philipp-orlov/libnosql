@@ -37,10 +37,10 @@ in the "Terminology" section of `docs/design.md`.
   database that owns its disk rather than a budget). Exceeding it raises
   `ErrorCode::MapFull`; the store stays consistent on its last good commit.
   Raise it by reopening — it is not baked into the file.
-* **Little-endian metadata, opaque user bytes.** Format 6 fields are explicitly
+* **Little-endian metadata, opaque user bytes.** Format 7 fields are explicitly
   little-endian. User values and integer keys written as native object bytes are
   not automatically converted. Big-endian runtime is not yet validated.
-  Only store format 6 is supported.
+  Only store format 7 is supported.
 * **Keys are capped** at roughly a quarter page (1004 bytes at 4 KiB); see
   `Env::maxKeySize()`. Values are capped at 4 GiB. Empty keys are rejected.
 * **64-bit only.** The design maps the whole file, and keeps stale
@@ -95,7 +95,7 @@ in the "Terminology" section of `docs/design.md`.
   free-tree pages in proportion to its size until the pages are reused, and a
   commit that itself retires many pages writes many chunks; that cost is the
   commit's own, not the store's history.
-* **Deferred free metadata is bounded.** Format 6 persists at most 26 late free-page
+* **Deferred free metadata is bounded.** Format 7 persists at most 26 late free-page
   numbers in Meta. Exceeding that bound fails the commit and requires reopen;
   the pages are never silently discarded after an acknowledged commit.
 * **Overflow runs longer than one page are only reclaimed as whole runs, and a
@@ -139,7 +139,7 @@ strike against it; libsql adds one on top), the storage-engine-level gaps are re
   update pages in place and defer the expensive full-page write to a
   checkpoint, decoupled from commit latency. Skewed hot-key writes or large
   multi-row transactions cost structurally more here.
-* **Checksum verification has a read cost.** Format 6 verifies leaf/branch XXH3-64 hashes
+* **Checksum verification has a read cost.** Format 7 verifies leaf/branch XXH3-64 hashes
   and whole-overflow-run hashes on every committed-page access by default.
   `cacheReadChecksums()` opts readers into an environment-wide bitmap of
   successful checks that the writer keeps exact for its own writes and that is

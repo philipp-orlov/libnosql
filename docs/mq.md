@@ -23,7 +23,7 @@ removes it (it needs `NOSQL_WITH_BLOB`).
   original sequence, so it keeps its place rather than overtaking fresh traffic.
 - Queue records and sequence keys use little-endian integers; bodies and the opaque
   queue identity are not converted. Queue records are the same in store formats 5 and 6;
-  only store format 6 is supported.
+  only store format 7 is supported.
 - One writer at a time, in one process, as for the store itself. Any number of
   threads may send and receive; writes serialise on the store's writer.
 - Options are per handle and are not persisted. Applications must open every handle

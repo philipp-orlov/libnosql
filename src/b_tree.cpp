@@ -67,7 +67,7 @@ std::byte* nodeAddLeaf(Page* p, unsigned i, Slice key, std::uint32_t vsize,
     return body + key.size();
 }
 
-void nodeAddBranch(Page* p, unsigned i, Slice key, PageNo child) noexcept
+void nodeAddBranch(Page* p, unsigned i, Slice key, PageNo child, std::uint64_t count) noexcept
 {
     const std::size_t sz = branchNodeSize(key.size());
     p->upper = std::uint16_t(p->upper - sz);
@@ -75,6 +75,8 @@ void nodeAddBranch(Page* p, unsigned i, Slice key, PageNo child) noexcept
     n->ksize = std::uint16_t(key.size());
     n->childLo = std::uint32_t(child);
     n->childHi = std::uint16_t(child >> 32);
+    n->countLo = std::uint32_t(count);
+    n->countHi = std::uint32_t(count >> 32);
     if (key.size())
         std::memcpy(reinterpret_cast<std::byte*>(n) + sizeof(BranchNode), key.data(), key.size());
     slotInsert(p, i, p->upper);
@@ -109,10 +111,11 @@ bool branchSetKey(Page* p, unsigned i, Slice key) noexcept
         return true;
     }
     const PageNo child = branchChild(p, i);
+    const std::uint64_t count = branchCount(p, i);
     if (pageRoom(p) + nodeSize(p, i) < branchNodeSize(key.size()))
         return false;
     nodeDel(p, i);
-    nodeAddBranch(p, i, key, child);
+    nodeAddBranch(p, i, key, child, count);
     return true;
 }
 
@@ -261,6 +264,7 @@ struct Entry
     std::uint32_t vsize = 0;         ///< logical value length
     std::uint16_t flags = 0;
     PageNo child = 0;
+    std::uint64_t count = 0;  ///< branch entries: leaf entries under `child`
 };
 
 Entry readEntry(const Page* p, unsigned i)
@@ -275,6 +279,7 @@ Entry readEntry(const Page* p, unsigned i)
         e.pay = reinterpret_cast<const std::byte*>(n) + sizeof(LeafNode) + n->ksize;
     } else {
         e.child = branchChild(p, i);
+        e.count = branchCount(p, i);
     }
     return e;
 }
@@ -288,7 +293,7 @@ std::size_t entryCost(const Entry& e, bool leaf) noexcept
 void emit(Page* p, unsigned at, const Entry& e, bool leaf) noexcept
 {
     if (!leaf) {
-        nodeAddBranch(p, at, e.key, e.child);
+        nodeAddBranch(p, at, e.key, e.child, e.count);
         return;
     }
     std::byte* dst = nodeAddLeaf(p, at, e.key, e.vsize, e.flags);
@@ -334,19 +339,28 @@ unsigned chooseSplit(const Entry* e, unsigned n, unsigned newindx, bool leaf, st
 
 void splitPage(CursorImpl& c, int level, unsigned newindx, const Entry& ne);
 
-/// Insert (key -> child) just after the child the cursor descended through
-/// at `level`, splitting that branch page if it is full.
-void branchInsert(CursorImpl& c, int level, Slice key, PageNo child)
+/// Adds `delta` to the counts of the branch slots on the cursor's path
+/// above `top` (the path must already be ours).
+void adjustPathCounts(CursorImpl& c, std::int64_t delta) noexcept
+{
+    for (int i = 0; i < c.top; ++i)
+        setBranchCount(c.pg[i], c.idx[i], std::uint64_t(std::int64_t(branchCount(c.pg[i], c.idx[i])) + delta));
+}
+
+/// Insert (key -> child, holding `count` entries) just after the child the
+/// cursor descended through at `level`, splitting that branch page if full.
+void branchInsert(CursorImpl& c, int level, Slice key, PageNo child, std::uint64_t count)
 {
     Page* p = c.pg[level];
     const unsigned at = c.idx[level] + 1;
     if (pageRoom(p) >= branchNodeSize(key.size()) + 2) {
-        nodeAddBranch(p, at, key, child);
+        nodeAddBranch(p, at, key, child, count);
         return;
     }
     Entry ne;
     ne.key = key;
     ne.child = child;
+    ne.count = count;
     splitPage(c, level, at, ne);
 }
 
@@ -386,7 +400,7 @@ void splitPage(CursorImpl& c, int level, unsigned newindx, const Entry& ne)
         const PageNo rn = t->allocPages(1);
         Page* rp = t->allocBuffer(rn, P_BRANCH, 1);
         pageInit(rp, rn, P_BRANCH, ps);
-        nodeAddBranch(rp, 0, Slice(), mp->pgno);  // -infinity child
+        nodeAddBranch(rp, 0, Slice(), mp->pgno, 0);  // -infinity child; counted below
         for (int i = c.top; i >= 0; --i) {
             c.pg[i + 1] = c.pg[i];
             c.idx[i + 1] = c.idx[i];
@@ -411,9 +425,17 @@ void splitPage(CursorImpl& c, int level, unsigned newindx, const Entry& ne)
     else
         ++tr.branchPages;
 
+    // Entry counts of the two halves. The parent's slot for `mp` gets the left
+    // one now, while the cursor still points at it; the right one travels
+    // with the new slot, through any cascade of splits above.
+    std::uint64_t leftCount = 0, rightCount = 0;
+    for (unsigned i = 0; i < count; ++i)
+        (i < split ? leftCount : rightCount) += leaf ? 1 : ents[i].count;
+    setBranchCount(c.pg[level - 1], c.idx[level - 1], leftCount);
+
     // Promote the separator first. This may cascade all the way to a new root,
     // but it never touches `mp` or `np`, so the pointers below stay good.
-    branchInsert(c, level - 1, ents[split].key, sn);
+    branchInsert(c, level - 1, ents[split].key, sn, rightCount);
 
     pageInit(mp, mp->pgno, mp->flags, ps);
     for (unsigned i = 0; i < count; ++i) {
@@ -519,6 +541,7 @@ void rebalance(CursorImpl& c)
         std::ptrdiff_t(pageUsed(left, ps)) + std::ptrdiff_t(pageUsed(right, ps)) + sepDelta;
 
     if (merged <= std::ptrdiff_t(usable)) {
+        setBranchCount(parent, ridx - 1, branchCount(parent, ridx - 1) + branchCount(parent, ridx));
         for (unsigned i = 0; i < right->nkeys; ++i) {
             Entry e = readEntry(right, i);
             if (!leaf && i == 0)
@@ -561,6 +584,9 @@ void rebalance(CursorImpl& c)
         nodeDel(right, 0);
         if (!leaf)
             branchSetKey(right, 0, Slice());  // new -infinity child
+        const std::uint64_t moved = leaf ? 1 : e.count;
+        setBranchCount(parent, ridx - 1, branchCount(parent, ridx - 1) + moved);
+        setBranchCount(parent, ridx, branchCount(parent, ridx) - moved);
         branchSetKey(parent, ridx, newsep);
     } else {
         if (left->nkeys <= donorMin)
@@ -588,6 +614,9 @@ void rebalance(CursorImpl& c)
             e.key = Slice();  // it becomes the new -infinity child
         emit(right, 0, e, leaf);
         nodeDel(left, left->nkeys - 1);
+        const std::uint64_t moved = leaf ? 1 : e.count;
+        setBranchCount(parent, ridx - 1, branchCount(parent, ridx - 1) - moved);
+        setBranchCount(parent, ridx, branchCount(parent, ridx) + moved);
         branchSetKey(parent, ridx, movedKey);
     }
     t->markDirty(c.dbi);
@@ -759,6 +788,91 @@ bool treeSearch(CursorImpl& c, Slice key, bool* exact)
     }
     c.idx[c.top] = std::uint16_t(leafLowerBound(c.pg[c.top], key, cmp, exact));
     return true;
+}
+
+namespace {
+
+void checkIntegerKey(const Tree& tr, Slice key)
+{
+    if ((tr.flags & std::uint32_t(DbFlags::IntegerKey)) != 0) {
+        const unsigned width = tr.flags >> 16;
+        if ((key.size() != 4 && key.size() != 8) || (width && key.size() != width))
+            throw Error(ErrorCode::InvalidArgument, "integer key width differs from the tree");
+    }
+}
+
+}  // namespace
+
+std::uint64_t treeRank(CursorImpl& c, Slice key)
+{
+    Tree& tr = c.tree();
+    if (tr.root == kInvalidPage)
+        return 0;
+    checkIntegerKey(tr, key);
+    const CompareFn cmp = c.cmp();
+    std::uint64_t rank = 0;
+    const Page* p = c.txn->getPage(tr.root);
+    for (int depth = 0; isBranch(p); ++depth) {
+        if (p->nkeys == 0)
+            throw Error(ErrorCode::Corrupted, "empty branch page");
+        if (depth + 1 >= kMaxDepth)
+            throw Error(ErrorCode::Corrupted, "b-tree exceeded maximum depth");
+        // Every subtree left of the one `key` belongs in sorts before it.
+        const unsigned i = branchSearch(p, key, cmp);
+        for (unsigned j = 0; j < i; ++j)
+            rank += branchCount(p, j);
+        p = c.txn->getPage(branchChild(p, i));
+    }
+    bool exact = false;
+    return rank + leafLowerBound(p, key, cmp, &exact);
+}
+
+bool treeSelect(CursorImpl& c, std::uint64_t rank)
+{
+    c.seqSeen = c.txn->root()->seq;
+    Tree& tr = c.tree();
+    if (tr.root == kInvalidPage || rank >= tr.entries) {
+        c.unposition();
+        return false;
+    }
+    c.top = 0;
+    c.pg[0] = c.txn->getPage(tr.root);
+    while (isBranch(c.pg[c.top])) {
+        const Page* p = c.pg[c.top];
+        unsigned j = 0;
+        for (; j < p->nkeys; ++j) {
+            const std::uint64_t n = branchCount(p, j);
+            if (rank < n)
+                break;
+            rank -= n;
+        }
+        if (j == p->nkeys)
+            throw Error(ErrorCode::Corrupted, "branch entry counts fall short of the tree's");
+        if (c.top + 1 >= kMaxDepth)
+            throw Error(ErrorCode::Corrupted, "b-tree exceeded maximum depth");
+        c.idx[c.top] = std::uint16_t(j);
+        c.pg[c.top + 1] = c.txn->getPage(branchChild(p, j));
+        ++c.top;
+    }
+    if (rank >= c.pg[c.top]->nkeys)
+        throw Error(ErrorCode::Corrupted, "branch entry count exceeds its leaf");
+    c.idx[c.top] = std::uint16_t(rank);
+    c.positioned = true;
+    setAnchor(c);
+    return true;
+}
+
+std::uint64_t cursorRank(CursorImpl& c)
+{
+    cursorRevalidate(c);
+    if (!c.positioned)
+        throw Error(ErrorCode::NotFound, "cursor is not positioned");
+    std::uint64_t rank = c.idx[c.top];
+    for (int lvl = 0; lvl < c.top; ++lvl) {
+        for (unsigned j = 0; j < c.idx[lvl]; ++j)
+            rank += branchCount(c.pg[lvl], j);
+    }
+    return rank;
 }
 
 void cursorRevalidate(CursorImpl& c)
@@ -1033,6 +1147,10 @@ bool treePut(CursorImpl& c, Slice key, Slice value, PutMode mode, WritableSlice*
     // Re-read: overflowCreate may have handed out pages, but never moved ours.
     p = c.pg[c.top];
     at = c.idx[c.top];
+    // A new key adds one entry under every branch slot on the way down; a
+    // split below fixes up the slots it divides.
+    if (!exact)
+        adjustPathCounts(c, 1);
     std::byte* payload;
     if (pageRoom(p) >= entryCost(ne, true)) {
         payload = nodeAddLeaf(p, at, key, ne.vsize, ne.flags);
@@ -1076,6 +1194,7 @@ void treeDelCurrent(CursorImpl& c)
     if (n->flags & N_BIGDATA)
         overflowRelease(t, tr, bigPgno(n));
     nodeDel(p, i);
+    adjustPathCounts(c, -1);
     --tr.entries;
     t->markDirty(c.dbi);
     rebalance(c);
@@ -1100,10 +1219,52 @@ bool treeDel(CursorImpl& c, Slice key)
     return true;
 }
 
+namespace {
+
+/// Repositions within the cursor's current leaf when `key` belongs there:
+/// the cursor is positioned, nothing has changed the tree since, and `key`
+/// lies between the leaf's first and last key. Saves the descent from the
+/// root that a seek near the previous one would otherwise repeat.
+bool seekInLeaf(CursorImpl& c, Slice key, bool* exact)
+{
+    // Probes that keep missing are not local: stop paying for the check for
+    // a while, then look again.
+    if (c.hintSkip) {
+        --c.hintSkip;
+        return false;
+    }
+    if (!c.positioned || c.top < 0 || c.seqSeen != c.txn->root()->seq)
+        return false;
+    const Page* p = c.pg[c.top];
+    const unsigned n = p->nkeys;
+    if (n == 0 || !isLeaf(p))
+        return false;
+    const Tree& tr = c.tree();
+    if ((tr.flags & std::uint32_t(DbFlags::IntegerKey)) != 0)
+        return false;
+    const CompareFn cmp = comparatorFor(tr.flags);
+    if (cmp(key, nodeKey(p, n - 1)) > 0 || cmp(key, nodeKey(p, 0)) < 0) {
+        if (++c.hintMisses >= 2) {
+            c.hintMisses = 0;
+            c.hintSkip = 32;
+        }
+        return false;
+    }
+    c.hintMisses = 0;
+    c.idx[c.top] = std::uint16_t(leafLowerBound(p, key, cmp, exact));
+    return true;
+}
+
+}  // namespace
+
 bool cursorSeek(CursorImpl& c, Slice key)
 {
-    c.seqSeen = c.txn->root()->seq;
     bool exact = false;
+    if (seekInLeaf(c, key, &exact)) {
+        setAnchor(c);
+        return true;
+    }
+    c.seqSeen = c.txn->root()->seq;
     if (!treeSearch(c, key, &exact) || !normalizeForward(c)) {
         c.unposition();
         return false;
@@ -1115,8 +1276,16 @@ bool cursorSeek(CursorImpl& c, Slice key)
 
 bool cursorSeekExact(CursorImpl& c, Slice key)
 {
-    c.seqSeen = c.txn->root()->seq;
     bool exact = false;
+    if (seekInLeaf(c, key, &exact)) {
+        if (!exact) {
+            c.unposition();
+            return false;
+        }
+        setAnchor(c);
+        return true;
+    }
+    c.seqSeen = c.txn->root()->seq;
     if (!treeSearch(c, key, &exact) || !exact) {
         c.unposition();
         return false;
@@ -1142,7 +1311,50 @@ bool treeGetSubdb(TxnImpl* t, Slice name, Tree* out)
     if (n->vsize != sizeof(Tree))
         throw Error(ErrorCode::Corrupted, "malformed sub-database record");
     std::memcpy(out, leafValue(t, c.pg[c.top], c.idx[c.top]).data(), sizeof(Tree));
+    if (const RootSlot* s = findRootSlot(t->root()->meta, name))
+        *out = s->tree;
     return true;
+}
+
+RootSlot* findRootSlot(Meta& m, Slice name) noexcept
+{
+    if (name.empty() || name.size() > kRootNameMax)
+        return nullptr;
+    for (RootSlot& s : m.roots) {
+        if (s.length == name.size() && std::memcmp(s.name, name.data(), name.size()) == 0)
+            return &s;
+    }
+    return nullptr;
+}
+
+void treeFlushSubdb(TxnImpl* t, Slice name, const Tree& tr)
+{
+    TxnImpl* r = t->root();
+    Meta& m = r->meta;
+    RootSlot* slot = findRootSlot(m, name);
+    if (!slot && !name.empty() && name.size() <= kRootNameMax) {
+        // An empty slot, else the one written longest ago, whose record goes
+        // back to the catalog.
+        for (RootSlot& s : m.roots) {
+            if (s.length == 0) {
+                slot = &s;
+                break;
+            }
+            if (!slot || s.written < slot->written)
+                slot = &s;
+        }
+        if (slot->length)
+            treePutSubdb(t, Slice(slot->name, slot->length), slot->tree);
+        std::memset(slot->name, 0, sizeof slot->name);
+        std::memcpy(slot->name, name.data(), name.size());
+        slot->length = std::uint8_t(name.size());
+    }
+    if (!slot) {
+        treePutSubdb(t, name, tr);
+        return;
+    }
+    slot->tree = tr;
+    slot->written = r->txnid;
 }
 
 void treePutSubdb(TxnImpl* t, Slice name, const Tree& tr)
@@ -1159,6 +1371,8 @@ void treePutSubdb(TxnImpl* t, Slice name, const Tree& tr)
 
 bool treeDelSubdb(TxnImpl* t, Slice name)
 {
+    if (RootSlot* s = findRootSlot(t->root()->meta, name))
+        *s = RootSlot{};
     CursorImpl c;
     c.txn = t;
     c.dbi = kCatalogDbi;

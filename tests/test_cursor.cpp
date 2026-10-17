@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Philipp Orlov
 // SPDX-License-Identifier: Apache-2.0
 
+#include <map>
+#include <random>
 #include <set>
 
 #include "nosql/nosql.hpp"
@@ -231,6 +233,190 @@ TEST(emptyDatabaseIteratesZeroTimes)
         }
         CHECK_EQ(n, 0);
     });
+}
+
+namespace {
+
+std::string randomKey(std::mt19937_64& rng)
+{
+    // Mostly short, sometimes long enough to make branch pages split early.
+    const std::size_t n = rng() % 8 == 0 ? 40 + rng() % 120 : 1 + rng() % 12;
+    std::string k(n, 'a');
+    for (char& ch : k)
+        ch = char('a' + rng() % 26);
+    return k;
+}
+
+std::string randomValue(std::mt19937_64& rng)
+{
+    const std::size_t n = rng() % 50 == 0 ? 3000 + rng() % 6000 : rng() % 200;
+    return std::string(n, char('0' + rng() % 10));
+}
+
+/// Every count the tree can answer, against the model.
+void checkCounts(Txn& t, const std::map<std::string, std::string>& model, std::mt19937_64& rng)
+{
+    checkIntegrity(t);
+    Db d = t.mainDb();
+    CHECK_EQ(d.count(), std::uint64_t(model.size()));
+    CHECK_EQ(d.countRange(Slice(), Slice()), std::uint64_t(model.size()));
+    for (int q = 0; q < 40; ++q) {
+        std::string lo = randomKey(rng), hi = randomKey(rng);
+        if (hi < lo)
+            std::swap(lo, hi);
+        const auto want = std::uint64_t(std::distance(model.lower_bound(lo), model.lower_bound(hi)));
+        CHECK_EQ(d.countRange(lo, hi), want);
+        CHECK_EQ(d.countRange(Slice(), hi), std::uint64_t(std::distance(model.begin(), model.lower_bound(hi))));
+        CHECK_EQ(d.countRange(lo, Slice()), std::uint64_t(std::distance(model.lower_bound(lo), model.end())));
+    }
+    if (model.empty())
+        return;
+    for (int q = 0; q < 20; ++q) {
+        Cursor c = d.cursor();
+        const std::string from = randomKey(rng);
+        auto it = model.lower_bound(from);
+        if (!c.seek(from)) {
+            CHECK(it == model.end());
+            continue;
+        }
+        const std::uint64_t n = rng() % 3 == 0 ? rng() % 5 : rng() % (model.size() + 10);
+        const std::uint64_t left = std::uint64_t(std::distance(it, model.end())) - 1;
+        if (n > left) {
+            CHECK(!c.skip(n));
+            continue;
+        }
+        CHECK(c.skip(n));
+        std::advance(it, std::ptrdiff_t(n));
+        CHECK_EQ(c.key().string(), it->first);
+        CHECK_EQ(c.value().string(), it->second);
+    }
+}
+
+}  // namespace
+
+TEST(branchCountsSurviveEverySplitAndMerge)
+{
+    tst::Scratch s("cursor");
+    Env e = Env::configure().open(s.file());
+    std::mt19937_64 rng(42);
+    std::map<std::string, std::string> model;
+    for (int round = 0; round < 40; ++round) {
+        Txn t = e.writeTxn();
+        Db d = t.mainDb();
+        // Grow early rounds, shrink late ones, so pages split, merge, shift
+        // and the root grows and collapses.
+        const int ops = 600;
+        const bool shrinking = round >= 25;
+        for (int i = 0; i < ops; ++i) {
+            const unsigned what = unsigned(rng() % 10);
+            if ((shrinking && what < 6) || (!shrinking && what < 2)) {
+                if (model.empty())
+                    continue;
+                auto it = model.lower_bound(randomKey(rng));
+                if (it == model.end())
+                    it = model.begin();
+                CHECK(d.erase(it->first));
+                model.erase(it);
+            } else {
+                const std::string k = what == 9 && !model.empty() ? model.begin()->first : randomKey(rng);
+                const std::string v = randomValue(rng);
+                d.put(k, v);
+                model[k] = v;
+            }
+        }
+        // A nested transaction whose changes are thrown away must leave the
+        // counts as they were.
+        {
+            Txn n = t.nested();
+            Db nd = n.mainDb();
+            for (int i = 0; i < 300; ++i)
+                nd.put(randomKey(rng), randomValue(rng));
+            n.abort();
+        }
+        checkCounts(t, model, rng);
+        t.commit();
+        Txn r = e.readTxn();
+        checkCounts(r, model, rng);
+    }
+    // Down to nothing and back.
+    e.write([&](Txn& t) {
+        Db d = t.mainDb();
+        for (const auto& [k, v] : model)
+            CHECK(d.erase(k));
+        model.clear();
+        checkCounts(t, model, rng);
+        for (int i = 0; i < 3000; ++i) {
+            const std::string k = tst::keyOf(i);
+            d.put(k, "v");
+            model[k] = "v";
+        }
+        checkCounts(t, model, rng);
+    });
+}
+
+TEST(seeksNearTheLastOneStayCorrect)
+{
+    tst::Scratch s("cursor");
+    Env e = Env::configure().open(s.file());
+    std::map<std::string, std::string> model;
+    e.write([&](Txn& t) {
+        Db d = t.mainDb();
+        for (int i = 0; i < 20000; i += 2) {
+            d.put(tst::keyOf(i), "v" + std::to_string(i));
+            model[tst::keyOf(i)] = "v" + std::to_string(i);
+        }
+    });
+    std::mt19937_64 rng(7);
+    auto probe = [&](Cursor& c, int target) {
+        const std::string k = tst::keyOf(target);
+        const auto it = model.lower_bound(k);
+        const bool ok = c.seek(k);
+        CHECK_EQ(ok, it != model.end());
+        if (ok)
+            CHECK_EQ(c.key().string(), it->first);
+        Slice v;
+        const bool exact = c.seekExact(k, v);
+        CHECK_EQ(exact, model.count(k) == 1);
+        if (exact)
+            CHECK_EQ(v.string(), model[k]);
+    };
+    e.read([&](Txn& t) {
+        Cursor c = t.mainDb().cursor();
+        CHECK(c.boundTo(t.mainDb()));
+        // Ascending neighbours (the leaf hint hits), then random jumps (it
+        // misses and backs off), then neighbours again.
+        for (int i = 0; i < 3000; ++i)
+            probe(c, 5000 + i);
+        for (int i = 0; i < 3000; ++i)
+            probe(c, int(rng() % 21000));
+        for (int i = 0; i < 3000; ++i)
+            probe(c, 15000 - i);
+    });
+    // In a write transaction a write in between must stop the hint from
+    // trusting a page that has changed.
+    e.write([&](Txn& t) {
+        Db d = t.mainDb();
+        Cursor c = d.cursor();
+        for (int i = 0; i < 4000; ++i) {
+            probe(c, 8000 + i);
+            if (i % 7 == 0) {
+                const std::string k = tst::keyOf(8000 + i + 1);
+                d.put(k, "w");
+                model[k] = "w";
+            }
+            if (i % 11 == 0) {
+                const std::string k = tst::keyOf(8000 + i + 2);
+                d.erase(k);
+                model.erase(k);
+            }
+        }
+        checkIntegrity(t);
+    });
+    Txn r = e.readTxn();
+    Cursor stale = r.mainDb().cursor();
+    r.abort();
+    Txn r2 = e.readTxn();
+    CHECK(!stale.boundTo(r2.mainDb()));
 }
 
 int main()

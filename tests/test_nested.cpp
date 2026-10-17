@@ -66,7 +66,7 @@ TEST(nestedExceptionRollsTheChildBack)
 TEST(deeplyNestedTransactions)
 {
     tst::Scratch s("nested");
-    Env e = Env::configure().pageSize(512).open(s.file());
+    Env e = Env::configure().pageSize(1024).open(s.file());
     e.write([](Txn& t) {
         t.mainDb().put("d0", "v");
         t.nested([](Txn& n1) {
@@ -135,7 +135,7 @@ TEST(parentIsFrozenWhileAChildIsOpen)
 TEST(abortedChildPagesAreReusable)
 {
     tst::Scratch s("nested");
-    Env e = Env::configure().pageSize(512).open(s.file());
+    Env e = Env::configure().pageSize(1024).open(s.file());
     e.write([](Txn& t) {
         for (int i = 0; i < 200; ++i)
             t.mainDb().put(tst::keyOf(i), tst::blob(80, i));

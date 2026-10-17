@@ -1,25 +1,28 @@
-# On-disk Format 6
+# On-disk Format 7
 
-Format 6 is the only store format this code reads or writes. It uses independently
+Format 7 is the only store format this code reads or writes. It uses independently
 implemented XXH3-64 checksums, little-endian metadata,
-a separate catalog, and a free list kept in leaf-sized chunks under 16-byte keys.
-No third-party checksum code or library is included. Meta is 480 bytes and the
-slotted-page header is 16 bytes. Opening a store of any other format version,
-format 5 included, fails with `ErrorCode::Incompatible` for both read-only
-and writable open; nothing is converted.
+a separate catalog, a free list kept in leaf-sized chunks under 16-byte keys,
+entry counts in every branch slot, and a meta record that also carries a small
+free-list entry and the root descriptors of up to six sub-databases.
+No third-party checksum code or library is included. Meta is 968 bytes and the
+slotted-page header is 16 bytes; pages are 1 KiB to 64 KiB. Opening a store of
+any other format version, 5 and 6 included, fails with `ErrorCode::Incompatible`
+for both read-only and writable open; nothing is converted.
 
 Three version numbers appear in the persisted bytes and are independent of each other:
 
 | where | value | constant |
 |---|---|---|
-| store meta `version` (this document) | 6 | `kFormatVersion` in `format.hpp` |
-| replication bundle and segment headers | 5 | `kReplicationVersion` in `replication_format.hpp` |
+| store meta `version` (this document) | 7 | `kFormatVersion` in `format.hpp` |
+| replication bundle and segment headers | 6 | `kReplicationVersion` in `replication_format.hpp` |
 | blob index record prefix | 5 | the literal in `blob_storage.cpp` |
 
-The replication and blob-index versions did not change when the store format moved
-from 5 to 6, so a "5" next to "bundle" or "blob index" is not a stale store format.
+Segment index rows embed the Meta record, so the replication version moved
+with format 7; the blob-index version did not change, so a "5" next to "blob
+index" is not a stale store format.
 
-`nosql compact source.db compacted.db` builds a separate format-6 store with
+`nosql compact source.db compacted.db` builds a separate format-7 store with
 new store/commit identities. It does not copy archives or convert application
 schemas. Replication restarts from a fresh snapshot of the compacted store.
 
@@ -123,7 +126,7 @@ meta page. Identity fields are opaque 16-byte tokens.
 | Offset | Bytes | Field |
 |---|---|---|
 | 0 | 16 | magic, `NOSQL-ORLOV`, NUL padded |
-| 16 | 4 | version = 6 |
+| 16 | 4 | version = 7 |
 | 20 | 4 | pageSize |
 | 24 | 8 | txnid |
 | 32 | 8 | lastPgno |
@@ -136,12 +139,18 @@ meta page. Identity fields are opaque 16-byte tokens.
 | 176 | 16 | commitId |
 | 192 | 16 | parentId |
 | 208 | 8 | parentChecksum |
-| 216 | 8 | deferredCount, at most 26 |
-| 224 | 208 | deferredPages[26], unused entries zero |
-| 432 | 48 | catalogTree |
+| 216 | 4 | deferredCount |
+| 220 | 4 | inlineCount; deferredCount + inlineCount at most 26 |
+| 224 | 8 | inlineTxn |
+| 232 | 208 | deferredPages[26]: deferredCount deferred pages, then inlineCount inline free-list pages; unused entries zero |
+| 440 | 48 | catalogTree |
+| 488 | 480 | roots[6]: sub-database root slots, 80 bytes each |
 
-Meta checksum: copy the 480-byte record, zero bytes 152..159, and hash all
-480 bytes with XXH3-64. Replace a zero result with 1.
+A root slot is `name[23]` (NUL padded), `length` (1 byte; 0 for an empty
+slot), a 48-byte Tree descriptor and an 8-byte `written` txnid.
+
+Meta checksum: copy the 968-byte record, zero bytes 152..159, and hash all
+968 bytes with XXH3-64. Replace a zero result with 1.
 Checksums detect errors; store/commit identities distinguish histories.
 
 New stores receive independent 128-bit store and initial commit identities.
@@ -154,7 +163,8 @@ signatures, or authorization tokens, and the generator is not cryptographic.
 
 Late free-page records that exceed the normal freelist convergence budget are
 persisted in meta and loaded on reopen. Exceeding 26 deferred pages fails the
-commit rather than leaking them silently. A commit failure requires closing and
+commit rather than leaking them silently. The same array's tail holds the
+inline free-list entry (see Free list). A commit failure requires closing and
 reopening the environment because its publication outcome may be indeterminate.
 
 `Tree::flags` low 16 bits retain public ordering flags; bits 16..31 encode the
@@ -182,7 +192,7 @@ API. Large overflow reads therefore checksum the whole run. With the explicit
 `cacheReadChecksums()` option, read-only transactions cache successful page/run
 checks in a bounded bitmap. Later accesses may miss external corruption until
 another transaction or an explicit integrity check. The default does not cache
-checks. This is a runtime policy only; format-6 bytes and checksum values are unchanged.
+checks. This is a runtime policy only; format-7 bytes and checksum values are unchanged.
 
 The node limit is `((pageSize - 24) / 2) & ~3` (2036 at 4 KiB); key limits and
 node header sizes are unchanged. Overflow allocation rounds `16 + valueBytes + 8`
@@ -193,6 +203,12 @@ Checksums detect damage, not malicious forgery.
 
 Meta's catalog root references a third internal B+tree. Bytewise keys are DB
 names; values are 48-byte little-endian Tree descriptors marked `N_SUBDB`.
+A name that also has a meta root slot is described by the slot: the catalog's
+descriptor for it is stale and must not be followed. A commit writes a
+sub-database's descriptor into its slot, or into an empty slot, or into the
+slot written longest ago after writing that slot's descriptor back to the
+catalog; names longer than 23 bytes always use the catalog. Dropping a
+sub-database clears its slot. Every slot names a catalog entry.
 The main tree is exclusively user data: a key and a DB may share a name, and
 main-tree clear can release the whole tree. Integrity walks all three roots
 and every catalog descriptor.
@@ -259,10 +275,15 @@ usable page area, before the checksum trailer, and are 4-byte aligned.
 
 ```c
 struct LeafNode   { uint16_t flags; uint16_t ksize; uint32_t vsize; };
-struct BranchNode { uint32_t childLo; uint16_t childHi; uint16_t ksize; };
+struct BranchNode { uint32_t childLo; uint16_t childHi; uint16_t ksize;
+                    uint32_t countLo; uint32_t countHi; };
 ```
 
-Both are 8 bytes and are followed by `ksize` key bytes.
+A leaf node is 8 bytes and a branch node 16; both are followed by `ksize` key
+bytes. A branch node's `countLo | (countHi << 32)` is the number of leaf
+entries in its child's subtree, maintained by every insert, delete, split and
+rebalance and checked by the integrity walk; ranks, range counts and skips
+descend by it.
 
 A leaf node's payload follows the key: the value itself, or — when
 `flags & N_BIGDATA` — an 8-byte page number naming an overflow run, with
@@ -280,7 +301,8 @@ its key is never compared.
 | quantity | rule | at 4 KiB pages |
 |---|---|---|
 | largest node | `((pageSize - 24) / 2) & ~3` | 2036 B |
-| largest key | `(((pageSize - 16) / 4) & ~3) - 16` | 1004 B |
+| largest key | `(((pageSize - 16) / 4) & ~3) - 24` | 996 B |
+| page size | power of two | 1 KiB to 64 KiB |
 | largest value | `2^32 - 1` | 4 GiB |
 | page numbers | 48 bits | 2^48 pages |
 | tree depth | 48 levels | — |
@@ -293,9 +315,17 @@ that byte order is numeric order. Values are packed little-endian arrays of
 `uint64_t` page numbers. An entry keyed `(K, c)` lists the `c`-th chunk of the
 pages that transaction `K` retired.
 
-A chunk holds at most `(maxNodeSize - 32) / 8` pages -- 250 at 4 KiB, 26 at
-512 B -- which is as many as fit a leaf node held inline, so a chunk is never an
+A chunk holds at most `(maxNodeSize - 32) / 8` pages -- 250 at 4 KiB, 58 at
+1 KiB -- which is as many as fit a leaf node held inline, so a chunk is never an
 overflow run. The writer absorbs one chunk at a time as it needs pages, deletes
 the chunks it absorbed at commit, and records what it retired plus the unspent
 remainder under its own id in fresh chunks. Drawing a handful of pages from a
 list of a million therefore rewrites one node, not an 8 MB value.
+
+A commit that retired at most 16 pages lists them in Meta instead (`inlineTxn`
+= its id, the pages after the deferred ones); what it absorbed and did not
+spend still goes into the tree under its id. The next writer absorbs the
+inline entry before any tree chunk when `inlineTxn` is no newer than the
+oldest live snapshot; otherwise, at commit, it moves the entry into the tree
+under `(inlineTxn, 2^64 - 1)` -- a chunk number no commit writes for itself --
+before recording its own.

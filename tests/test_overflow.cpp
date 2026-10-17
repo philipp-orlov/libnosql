@@ -89,7 +89,7 @@ TEST(sameSizeLargeOverwriteReusesTheRun)
 TEST(reserveForALargeValue)
 {
     tst::Scratch s("overflow");
-    Env e = Env::configure().pageSize(512).maxSize(1ull << 28).open(s.file());
+    Env e = Env::configure().pageSize(1024).maxSize(1ull << 28).open(s.file());
     e.write([](Txn& t) {
         auto w = t.mainDb().reserve("big", 30000);
         CHECK_EQ(w.size(), std::size_t(30000));

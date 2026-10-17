@@ -27,7 +27,7 @@ inline constexpr PageNo kInvalidPage = ~PageNo(0);
 /// Stored verbatim so the first bytes of the file read as the name in any hex
 /// dump. Padded to 16 so every 64-bit field after it stays 8-byte aligned.
 inline constexpr char kMagic[16] = "NOSQL-ORLOV";
-inline constexpr std::uint32_t kFormatVersion = 6;
+inline constexpr std::uint32_t kFormatVersion = 7;
 inline constexpr std::size_t kPageChecksumBytes = 8;
 
 using Identity = std::array<std::uint64_t, 2>;
@@ -37,7 +37,7 @@ using Identity = std::array<std::uint64_t, 2>;
 /// which on some platforms is a system call or a file read per word.
 Identity newIdentity() noexcept;
 
-inline constexpr std::size_t kMinPageSize = 512;
+inline constexpr std::size_t kMinPageSize = 1024;
 inline constexpr std::size_t kMaxPageSize = 65536;
 inline constexpr std::size_t kDefaultPageSize = 4096;
 
@@ -151,14 +151,18 @@ struct LeafNode
 static_assert(sizeof(LeafNode) == 8);
 
 /// Branch node header, followed by `ksize` key bytes. The child page number
-/// is split into 32+16 bits so the struct stays 4-aligned and 8 bytes wide.
+/// is split into 32+16 bits and the entry count into 32+32 so the struct
+/// stays 4-aligned. `count` is the number of leaf entries in the child's
+/// subtree: ranks, range counts and skips descend by it in O(log n).
 struct BranchNode
 {
     Little<std::uint32_t> childLo;
     Little<std::uint16_t> childHi;
     Little<std::uint16_t> ksize;
+    Little<std::uint32_t> countLo;
+    Little<std::uint32_t> countHi;
 };
-static_assert(sizeof(BranchNode) == 8);
+static_assert(sizeof(BranchNode) == 16);
 
 /// Node payloads are kept 4-byte aligned so the headers above can be read
 /// through typed pointers on every supported platform.
@@ -194,6 +198,29 @@ inline void setBranchChild(Page* p, unsigned i, PageNo child) noexcept
     BranchNode* n = bnode(p, i);
     n->childLo = std::uint32_t(child);
     n->childHi = std::uint16_t(child >> 32);
+}
+
+/// Leaf entries under branch slot `i`.
+inline std::uint64_t branchCount(const Page* p, unsigned i) noexcept
+{
+    const BranchNode* n = bnode(p, i);
+    return std::uint64_t(n->countLo) | (std::uint64_t(n->countHi) << 32);
+}
+inline void setBranchCount(Page* p, unsigned i, std::uint64_t count) noexcept
+{
+    BranchNode* n = bnode(p, i);
+    n->countLo = std::uint32_t(count);
+    n->countHi = std::uint32_t(count >> 32);
+}
+/// Leaf entries in the subtree rooted at `p`.
+inline std::uint64_t pageEntries(const Page* p) noexcept
+{
+    if (isLeaf(p))
+        return p->nkeys;
+    std::uint64_t total = 0;
+    for (unsigned i = 0; i < p->nkeys; ++i)
+        total += branchCount(p, i);
+    return total;
 }
 
 inline Slice nodeKey(const Page* p, unsigned i) noexcept
@@ -276,6 +303,10 @@ inline std::uint64_t readBig(const std::byte* in) noexcept
     return v;
 }
 
+/// The chunk number an inline free-list entry (Meta::inlineTxn) takes when
+/// it moves into the tree: never one a commit writes for its own chunks.
+inline constexpr std::uint64_t kInlineChunk = ~std::uint64_t(0);
+
 inline FreeKey freeKey(TxnId txnid, std::uint64_t chunk) noexcept
 {
     FreeKey k;
@@ -322,6 +353,21 @@ inline Tree emptyTree(std::uint32_t flags = 0) noexcept
     return t;
 }
 
+/// A named tree's root record kept in the meta page instead of the catalog
+/// (Meta::roots). The catalog keeps the name -- it is what says the tree
+/// exists -- but while a slot holds the name, the slot's record is the one
+/// that counts and the catalog's is stale. A commit then rewrites only the
+/// meta page for the record, not the catalog leaf as well.
+struct RootSlot
+{
+    char name[23];
+    std::uint8_t length;  ///< 0: empty slot
+    Tree tree;
+    Little<std::uint64_t> written;  ///< txnid that last wrote it (eviction order)
+};
+static_assert(sizeof(RootSlot) == 80);
+inline constexpr std::size_t kRootNameMax = sizeof(RootSlot::name);
+
 struct Meta
 {
     char magic[16];
@@ -338,12 +384,20 @@ struct Meta
     Identity commitId{};
     Identity parentId{};
     Little<std::uint64_t> parentChecksum = 0;
-    Little<std::uint64_t> deferredCount = 0;
+    /// `deferredPages` holds two lists back to back: first `deferredCount`
+    /// pages freed too late to be recorded by the commit that freed them,
+    /// then `inlineCount` pages retired by transaction `inlineTxn` -- a
+    /// free-list entry small enough to live here rather than in the free
+    /// tree, which then needs no page of its own rewritten per commit.
+    Little<std::uint32_t> deferredCount = 0;
+    Little<std::uint32_t> inlineCount = 0;
+    Little<std::uint64_t> inlineTxn = 0;
     std::array<Little<PageNo>, 26> deferredPages{};
     Tree catalogTree = emptyTree();
+    std::array<RootSlot, 6> roots{};
 };
 static_assert(offsetof(Meta, storeId) == 160);
-static_assert(sizeof(Meta) == 480);
+static_assert(sizeof(Meta) == 968);
 static_assert(kPageHdr + sizeof(Meta) <= kMinPageSize);
 
 inline Meta* metaOf(Page* p) noexcept

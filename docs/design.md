@@ -4,7 +4,7 @@
 
 libnosql is a C++17 embedded, single-file, copy-on-write B+tree with one writer,
 many snapshot readers, named databases, and nested write transactions. It uses
-no WAL and no third-party libraries or vendored code. Only format 6 is supported;
+no WAL and no third-party libraries or vendored code. Only format 7 is supported;
 opening an unsupported format fails, including through compaction.
 
 See [format.md](format.md) for persisted bytes, [mq.md](mq.md) for queues,
@@ -203,6 +203,21 @@ the last one the reclaim list is frozen so the write describes a fixed set. Page
 freed too late to be recorded roll into the next writer, and are persisted in meta
 meanwhile, not silently lost on restart. Exceeding its 26-page capacity fails commit.
 
+A commit that retired at most 16 pages lists those in the meta record instead
+(an inline entry under its id) and writes only its unspent remainder to the
+tree. The next writer absorbs the inline entry first, so a run of small
+commits needs nothing from the tree and writes no free-list page; a reader
+that pins the entry makes the next commit move it into the tree under a
+reserved chunk number. Likewise the descriptors of up to six recently written
+sub-databases live in the meta record (root slots), so such a commit does not
+rewrite the catalog leaf either. A small commit then writes its tree path and
+the meta page and nothing else.
+
+Branch slots carry their subtree's entry count. Inserts and deletes adjust the
+counts along the (already copied) path; splits set the two halves' counts from
+the entries they divide; merges and shifts move counts with the nodes. Range
+counts (`Db::countRange`) and `Cursor::skip` descend by them.
+
 `dirtyLimit` defaults to 256 MiB of active page buffers, including nested writers;
 a write that would exceed it fails with `ErrorCode::OutOfMemory`, and zero disables
 the limit. `bufferCache` defaults to 32 MiB and bounds idle buffer
@@ -279,7 +294,7 @@ strict validation. This detection tradeoff is why caching is opt-in.
 
 ## Compaction and Optional Layers
 
-`compact(src, dst)` opens a format-6 source read-only and streams its main and
+`compact(src, dst)` opens a format-7 source read-only and streams its main and
 named trees through `BulkFile`/`BulkTree`. It retains one page per active tree
 level and chunks overflow values, rather than buffering a destination transaction.
 It builds a new catalog, checks the result, synchronizes it and atomically

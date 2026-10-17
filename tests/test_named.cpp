@@ -1,3 +1,4 @@
+#include <map>
 // Copyright (c) 2026 Philipp Orlov
 // SPDX-License-Identifier: Apache-2.0
 
@@ -260,12 +261,77 @@ TEST(integrityDiscoversUnopenedNamedTrees)
     const auto* node = internal::lnode(page, 0);
     internal::Tree tree{};
     std::memcpy(&tree, reinterpret_cast<const char*>(node) + sizeof(*node) + node->ksize, sizeof tree);
+    // A root slot in the meta page, when the tree has one, is its record.
+    for (const internal::RootSlot& slot : meta.roots) {
+        if (std::string(slot.name, slot.length) == "hidden")
+            tree = slot.tree;
+    }
     const std::uint64_t invalid = UINT64_MAX;
     file.seekp(std::streamoff(tree.root * 4096));
     file.write(reinterpret_cast<const char*>(&invalid), sizeof invalid);
     file.close();
     Env env = Env::configure().open(scratch.file());
     env.read([](Txn& txn) { CHECK_THROWS(checkIntegrity(txn), ErrorCode::Corrupted); });
+}
+
+TEST(rootSlotsInTheMetaPageStayConsistent)
+{
+    tst::Scratch s("named");
+    std::map<std::string, std::map<std::string, std::string>> model;
+    auto name = [](int i) {
+        // Short names take meta root slots; long ones stay in the catalog.
+        return i % 5 == 4 ? std::string(30, char('a' + i)) : "db" + std::to_string(i);
+    };
+    {
+        Env e = Env::configure().open(s.file());
+        std::vector<Txn> readers;
+        std::vector<decltype(model)> seen;
+        for (int round = 0; round < 120; ++round) {
+            e.write([&](Txn& t) {
+                // More trees written than there are slots: slots get evicted
+                // back to the catalog and reused.
+                for (int k = 0; k < 3; ++k) {
+                    const int which = (round * 3 + k) % 11;
+                    Db d = t.db(name(which), DbFlags::Create);
+                    const std::string key = "k" + std::to_string(round % 17);
+                    const std::string value = "r" + std::to_string(round);
+                    d.put(key, value);
+                    model[name(which)][key] = value;
+                }
+                if (round % 40 == 39) {
+                    t.dropDb(name(3));
+                    model.erase(name(3));
+                }
+            });
+            if (round % 10 == 0) {
+                readers.push_back(e.readTxn());
+                seen.push_back(model);
+            }
+            if (round % 25 == 0) {
+                Txn r = e.readTxn();
+                checkIntegrity(r);
+            }
+        }
+        // Each pinned reader still sees exactly its snapshot.
+        for (std::size_t i = 0; i < readers.size(); ++i) {
+            for (const auto& [db, rows] : seen[i]) {
+                Db d = readers[i].db(db);
+                CHECK_EQ(d.count(), std::uint64_t(rows.size()));
+                for (const auto& [k, v] : rows)
+                    CHECK_EQ(d.get(k).value().string(), v);
+            }
+        }
+    }
+    Env again = Env::configure().open(s.file());
+    Txn r = again.readTxn();
+    checkIntegrity(r);
+    CHECK_EQ(r.listDbs().size(), model.size());
+    for (const auto& [db, rows] : model) {
+        Db d = r.db(db);
+        CHECK_EQ(d.count(), std::uint64_t(rows.size()));
+        for (const auto& [k, v] : rows)
+            CHECK_EQ(d.get(k).value().string(), v);
+    }
 }
 
 int main()

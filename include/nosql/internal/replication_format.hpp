@@ -16,7 +16,7 @@ namespace nosql::internal {
 /// 15 bytes plus its terminator and does not fit the 8 the sketch assumed.
 inline constexpr char kBundleMagic[16] = "REP-NOSQL-ORLOV";   ///< bundles
 inline constexpr char kSegmentMagic[16] = "SEG-NOSQL-ORLOV";  ///< shipping segments
-inline constexpr std::uint32_t kReplicationVersion = 5;
+inline constexpr std::uint32_t kReplicationVersion = 6;
 
 /// 72 bytes, no padding, every 64-bit field naturally aligned. The design
 /// sketch said 64, which only held with the 8-byte magic it assumed.
@@ -85,6 +85,6 @@ struct SegmentIndexRecord
     Little<std::uint64_t> frameChecksum;
     Little<std::uint64_t> checksum;
 };
-static_assert(sizeof(SegmentIndexRecord) == 512);
+static_assert(sizeof(SegmentIndexRecord) == 1000);
 
 }  // namespace nosql::internal

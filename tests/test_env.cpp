@@ -31,7 +31,7 @@ TEST(pageSizeMustBeAPowerOfTwoInRange)
     CHECK_THROWS(Env::configure().pageSize(3000).open(s.file()), ErrorCode::InvalidArgument);
     CHECK_THROWS(Env::configure().pageSize(256).open(s.file()), ErrorCode::InvalidArgument);
     CHECK_THROWS(Env::configure().pageSize(1 << 20).open(s.file()), ErrorCode::InvalidArgument);
-    for (std::size_t ps : {512u, 1024u, 4096u, 16384u, 65536u}) {
+    for (std::size_t ps : {1024u, 2048u, 4096u, 16384u, 65536u}) {
         tst::Scratch one("env");
         Env e = Env::configure().pageSize(ps).open(one.file());
         CHECK_EQ(e.pageSize(), ps);
@@ -108,7 +108,7 @@ TEST(aSecondProcessStyleOpenIsRefused)
 TEST(mapFullIsReportedNotCrashed)
 {
     tst::Scratch s("env");
-    Env e = Env::configure().pageSize(512).maxSize(64 * 1024).open(s.file());
+    Env e = Env::configure().pageSize(1024).maxSize(128 * 1024).open(s.file());
     bool hit = false;
     try {
         for (int round = 0; round < 200 && !hit; ++round)

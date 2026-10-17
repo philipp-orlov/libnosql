@@ -91,6 +91,7 @@ class BulkTree
     {
         std::vector<std::uint64_t> bytes;
         std::string minimum;
+        std::uint64_t entries = 0;  ///< leaf entries under this page
         explicit Buffer(std::size_t pageSize, std::uint16_t flags) : bytes(pageSize / 8) { reset(flags); }
         Page* page() { return reinterpret_cast<Page*>(bytes.data()); }
         void reset(std::uint16_t flags)
@@ -100,6 +101,7 @@ class BulkTree
             page()->lower = std::uint16_t(kPageHdr);
             page()->upper = std::uint16_t(bytes.size() * 8 - kPageChecksumBytes);
             minimum.clear();
+            entries = 0;
         }
         void* node(std::size_t size)
         {
@@ -164,6 +166,7 @@ public:
                 return tree_;
             }
             const auto minimum = buffer.minimum;
+            const std::uint64_t entries = buffer.entries;
             const auto number = file_.writePage(buffer.page());
             ++tree_.branchPages;
             buffer.reset(P_BRANCH);
@@ -172,13 +175,13 @@ public:
                 tree_.depth = std::uint32_t(level + 2);
                 return tree_;
             }
-            child(level + 1, minimum, number);
+            child(level + 1, minimum, number, entries);
         }
         return tree_;
     }
 
 private:
-    void child(std::size_t level, const std::string& minimum, PageNo number)
+    void child(std::size_t level, const std::string& minimum, PageNo number, std::uint64_t entries)
     {
         if (level >= kMaxDepth - 1)
             throw Error(ErrorCode::Corrupted, "bulk tree depth exceeded");
@@ -186,10 +189,11 @@ private:
             levels_.emplace_back(file_.pageSize(), P_BRANCH);
         if (pageRoom(levels_[level].page()) < branchNodeSize(minimum.size()) + 2) {
             const auto parentMinimum = levels_[level].minimum;
+            const std::uint64_t parentEntries = levels_[level].entries;
             const auto parentNumber = file_.writePage(levels_[level].page());
             ++tree_.branchPages;
             levels_[level].reset(P_BRANCH);
-            child(level + 1, parentMinimum, parentNumber);
+            child(level + 1, parentMinimum, parentNumber, parentEntries);
         }
         auto& buffer = levels_[level];
         const bool first = buffer.page()->nkeys == 0;
@@ -199,13 +203,17 @@ private:
         node->childLo = std::uint32_t(number);
         node->childHi = std::uint16_t(number >> 32);
         node->ksize = std::uint16_t(key.size());
+        node->countLo = std::uint32_t(entries);
+        node->countHi = std::uint32_t(entries >> 32);
+        buffer.entries += entries;
         if (!key.empty()) std::memcpy(reinterpret_cast<std::byte*>(node) + sizeof(*node), key.data(), key.size());
     }
     void flushLeaf()
     {
+        const std::uint64_t entries = leaf_.page()->nkeys;
         const auto number = file_.writePage(leaf_.page());
         ++tree_.leafPages;
-        child(0, leaf_.minimum, number);
+        child(0, leaf_.minimum, number, entries);
         leaf_.reset(P_LEAF);
     }
 

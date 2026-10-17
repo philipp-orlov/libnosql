@@ -18,10 +18,10 @@ TEST(littleEndianFieldsHaveGoldenBytes)
         CHECK_EQ(bytes[index], index + 1);
     CHECK_EQ(internal::readLittle<std::uint64_t>(bytes), 0x0807060504030201ull);
     CHECK_EQ(sizeof(internal::Page), 16u);
-    CHECK_EQ(internal::kFormatVersion, 6u);
+    CHECK_EQ(internal::kFormatVersion, 7u);
     CHECK_EQ(internal::kPageChecksumBytes, 8u);
-    CHECK_EQ(sizeof(internal::Meta), 480u);
-    CHECK_EQ(offsetof(internal::Meta, catalogTree), 432u);
+    CHECK_EQ(sizeof(internal::Meta), 968u);
+    CHECK_EQ(offsetof(internal::Meta, catalogTree), 440u);
 }
 
 TEST(readsRejectCorruptedLeafAndOverflowPayload)
@@ -201,7 +201,7 @@ TEST(bulkBuildsMultipleLevelsAndOverflowRuns)
 {
     tst::Scratch scratch("bulk-levels");
     {
-        Env env = Env::configure().pageSize(512).sync(Durability::None).open(scratch.file());
+        Env env = Env::configure().pageSize(1024).sync(Durability::None).open(scratch.file());
         env.write([](Txn& txn) {
             auto db = txn.db("large", DbFlags::Create);
             for (unsigned index = 0; index < 5000; ++index)
