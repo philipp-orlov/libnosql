@@ -17,6 +17,7 @@
 // which is a genuine lower bound on the subtree.
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -126,10 +127,49 @@ bool branchSetKey(Page* p, unsigned i, Slice key) noexcept
 // rid of. Both searches are templated on the comparison and dispatched once,
 // which lets the overwhelmingly common byte-wise ordering inline.
 
-/// Byte-wise ordering, as a functor the compiler can inline.
+/// `x` with its bytes in memory order as the most significant first.
+inline std::uint64_t memoryOrder(std::uint64_t x) noexcept
+{
+    if constexpr (kLittleEndian) {
+#if defined(_MSC_VER) && !defined(__clang__)
+        return _byteswap_uint64(x);
+#else
+        return __builtin_bswap64(x);
+#endif
+    }
+    return x;
+}
+
+/// Byte-wise ordering, as a functor the compiler can inline. Keys are short,
+/// so eight bytes at a time beats a call to memcmp per probe.
 struct LexCmp
 {
-    int operator()(Slice a, Slice b) const noexcept { return a.compare(b); }
+    int operator()(Slice a, Slice b) const noexcept
+    {
+        const std::byte* pa = a.data();
+        const std::byte* pb = b.data();
+        const std::size_t n = std::min(a.size(), b.size());
+        if (n >= 8) {
+            std::uint64_t x, y;
+            for (std::size_t i = 0; i + 8 <= n; i += 8) {
+                std::memcpy(&x, pa + i, 8);
+                std::memcpy(&y, pb + i, 8);
+                if (x != y)
+                    return memoryOrder(x) < memoryOrder(y) ? -1 : 1;
+            }
+            // The last eight bytes, overlapping ones already found equal.
+            std::memcpy(&x, pa + n - 8, 8);
+            std::memcpy(&y, pb + n - 8, 8);
+            if (x != y)
+                return memoryOrder(x) < memoryOrder(y) ? -1 : 1;
+        } else {
+            for (std::size_t i = 0; i < n; ++i) {
+                if (pa[i] != pb[i])
+                    return pa[i] < pb[i] ? -1 : 1;
+            }
+        }
+        return a.size() < b.size() ? -1 : (a.size() > b.size() ? 1 : 0);
+    }
 };
 /// Fallback for the two non-default orderings.
 struct FnCmp
@@ -188,6 +228,109 @@ unsigned leafLowerBound(const Page* p, Slice key, CompareFn cmp, bool* exact) no
     if (cmp == &cmpLexicographic)
         return leafLowerBoundWith(p, key, LexCmp{}, exact);
     return leafLowerBoundWith(p, key, FnCmp{cmp}, exact);
+}
+
+/// The keys a descent knows lie around the page it enters: its parent's
+/// separators either side of the child taken (or further up at an edge).
+struct Bounds
+{
+    Slice low, high;
+    bool known() const noexcept { return low.size() && high.size(); }
+};
+
+/// Where `key` likely sits among `n` slots whose keys spread evenly over
+/// [b.low, b.high): the eight bytes past the bounds' common prefix, read as
+/// a number. Rowid keys and most index keys are near enough to that.
+unsigned guessSlot(const Bounds& b, Slice key, unsigned n) noexcept
+{
+    const std::byte* lo = b.low.data();
+    const std::byte* hi = b.high.data();
+    const std::size_t m = std::min(b.low.size(), b.high.size());
+    std::size_t at = 0;
+    while (at < m && lo[at] == hi[at])
+        ++at;
+    auto word = [at](Slice s) {
+        std::uint64_t v = 0;
+        for (std::size_t j = 0; j < 8; ++j)
+            v = (v << 8) |
+                (at + j < s.size() ? std::to_integer<std::uint64_t>(s.data()[at + j]) : 0u);
+        return v;
+    };
+    const std::uint64_t a = word(b.low), z = word(b.high), k = word(key);
+    if (z <= a || k <= a)
+        return 0;
+    if (k >= z)
+        return n - 1;
+    const unsigned g = unsigned(double(k - a) / double(z - a) * double(n));
+    return g < n ? g : n - 1;
+}
+
+/// First slot in [lo, hi) for which `before` is false (it holds for a prefix
+/// of the range), probing `guess` first and galloping out from it. A good
+/// guess costs two probes; a bad one about twice a binary search's.
+template <class Before>
+unsigned searchFrom(unsigned lo, unsigned hi, unsigned guess, Before before) noexcept
+{
+    unsigned a = lo, z = hi;
+    if (before(guess)) {
+        a = guess + 1;
+        for (unsigned step = 1;; step *= 2) {
+            const unsigned probe = a + step - 1;
+            if (probe >= hi)
+                break;
+            if (!before(probe)) {
+                z = probe;
+                break;
+            }
+            a = probe + 1;
+        }
+    } else {
+        z = guess;
+        for (unsigned step = 1;; step *= 2) {
+            if (z < lo + step)
+                break;
+            const unsigned probe = z - step;
+            if (before(probe)) {
+                a = probe + 1;
+                break;
+            }
+            z = probe;
+        }
+    }
+    while (a < z) {
+        const unsigned mid = a + (z - a) / 2;
+        if (before(mid))
+            a = mid + 1;
+        else
+            z = mid;
+    }
+    return a;
+}
+
+/// branchSearch and leafLowerBound for a descent that knows the page's
+/// bounds: the binary search's chain of dependent cache misses becomes one
+/// or two probes near the interpolated slot.
+unsigned branchSearchIn(const Page* p, Slice key, CompareFn cmp, const Bounds& b) noexcept
+{
+    const unsigned n = p->nkeys;
+    if (cmp != &cmpLexicographic || !b.known() || n < 8)
+        return branchSearch(p, key, cmp);
+    const LexCmp lex;
+    const unsigned guess = 1 + guessSlot(b, key, n - 1);
+    return searchFrom(1, n, guess, [&](unsigned i) { return lex(nodeKey(p, i), key) <= 0; }) - 1;
+}
+
+unsigned leafLowerBoundIn(const Page* p, Slice key, CompareFn cmp, const Bounds& b,
+                          bool* exact) noexcept
+{
+    const unsigned n = p->nkeys;
+    if (cmp != &cmpLexicographic || !b.known() || n < 8)
+        return leafLowerBound(p, key, cmp, exact);
+    const LexCmp lex;
+    const unsigned i = searchFrom(0, n, guessSlot(b, key, n),
+                                  [&](unsigned j) { return lex(nodeKey(p, j), key) < 0; });
+    *exact = i < n && lex(nodeKey(p, i), key) == 0;
+    return i;
 }
 
 // -------------------------------------------------------------- overflow ---
@@ -777,16 +920,24 @@ bool treeSearch(CursorImpl& c, Slice key, bool* exact)
     }
     c.top = 0;
     c.pg[0] = c.txn->getPage(tr.root);
+    Bounds b;
     while (isBranch(c.pg[c.top])) {
-        if (c.pg[c.top]->nkeys == 0)
+        const Page* p = c.pg[c.top];
+        if (p->nkeys == 0)
             throw Error(ErrorCode::Corrupted, "empty branch page");
-        c.idx[c.top] = std::uint16_t(branchSearch(c.pg[c.top], key, cmp));
+        const unsigned i = branchSearchIn(p, key, cmp, b);
+        c.idx[c.top] = std::uint16_t(i);
         if (c.top + 1 >= kMaxDepth)
             throw Error(ErrorCode::Corrupted, "b-tree exceeded maximum depth");
-        c.pg[c.top + 1] = c.txn->getPage(branchChild(c.pg[c.top], c.idx[c.top]));
+        // The child's keys lie between the separators either side of it.
+        if (i > 0)
+            b.low = nodeKey(p, i);
+        if (i + 1u < p->nkeys)
+            b.high = nodeKey(p, i + 1);
+        c.pg[c.top + 1] = c.txn->getPage(branchChild(p, i));
         ++c.top;
     }
-    c.idx[c.top] = std::uint16_t(leafLowerBound(c.pg[c.top], key, cmp, exact));
+    c.idx[c.top] = std::uint16_t(leafLowerBoundIn(c.pg[c.top], key, cmp, b, exact));
     return true;
 }
 
