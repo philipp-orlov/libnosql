@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 #include "nosql/internal/format.hpp"
@@ -60,9 +61,8 @@ public:
 
     void set(PageNo key, Page* val)
     {
-        // Grow at 3/4 load; linear probing degrades quickly past that.
-        if ((size_ + 1) * 4 > slots_.size() * 3)
-            grow();
+        if (slots_.empty())
+            grow(kInitial);
         std::size_t i = home(key);
         for (;;) {
             Slot& s = slots_[i];
@@ -70,15 +70,20 @@ public:
                 s.val = val;
                 return;
             }
-            if (s.key == kEmpty) {
-                s.key = key;
-                s.val = val;
-                used_[i >> 6] |= std::uint64_t(1) << (i & 63);
-                ++size_;
-                return;
-            }
+            if (s.key == kEmpty)
+                break;
             i = (i + 1) & mask_;
         }
+        // Only a new key can exceed the 3/4 load limit.
+        if (size_ >= slots_.size() - slots_.size() / 4) {
+            reserve(size_ + 1);
+            i = home(key);
+            while (slots_[i].key != kEmpty)
+                i = (i + 1) & mask_;
+        }
+        slots_[i] = Slot{key, val};
+        used_[i >> 6] |= std::uint64_t(1) << (i & 63);
+        ++size_;
     }
 
     bool erase(PageNo key) noexcept
@@ -136,8 +141,16 @@ public:
     /// roughly how many pages it will dirty never rehashes mid-flight.
     void reserve(std::size_t n)
     {
-        while (n * 4 > slots_.size() * 3)
-            grow();
+        if (!n)
+            return;
+        std::size_t want = slots_.empty() ? kInitial : slots_.size();
+        while (n > want - want / 4) {
+            if (want > slots_.max_size() / 2)
+                throw std::length_error("page table capacity exceeded");
+            want *= 2;
+        }
+        if (want > slots_.size())
+            grow(want);
     }
 
     /// Empty the table but keep the buffer, so the next transaction reusing
@@ -200,12 +213,11 @@ private:
         return std::size_t((key * 0x9E3779B97F4A7C15ull) >> shift_);
     }
 
-    void grow()
+    void grow(std::size_t want)
     {
-        const std::size_t want = slots_.empty() ? kInitial : slots_.size() * 2;
         std::vector<Slot> old(want);
-        old.swap(slots_);
         std::vector<std::uint64_t> oldUsed(want / 64);
+        old.swap(slots_);
         oldUsed.swap(used_);
         mask_ = want - 1;
         unsigned bits = 0;

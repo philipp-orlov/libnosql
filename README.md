@@ -746,6 +746,13 @@ range scan or a join's inner probe allocates no cursor object. The pool holds at
 externally retained transaction handles can add further objects. Named-database
 slots, arena chunks, public cursors and queue objects are separate allocations.
 
+Updating an existing dirty-page entry never grows its table, even at the load
+limit. Reserving a large table allocates its final slot array and bitmap once,
+rather than repeatedly allocating and rehashing intermediate sizes. Both arrays
+must allocate successfully before replacing the old table; allocation failure
+leaves existing entries intact. These changes affect in-memory bookkeeping only:
+the copy-on-write commit protocol and file format are unchanged, with no WAL.
+
 The Linux static-build allocation probes measure zero `new`, page-backing
 allocation and direct free/unmap calls over 1,000 warmed 256 KiB overwrite/read
 transactions, and over 12 warmed batches of 8,192 records (`tests/test_memory.cpp`
@@ -765,6 +772,16 @@ than an aspiration: `tests/test_steady.cpp` runs tens of thousands of commits
 against a fixed working set and asserts the page count and file size stop
 moving. Twenty thousand rounds of rewrites against a 20 000-key store leave it
 at exactly the 640 pages it warmed up to.
+
+Mixed inline/overflow rewrites also reserve reusable pages for free-list
+bookkeeping before commit stops absorbing free chunks. Without that reserve,
+commits could keep extending the file for bookkeeping despite ample free pages.
+The steady-state regression rotates four value sizes over 256 keys for 100,000
+commits at both 1 KiB and 4 KiB page sizes and checks file size, page growth,
+readback and integrity.
+This reserve can require extra free-list work on small commits against an
+already-populated free tree; benchmark that workload separately from bulk
+inserts. It favors bounded long-run storage over skipping that bookkeeping.
 
 ## Scope
 

@@ -329,6 +329,16 @@ void flushNamedTrees(TxnImpl* t)
 /// procedure cannot feed on its own output.
 void updateFreelist(TxnImpl* t)
 {
+    // Keep room to copy a free-tree path and split it before absorption is
+    // disabled. Otherwise small commits can spend the inline free entry, then
+    // extend the file for GC bookkeeping while older free chunks go unused.
+    if (t->treeAt(kFreeDbi).root != kInvalidPage) {
+        const std::size_t reserve = 2 * (std::size_t(t->treeAt(kFreeDbi).depth) + 1);
+        while (t->reclaim.size() - t->reclaimPos + t->loose.size() < reserve)
+            if (!reclaimMore(t))
+                break;
+    }
+
     // Stop absorbing new GC entries -- the delete pass below has already run,
     // so a newly absorbed key would have nobody to remove it -- but keep
     // spending the ones already absorbed. Without that, a commit would have to

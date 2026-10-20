@@ -7,6 +7,7 @@
 // a store that leaks a few pages per commit is fine for an afternoon and
 // useless after a month.
 #include <cstring>
+#include <array>
 #include <random>
 #include <thread>
 
@@ -125,6 +126,46 @@ TEST(largeValueRewritesReachAPlateau)
         round(r);
     CHECK(e.stats().usedPages < warm * 2);
     e.read([&](Txn& t) { checkIntegrity(t); });
+}
+
+TEST(variableSizeRewritesReservePagesForFreeListBookkeeping)
+{
+    for (std::size_t pageSize : {1024u, 4096u}) {
+        tst::Scratch scratch("variable-rewrite");
+        auto env = Env::configure().pageSize(pageSize).sync(Durability::None)
+                       .maxSize(16u << 20).open(scratch.file());
+        std::array<std::string, 256> keys;
+        for (std::size_t i = 0; i < keys.size(); ++i)
+            keys[i] = "key-" + std::to_string(i);
+        const std::array<std::string, 4> values{
+            std::string(32, 'a'), std::string(256, 'b'),
+            std::string(pageSize / 2, 'c'), std::string(pageSize * 2, 'd')};
+        const auto round = [&](unsigned r) {
+            const auto index = r % keys.size();
+            const auto& value = values[(r / keys.size() + index) % values.size()];
+            env.write([&](Txn& txn) { txn.mainDb().put(keys[index], value); });
+            env.read([&](Txn& txn) {
+                const auto stored = txn.mainDb().at(keys[index]);
+                CHECK_EQ(stored.size(), value.size());
+                CHECK(std::memcmp(stored.data(), value.data(), value.size()) == 0);
+            });
+        };
+        for (unsigned r = 0; r < 10000; ++r)
+            round(r);
+        const auto warm = env.stats();
+        for (unsigned r = 10000; r < 100000; ++r)
+            round(r);
+        const auto late = env.stats();
+        std::printf("    %zu-byte pages: variable rewrites file %llu -> %llu, pages %llu -> %llu\n",
+                    pageSize, (unsigned long long)warm.fileSize, (unsigned long long)late.fileSize,
+                    (unsigned long long)warm.usedPages, (unsigned long long)late.usedPages);
+        CHECK_EQ(late.fileSize, warm.fileSize);
+        CHECK(late.usedPages <= warm.usedPages + 32);
+        env.read([](Txn& txn) {
+            CHECK_EQ(txn.mainDb().count(), 256u);
+            checkIntegrity(txn);
+        });
+    }
 }
 
 TEST(createAndDropSubDatabasesForever)
