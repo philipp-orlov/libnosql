@@ -31,6 +31,7 @@ struct AllocationCounts
 thread_local AllocationCounts counts;
 thread_local bool rejectHeap = false;
 thread_local bool rejectBacking = false;
+thread_local std::size_t rejectHeapAt = 0;
 #ifdef NOSQL_TEST_WRAP_ALLOCATIONS
 thread_local void* lastBacking = nullptr;
 #endif
@@ -38,16 +39,19 @@ thread_local void* lastBacking = nullptr;
 class AllocationProbe
 {
 public:
-    explicit AllocationProbe(bool failHeap = false, bool failBacking = false)
+    explicit AllocationProbe(bool failHeap = false, bool failBacking = false,
+                             std::size_t failHeapAt = 0)
     {
         counts = {};
         rejectHeap = failHeap;
         rejectBacking = failBacking;
+        rejectHeapAt = failHeapAt;
     }
     ~AllocationProbe()
     {
         rejectHeap = false;
         rejectBacking = false;
+        rejectHeapAt = 0;
     }
 };
 
@@ -56,7 +60,7 @@ public:
 void* operator new(std::size_t size)
 {
     ++counts.heap;
-    if (rejectHeap)
+    if (rejectHeap || counts.heap == rejectHeapAt)
         throw std::bad_alloc();
     if (void* allocation = std::malloc(size ? size : 1))
         return allocation;
@@ -375,6 +379,88 @@ TEST(transactionScratchRetentionIsByteBounded)
     const auto retained = txn.owned.capacity() * sizeof(decltype(txn.owned)::value_type) +
                           txn.pending.capacity() * sizeof(decltype(txn.pending)::value_type);
     CHECK(retained <= internal::TxnImpl::kRetainedScratchBytes);
+}
+
+TEST(pageTableGrowthFailurePreservesEntries)
+{
+    for (std::size_t failAt : {1u, 2u}) {
+        internal::PageTable table;
+        internal::Page page{};
+        for (unsigned key = 0; key < 48; ++key)
+            table.set(key, &page);
+        const auto capacity = table.capacity();
+        bool failed = false;
+        {
+            AllocationProbe probe(false, false, failAt);
+            try {
+                table.set(48, &page);
+            } catch (const std::bad_alloc&) {
+                failed = true;
+            }
+        }
+        CHECK(failed);
+        CHECK_EQ(table.capacity(), capacity);
+        CHECK_EQ(table.size(), 48u);
+        for (unsigned key = 0; key < 48; ++key)
+            CHECK(table.find(key) == &page);
+        CHECK(table.find(48) == nullptr);
+        table.set(48, &page);
+        CHECK_EQ(table.size(), 49u);
+        table.clear();
+        CHECK(table.empty());
+    }
+}
+
+TEST(pageTableUpdatesAtLoadLimitDoNotAllocate)
+{
+    internal::PageTable table;
+    internal::Page first{}, second{};
+    for (unsigned key = 0; key < 48; ++key)
+        table.set(key, &first);
+    const auto retained = table.retainedBytes();
+    AllocationCounts measured;
+    {
+        AllocationProbe probe(true, true);
+        for (unsigned round = 0; round < 10000; ++round)
+            for (unsigned key = 0; key < 48; ++key)
+                table.set(key, &second);
+        measured = counts;
+    }
+    CHECK_EQ(measured.heap, 0u);
+    CHECK_EQ(table.retainedBytes(), retained);
+    CHECK_EQ(table.size(), 48u);
+    for (unsigned key = 0; key < 48; ++key)
+        CHECK(table.find(key) == &second);
+}
+
+TEST(pageTableReserveAllocatesOnlyItsFinalBuffers)
+{
+    internal::PageTable table;
+    internal::Page page{};
+    table.set(7, &page);
+    AllocationCounts measured;
+    {
+        AllocationProbe probe;
+        table.reserve(65536);
+        measured = counts;
+    }
+    CHECK_EQ(measured.heap, 2u);
+    CHECK(table.find(7) == &page);
+    {
+        AllocationProbe probe(true, true);
+        for (unsigned key = 0; key < 65536; ++key)
+            table.set(key, &page);
+    }
+    CHECK_EQ(table.size(), 65536u);
+    bool failed = false;
+    try {
+        table.reserve(std::numeric_limits<std::size_t>::max());
+    } catch (const std::length_error&) {
+        failed = true;
+    }
+    CHECK(failed);
+    CHECK_EQ(table.size(), 65536u);
+    CHECK(table.find(7) == &page);
 }
 
 int main()
