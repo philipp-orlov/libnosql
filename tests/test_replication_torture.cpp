@@ -88,7 +88,7 @@ TEST(aReplicaFollowsARandomWorkloadExactly)
 
     std::mt19937_64 rng(20240607);
     Env e = Env::configure()
-                .sync(Durability::None)
+                .sync(Durability::NoMetaSync)
                 .initialSize(64 << 10)
                 .growthStep(256 << 10)
                 .shipTo(ship)
@@ -131,11 +131,7 @@ TEST(replayingTheWholeChainOneCommitAtATimeGivesTheSameResult)
     const fs::path bundle = dir.file("d.bundle");
 
     std::mt19937_64 rng(987654321);
-    Env e = Env::configure()
-                .sync(Durability::None)
-                .shipTo(ship)
-                .shipRetain(1000)
-                .open(store);
+    Env e = Env::configure().sync(Durability::NoMetaSync).shipTo(ship).shipRetain(1000).open(store);
     for (int i = 0; i < 5; ++i)
         randomCommit(e, rng);
     {
@@ -173,11 +169,7 @@ TEST(baseImagesTakenUnderLoadAreAllUsable)
     const fs::path bundle = dir.file("d.bundle");
 
     std::mt19937_64 rng(555);
-    Env e = Env::configure()
-                .sync(Durability::None)
-                .shipTo(ship)
-                .shipRetain(1000)
-                .open(store);
+    Env e = Env::configure().sync(Durability::NoMetaSync).shipTo(ship).shipRetain(1000).open(store);
     for (int i = 0; i < 8; ++i)
         randomCommit(e, rng);
 

@@ -67,14 +67,33 @@ enum class PutMode
     Append,        ///< bulk-load fast path; key must be > every existing key
 };
 
-/// How much the store fsyncs on commit.
+/// How much the store fsyncs on commit. Every mode is copy-on-write without a
+/// log; they differ only in when the meta page that publishes a commit is
+/// written and flushed. Each one opens on a consistent snapshot after a
+/// process crash or a power loss; what differs is how many of the newest
+/// commits that snapshot may be missing.
+///
+/// Under Lazy and None the newest meta lives in memory only. A sync -- a Lazy
+/// commit that finds Options::syncInterval() elapsed, Env::sync(), or the
+/// store closing -- flushes the data, writes that meta and flushes its page.
+/// Until then a crash of either kind reopens the store on the last sync, so a
+/// page that snapshot names is not reused before the next sync even once a
+/// later commit has replaced it. Pages written since the sync are reused as
+/// under Safe. Each page of the synced snapshot waits at most once, so the
+/// file stays within about twice the data the last sync held.
 enum class Durability
 {
-    Safe = 0,    ///< flush data, then the meta page: crash-Safe and durable
-    NoMetaSync,  ///< flush data only; a crash may lose the last commit(s),
-                 ///< but the store always opens on a consistent snapshot
-    None,        ///< flush nothing; consistent across process crash, not
-                 ///< across power loss. For bulk import and scratch stores.
+    Safe = 0,    ///< flush data, then the meta page, on every commit:
+                 ///< nothing committed is ever lost
+    NoMetaSync,  ///< flush data on every commit, the meta page with the next
+                 ///< one: a crash may lose the last commit
+    None,        ///< flush only on Env::sync() and when the store closes; a
+                 ///< crash loses everything since the last of these. For bulk
+                 ///< import and scratch stores.
+    Lazy,        ///< flush when a commit finds Options::syncInterval() elapsed
+                 ///< since the last sync, on Env::sync() and when the store
+                 ///< closes; a crash loses at most the commits since then
+                 ///< (group commit: two device flushes per interval).
 };
 
 // ---------------------------------------------------------------- stats ---
@@ -103,6 +122,7 @@ struct EnvStats
     std::uint64_t captureFailures = 0;
     std::uint64_t capturedTxnid = 0;
     std::uint64_t dirtyBytes = 0;
+    std::uint64_t durableTxn = 0;  ///< newest commit known to be on stable storage
 };
 
 // ------------------------------------------------------------------ db ----
@@ -365,8 +385,10 @@ public:
             pageSize_ = bytes;
             return *this;
         }
-        /// Hard upper bound on the file. Address space is not reserved up front;
-        /// the file grows on demand and the map follows. The default is 64 GiB,
+        /// Hard upper bound on the file. The file grows on demand and the map
+        /// follows. On POSIX a writable store reserves this much address space
+        /// at open (address space only: no memory, no swap), so growing never
+        /// moves the mapping. The default is 64 GiB,
         /// a ceiling for a database that owns its disk, not a budget: a consumer
         /// that shares a volume should set a bound from its own capacity so a
         /// runaway writer fails with MapFull instead of filling the volume.
@@ -436,6 +458,16 @@ public:
         Options& sync(Durability d)
         {
             durability_ = d;
+            return *this;
+        }
+        /// Under Durability::Lazy, the first commit at least this long after
+        /// the last sync runs the next one. Only commits (and Env::sync())
+        /// sync: there is no timer thread, so a store that stops committing
+        /// keeps its newest commits in memory until Env::sync() or close.
+        /// Zero syncs every commit. Default one second.
+        Options& syncInterval(std::chrono::milliseconds interval)
+        {
+            syncInterval_ = interval;
             return *this;
         }
         /// Let read transactions trust a page checksum this process has
@@ -513,6 +545,7 @@ public:
         bool preallocate_ = true;
         bool allowNetworkFilesystem_ = false;
         Durability durability_ = Durability::Safe;
+        std::chrono::milliseconds syncInterval_{1000};
         bool cacheReadChecksums_ = false;
         std::chrono::milliseconds revalidateAfter_{60000};
         std::size_t bufferCache_ = 32u << 20;
@@ -579,7 +612,12 @@ public:
         }
     }
 
-    /// Force everything durable now (useful under Durability::None).
+    /// Make every commit so far durable now. Under Lazy and None this is the
+    /// sync described at Durability: flush the data, write the newest meta,
+    /// flush its page. Under NoMetaSync it flushes the pending meta page.
+    /// Under Safe it does nothing unless `force`, which flushes the file and
+    /// its metadata. Blocks neither readers nor the writer, only another sync.
+    /// A failure poisons the environment (see Env::writeTxn).
     void sync(bool force = true);
 
     /// Forget every cached page check (see Options::cacheReadChecksums), so
@@ -602,7 +640,9 @@ public:
     std::uint64_t waitForCommit(std::uint64_t seen, std::chrono::milliseconds timeout) const;
 
     /// Release this handle. The store closes once the last transaction that
-    /// referenced it has finished.
+    /// referenced it has finished; under Lazy and None closing syncs first.
+    /// That sync cannot report a failure, so call sync() before closing to
+    /// see one.
     void close();
 
     /// Another handle on the same open store: no second open, descriptor or

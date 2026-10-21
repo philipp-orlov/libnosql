@@ -4,6 +4,7 @@
 // The public surface: env / txn / db / cursor, mapped onto the internals.
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 
 #include "nosql/internal/core.hpp"
@@ -125,13 +126,24 @@ void dropNamed(TxnImpl* t, unsigned dbi)
 namespace {
 /// The map is only as big as the file was when it was made: a file another
 /// process shortened would turn the next access to the lost pages into SIGBUS.
-/// Checked as a transaction begins (caller holds e.mtx), which cannot close the
-/// race but turns the persistent case into an error.
-void checkFileIntact(const EnvImpl& e)
+/// Checked as a writer begins and, at most every kIntactCheckNs, as a reader
+/// begins, which cannot close the race but turns the persistent case into an
+/// error. `mapped` is read before the file size: growth extends the file
+/// before the mapping, so a growth in between cannot look like a truncation.
+void checkFileIntact(const EnvImpl& e, std::uint64_t mapped)
 {
-    if (os::fileSize(e.fd) < e.region->m.size)
+    if (os::fileSize(e.fd) < mapped)
         throw Error(ErrorCode::IoError, "the store file was truncated behind the process: " +
                                             e.path.string());
+}
+
+constexpr std::int64_t kIntactCheckNs = 100'000'000;
+
+std::int64_t nowNs() noexcept
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
 }
 }  // namespace
 
@@ -164,12 +176,26 @@ Txn Env::beginWriter()
             throw Error(ErrorCode::BadTransaction, "commit failed; close and reopen the environment");
         {
             std::lock_guard<std::mutex> lk(e->mtx);
-            checkFileIntact(*e);
+            checkFileIntact(*e, e->region->m.size);
             t = e->acquireTxnLocked();
             t->env = e;
             t->readOnly = false;
             t->loadSnapshot(e->meta, e->region);
             t->oldest = e->oldestSnapshot();
+            t->readersOldest = t->oldest;
+            t->exemptEpoch = 0;
+            if (e->deferredMeta()) {
+                const TxnId newest = e->meta.txnid;
+                t->readersOldest =
+                    e->readers.empty() ? newest : std::min<TxnId>(e->readers.front().first, newest);
+                t->exemptEpoch = std::min<TxnId>(e->durableTxn, newest);
+            }
+        }
+        // Pages handed out under an older durable commit may be named by the
+        // current one: start the record afresh (writer only, under writeMtx).
+        if (e->deferredMeta() && e->bornEpoch != t->exemptEpoch) {
+            std::fill(e->born.begin(), e->born.end(), 0);
+            e->bornEpoch = t->exemptEpoch;
         }
         // Pre-size the hot per-commit containers so a typical transaction fills
         // them without any incremental reallocation.
@@ -191,13 +217,30 @@ Txn Env::readTxn()
     if (e->failed.load())
         throw Error(ErrorCode::BadTransaction, "commit failed; close and reopen the environment");
     e->validation.maybeReset();
+    // An fstat per reader would cost a system call per request: readers check
+    // now and then, outside the lock.
+    const std::int64_t now = nowNs();
+    std::int64_t last = e->lastIntactCheckNs.load(std::memory_order_relaxed);
+    if (now - last >= kIntactCheckNs &&
+        e->lastIntactCheckNs.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+        std::uint64_t mapped;
+        {
+            std::lock_guard<std::mutex> lk(e->mtx);
+            mapped = e->region->m.size;
+        }
+        try {
+            checkFileIntact(*e, mapped);
+        } catch (...) {
+            e->lastIntactCheckNs.store(0, std::memory_order_relaxed);  // next reader checks too
+            throw;
+        }
+    }
     std::shared_ptr<TxnImpl> t;
     {
         // One critical section for the pool, the snapshot and the reader
         // table: a request-per-transaction caller begins thousands of these a
         // second from several threads.
         std::lock_guard<std::mutex> lk(e->mtx);
-        checkFileIntact(*e);
         t = e->acquireTxnLocked();
         t->env = e;
         t->readOnly = true;
@@ -224,22 +267,15 @@ EnvStats Env::stats() const
         s.oldestReader = e->readers.empty() ? 0 : e->readers.front().first;
         s.bufferBytes = e->buffers.retainedBytes();
         s.dirtyBytes = e->dirtyBytes.load();
+        s.durableTxn = std::min<std::uint64_t>(e->durableTxn, e->meta.txnid);
         if (e->ship) {
             s.captureFailures = e->ship->failures();
             s.capturedTxnid = e->ship->capturedTxnid();
         }
         // Pages a commit freed too late to list (the next writer records
-        // them), and the free-list entry kept in the meta page.
-        s.freePages = e->carryOver.size() + e->meta.inlineCount;
+        // them), the free-list entry kept in the meta page, and the tree.
+        s.freePages = e->carryOver.size() + e->meta.inlineCount + e->freeTreePages;
     }
-
-    Txn rt = const_cast<Env*>(this)->readTxn();
-    CursorImpl c;
-    c.txn = rt.impl_.get();
-    c.dbi = kFreeDbi;
-    for (bool ok = cursorFirst(c); ok; ok = cursorNext(c))
-        s.freePages += cursorValue(c).size() / sizeof(PageNo);
-    rt.abort();
     return s;
 }
 
@@ -322,7 +358,7 @@ Txn Txn::nested()
     t->oldest = p->oldest;
     t->lastPgno = p->lastPgno;
     t->namedDbs = p->namedDbs;
-    t->dbs = p->dbs;
+    t->copyDbs(p->dbs);
     for (DbSlot& d : t->dbs)
         d.dirty = 0;
     p->child = t.get();
@@ -360,7 +396,8 @@ Db Txn::db(Slice name, DbFlags flags)
         auto& cache = e->subdbs;
         std::lock_guard<std::mutex> lk(cache.mtx);
         if (cache.txnid == t->txnid) {
-            for (const auto& entry : cache.trees) {
+            for (std::size_t i = 0; i < cache.used; ++i) {
+                const auto& entry = cache.trees[i];
                 if (entry.first == name.view()) {
                     tr = entry.second;
                     found = true;
@@ -377,10 +414,15 @@ Db Txn::db(Slice name, DbFlags flags)
             if (cache.txnid < t->txnid) {
                 // A newer snapshot: the old entries describe the past.
                 cache.txnid = t->txnid;
-                cache.trees.clear();
+                cache.used = 0;
             }
-            if (cache.txnid == t->txnid && cache.trees.size() < cache.kMax)
-                cache.trees.emplace_back(name.string(), tr);
+            if (cache.txnid == t->txnid && cache.used < cache.kMax) {
+                if (cache.used == cache.trees.size())
+                    cache.trees.emplace_back();
+                cache.trees[cache.used].first.assign(name.chars(), name.size());
+                cache.trees[cache.used].second = tr;
+                ++cache.used;
+            }
         }
     }
     if (!found) {
@@ -399,7 +441,7 @@ Db Txn::db(Slice name, DbFlags flags)
 
     dbi = unsigned(t->dbs.size());
     t->ensureDbs(dbi);
-    t->dbs[dbi].name = name.string();
+    t->dbs[dbi].name.assign(name.chars(), name.size());
     t->dbs[dbi].tree = tr;
     t->dbs[dbi].loaded = 1;
     if (created) {
@@ -761,7 +803,8 @@ bool Cursor::erase()
     if (!c.positioned)
         return false;
     const Slice k = cursorKey(c);
-    const std::vector<std::byte> saved(k.data(), k.data() + k.size());
+    std::vector<std::byte>& saved = c.erasedKey;
+    saved.assign(k.data(), k.data() + k.size());
     treeDelCurrent(c);
     // The key is gone, so seeking to it lands on whatever came next.
     return cursorSeek(c, Slice(saved.data(), saved.size()));

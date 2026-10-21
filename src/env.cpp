@@ -18,6 +18,13 @@ namespace nosql::internal {
 
 namespace {
 
+/// Whether a writable store reserves address space for maxSize at open. Off
+/// only to exercise, on POSIX, the remap-on-growth path that Windows uses.
+#ifndef NOSQL_RESERVE_MAPPING
+#define NOSQL_RESERVE_MAPPING 1
+#endif
+constexpr bool kReserveMapping = NOSQL_RESERVE_MAPPING != 0;
+
 /// splitmix64: one multiply-xorshift step per word, good enough for
 /// identifiers that only have to be distinct with overwhelming probability.
 std::uint64_t splitmix64(std::uint64_t& state) noexcept
@@ -60,6 +67,14 @@ Identity newIdentity() noexcept
 
 EnvImpl::~EnvImpl()
 {
+    // Closing syncs a deferred meta. Nothing can report a failure from here;
+    // the store then reopens on its last durable meta, as after a crash.
+    if (region && !readOnly && deferredMeta() && !failed.load()) {
+        try {
+            std::lock_guard<std::mutex> sl(syncMtx);
+            syncEnv(*this, false);
+        } catch (...) {}
+    }
     // Pooled transactions hand their buffers back to `buffers`, so they must go
     // first. Any still referenced by a stray handle simply outlives the pool.
     txnPool.clear();
@@ -70,11 +85,18 @@ EnvImpl::~EnvImpl()
         os::closeFile(fd);
 }
 
+/// The newest free-list entry a writer may recycle: none a live reader's
+/// snapshot needs, and none the newest durable snapshot needs. Pages retired
+/// by transaction T belong to snapshot T-1, so they are reusable once every
+/// snapshot that matters is T or newer. Under Safe the durable snapshot is the
+/// newest commit; under the other modes it lags, which is what keeps the
+/// snapshot a crash falls back to intact.
 TxnId EnvImpl::oldestSnapshot() const
 {
+    const TxnId durable = std::min<TxnId>(durableTxn, meta.txnid);
     if (readers.empty())
-        return meta.txnid;
-    return std::min<TxnId>(readers.front().first, meta.txnid);
+        return durable;
+    return std::min<TxnId>(readers.front().first, durable);
 }
 
 /// Reuse a pooled transaction object, or add one to the pool. A pooled entry
@@ -123,9 +145,10 @@ void EnvImpl::readerRelease(TxnId id) noexcept
         readers.erase(it);
 }
 
-/// Extend the file and republish the mapping. Existing transactions keep the
-/// mapping they started with, so growing never pulls memory out from under a
-/// concurrent reader.
+/// Extend the file and the mapping. Where the mapping has its address range
+/// reserved (POSIX) it grows in place; otherwise a new mapping is published
+/// and existing transactions keep the ones they have seen, so growing never
+/// pulls memory out from under a concurrent reader or the writer itself.
 void EnvImpl::growLocked(std::uint64_t needed)
 {
     if (needed <= region->m.size)
@@ -148,6 +171,12 @@ void EnvImpl::growLocked(std::uint64_t needed)
     os::resizeFile(fd, want);
     if (preallocate)
         os::reserveSpace(fd, oldSize, want - oldSize);
+
+    // Inside the address range reserved at open, the new extent is mapped in
+    // place: every pointer handed out so far stays valid and the pages
+    // already faulted in stay mapped.
+    if (os::extendMapping(fd, region->m, std::size_t(want), !readOnly))
+        return;
 
     auto fresh = std::make_shared<MappedRegion>();
     fresh->m = os::mapFile(fd, std::size_t(want), !readOnly);
@@ -197,6 +226,8 @@ void formatStore(EnvImpl& e)
     os::flushRange(e.fd, e.region->m, 0, 2 * e.pageSize);
     os::syncFile(e.fd, true);
     e.meta = m;
+    e.durableTxn = 0;
+    e.durableSlot = 0;
 }
 
 /// Work out the geometry of an existing store before it can be indexed by
@@ -243,6 +274,7 @@ std::size_t probePageSize(const MappedRegion& r)
 void loadMeta(EnvImpl& e)
 {
     const Meta* best = nullptr;
+    unsigned bestSlot = 0;
     for (unsigned slot = 0; slot < 2; ++slot) {
         if ((slot + 1) * e.pageSize > e.region->m.size)
             break;
@@ -252,12 +284,16 @@ void loadMeta(EnvImpl& e)
         const Meta* m = metaOf(p);
         if (!metaValid(*m, e.pageSize))
             continue;
-        if (!best || m->txnid > best->txnid)
+        if (!best || m->txnid > best->txnid) {
             best = m;
+            bestSlot = slot;
+        }
     }
     if (!best)
         throw Error(ErrorCode::Corrupted, "no usable meta page in " + e.path.string());
     e.meta = *best;
+    e.durableTxn = best->txnid;
+    e.durableSlot = bestSlot;
     if (std::uint64_t(e.meta.deferredCount) + e.meta.inlineCount > e.meta.deferredPages.size())
         throw Error(ErrorCode::Corrupted, "invalid deferred free-page count");
     e.carryOver.assign(e.meta.deferredPages.begin(),
@@ -265,6 +301,27 @@ void loadMeta(EnvImpl& e)
     e.commitGen.store(e.meta.txnid, std::memory_order_release);
     if ((e.meta.lastPgno + 1) * e.pageSize > e.region->m.size)
         throw Error(ErrorCode::Corrupted, "meta references pages beyond the end of the file");
+}
+
+/// Pages the free tree of the snapshot just loaded lists: one walk at open,
+/// so that EnvStats::freePages never needs one.
+std::uint64_t countFreeTreePages(EnvImpl& e)
+{
+    if (e.meta.freeTree.root == kInvalidPage)
+        return 0;
+    TxnImpl t;
+    t.env = &e;
+    t.readOnly = true;
+    t.loadSnapshot(e.meta, e.region);
+    CursorImpl c;
+    c.txn = &t;
+    c.dbi = kFreeDbi;
+    std::uint64_t pages = 0;
+    for (bool ok = cursorFirst(c); ok; ok = cursorNext(c))
+        pages += cursorValue(c).size() / sizeof(PageNo);
+    t.releaseResources();
+    t.env = nullptr;
+    return pages;
 }
 
 }  // namespace
@@ -286,6 +343,11 @@ Env Env::Options::open(const std::filesystem::path& path) const
     e->maxDbs = maxDbs_;
     e->readOnly = readOnly_;
     e->dura = durability_;
+    e->syncIntervalNs = std::chrono::nanoseconds(syncInterval_).count();
+    e->lastSyncNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count(),
+                        std::memory_order_relaxed);
     e->dirtyLimit = dirtyLimit_;
 
     e->fd = os::openFile(path, readOnly_, create_, exclusive_, true, false, fileMode_);
@@ -339,13 +401,19 @@ Env Env::Options::open(const std::filesystem::path& path) const
     }
     const std::uint64_t mapped = readOnly_ ? existing : want;
 
+    // Reserve the address range for the largest file this open may grow to,
+    // so the mapping never has to move (see EnvImpl::growLocked).
+    const std::uint64_t reserve =
+        readOnly_ || !kReserveMapping ? mapped : std::max(mapped, e->sizeUpper);
     e->region = std::make_shared<MappedRegion>();
-    e->region->m = os::mapFile(e->fd, std::size_t(mapped), !readOnly_);
+    e->region->m =
+        os::mapFileReserved(e->fd, std::size_t(mapped), std::size_t(reserve), !readOnly_);
 
     if (fresh)
         formatStore(*e);
     else
         loadMeta(*e);
+    e->freeTreePages = countFreeTreePages(*e);
 
 #ifdef NOSQL_NO_REPLICATION
     if (!ship_.empty())
@@ -396,18 +464,20 @@ void Env::sync(bool force)
     internal::EnvImpl& e = internal::openEnv(impl_);
     if (e.readOnly)
         return;
-    std::lock_guard<std::mutex> lk(e.mtx);
-    if (force || e.dura != Durability::Safe) {
-        // After a failed flush the kernel may have dropped the dirty pages and
-        // report success to a retry: the store is finished until reopened from
-        // its last checksummed meta page (see EnvImpl::failed).
-        try {
-            internal::os::flushRange(e.fd, e.region->m, 0, e.region->m.size);
-            internal::os::syncFile(e.fd, true);
-        } catch (...) {
+    // syncMtx, not mtx: readers and the writer carry on during the flush.
+    std::lock_guard<std::mutex> sl(e.syncMtx);
+    // After a failed flush the kernel may have dropped the dirty pages and
+    // report success to a retry: the store is finished until reopened from
+    // its last checksummed meta page (see EnvImpl::failed).
+    try {
+        internal::syncEnv(e, force);
+    } catch (const Error& err) {
+        if (err.code() != ErrorCode::BadTransaction)
             e.failed.store(true);
-            throw;
-        }
+        throw;
+    } catch (...) {
+        e.failed.store(true);
+        throw;
     }
 }
 

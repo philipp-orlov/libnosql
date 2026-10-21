@@ -8,6 +8,7 @@
 // useless after a month.
 #include <cstring>
 #include <array>
+#include <chrono>
 #include <random>
 #include <thread>
 
@@ -33,11 +34,17 @@ struct FixedKey
 
 }  // namespace
 
-TEST(rewritingTheSameKeysForeverDoesNotGrowTheStore)
+/// `syncEvery` rounds stand in for Lazy's interval, so the run does not depend
+/// on how fast the machine is.
+static void rewriteTheSameKeysForever(Durability mode, int syncEvery = 0)
 {
     tst::Scratch s("steady");
-    Env e =
-        Env::configure().pageSize(4096).maxSize(1ull << 30).sync(Durability::None).open(s.file());
+    Env e = Env::configure()
+                .pageSize(4096)
+                .maxSize(1ull << 30)
+                .sync(mode)
+                .syncInterval(std::chrono::hours(1))
+                .open(s.file());
     constexpr int kKeys = 20000;
     char vbuf[100];
     std::memset(vbuf, 'x', sizeof vbuf);
@@ -60,6 +67,8 @@ TEST(rewritingTheSameKeysForeverDoesNotGrowTheStore)
             for (int i = 0; i < 10; ++i)
                 (void)d.get(FixedKey(i));
         });
+        if (syncEvery && r % syncEvery == 0)
+            e.sync(false);
     };
 
     for (int r = 0; r < 500; ++r)
@@ -74,6 +83,12 @@ TEST(rewritingTheSameKeysForeverDoesNotGrowTheStore)
     CHECK(late.fileSize == warm.fileSize);
     CHECK(late.freePages < 200);
     e.read([&](Txn& t) { checkIntegrity(t); });
+}
+
+TEST(rewritingTheSameKeysForeverDoesNotGrowTheStore)
+{
+    rewriteTheSameKeysForever(Durability::None);
+    rewriteTheSameKeysForever(Durability::Lazy, 100);
 }
 
 TEST(mixedInsertDeleteChurnReachesAPlateau)
@@ -276,7 +291,9 @@ TEST(pageBufferRecyclingHonorsExactCacheBoundaries)
     CHECK(buffers.acquire(31) == cached);
     buffers.release(cached, 31);
     buffers.purge();
-    CHECK_EQ(buffers.allocationSize(33), 33 * pageSize);
+    // Larger runs round up to their bucket too; one that does not fit the
+    // budget goes back to the OS on release.
+    CHECK_EQ(buffers.allocationSize(33), 64 * pageSize);
     buffers.release(buffers.acquire(33), 33);
     CHECK_EQ(buffers.retainedBytes(), 0u);
 }

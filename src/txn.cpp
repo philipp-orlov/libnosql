@@ -10,6 +10,7 @@
 // still needs.
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 
 #ifndef NOSQL_NO_REPLICATION
@@ -32,18 +33,17 @@ void TxnImpl::releaseResources()
     // Buffers go back to the env's recycler rather than to the system
     // allocator: page-sized blocks churning through malloc for months is what
     // fragments a long-running process.
-    if (!owned.empty()) {
-        if (env)
-            for (const auto& [buf, npages] : owned)
-            {
-                env->dirtyBytes.fetch_sub(env->buffers.allocationSize(npages));
-                env->buffers.release(buf, npages);
-            }
-        else
-            for (const auto& [buf, npages] : owned)
-                os::freePage(buf);
-        owned.clear();
+    // Every owned buffer came from env->buffers, so `owned` is empty
+    // whenever `env` is not set. One lock and one counter update for the
+    // whole list: a large commit hands back tens of thousands at once.
+    if (!owned.empty() && env) {
+        std::uint64_t bytes = 0;
+        for (const auto& [buf, npages] : owned)
+            bytes += env->buffers.allocationSize(npages);
+        env->buffers.release(owned.data(), owned.size());
+        env->dirtyBytes.fetch_sub(bytes, std::memory_order_relaxed);
     }
+    owned.clear();
     // `pool` only ever holds buffers that are also in `owned`, so dropping the
     // references here is enough.
     pool.clear();
@@ -57,6 +57,9 @@ void TxnImpl::releaseResources()
     gcKeys.clear();
     gcAdd.clear();
     gcAcc.clear();
+    gcPinned.clear();
+    gcExempt.clear();
+    carryNext.clear();
     reclaim.clear();
     consumed.clear();
     std::size_t remaining = kRetainedScratchBytes;
@@ -83,9 +86,13 @@ void TxnImpl::releaseResources()
     trim(gcKeys);
     trim(gcAdd);
     trim(gcAcc);
+    trim(gcPinned);
+    trim(gcExempt);
     trim(reclaim);
     trim(consumed);
+    trim(carryNext);
     region.reset();
+    seen.clear();
     parent = nullptr;
     child = nullptr;
 }
@@ -95,7 +102,7 @@ void TxnImpl::releaseResources()
 void TxnImpl::reset()
 {
     releaseResources();
-    dbs.clear();
+    resizeDbs(0);
     meta = Meta{};
     env = nullptr;
     readOnly = false;
@@ -107,6 +114,9 @@ void TxnImpl::reset()
     reclaimNext = 0;
     reclaimNextChunk = 0;
     oldest = 0;
+    readersOldest = 0;
+    exemptEpoch = 0;
+    freeTreeDelta = 0;
     reclaimDrained = false;
     inlineAbsorbed = false;
     inlineOurs = false;
@@ -124,7 +134,7 @@ void TxnImpl::loadSnapshot(const Meta& snapshot, std::shared_ptr<MappedRegion> m
     namedDbs = meta.namedDbs;
     // Resize in place rather than assign from a temporary: a recycled object
     // already holds three empty slots, and this touches only the trees.
-    dbs.resize(kCatalogDbi + 1);
+    resizeDbs(kCatalogDbi + 1);
     for (DbSlot& slot : dbs) {
         slot.name.clear();
         slot.dirty = 0;
@@ -143,8 +153,9 @@ Page* TxnImpl::allocBuffer(PageNo p, std::uint16_t flags, unsigned npages)
         buf = pool.back();
         pool.pop_back();
     } else {
+        // A budget, not a synchronization point: relaxed is enough.
         const auto bytes = env->buffers.allocationSize(npages);
-        const auto current = env->dirtyBytes.load();
+        const auto current = env->dirtyBytes.load(std::memory_order_relaxed);
         if (env->dirtyLimit && (bytes > env->dirtyLimit || current > env->dirtyLimit - bytes))
             throw Error(ErrorCode::OutOfMemory, "dirty page budget exceeded; reduce the batch or raise dirtyLimit");
         buf = env->buffers.acquire(npages);
@@ -154,7 +165,7 @@ Page* TxnImpl::allocBuffer(PageNo p, std::uint16_t flags, unsigned npages)
             env->buffers.release(buf, npages);
             throw;
         }
-        env->dirtyBytes.fetch_add(bytes);
+        env->dirtyBytes.fetch_add(bytes, std::memory_order_relaxed);
     }
     buf->pgno = p;
     buf->flags = flags;
@@ -163,6 +174,32 @@ Page* TxnImpl::allocBuffer(PageNo p, std::uint16_t flags, unsigned npages)
 }
 
 namespace {
+
+/// Merges the sorted tail reclaim[joined..] into the sorted unspent part
+/// reclaim[reclaimPos..joined), dropping the spent prefix. Through the
+/// retained gcAcc rather than std::inplace_merge, which takes a temporary
+/// buffer from the heap whenever both parts are non-empty.
+void mergeReclaimed(TxnImpl* t, std::size_t joined)
+{
+    std::vector<PageNo>& rc = t->reclaim;
+    std::vector<PageNo>& out = t->gcAcc;
+    out.resize(rc.size() - t->reclaimPos);
+    std::merge(rc.begin() + std::ptrdiff_t(t->reclaimPos), rc.begin() + std::ptrdiff_t(joined),
+               rc.begin() + std::ptrdiff_t(joined), rc.end(), out.begin());
+    rc.swap(out);
+    t->reclaimPos = 0;
+}
+
+/// Whether this writer may recycle the GC entry (key, chunk). Beyond
+/// `oldest` (Lazy and None, pinned by the last sync) only exempt chunks
+/// written under the current durable commit qualify.
+bool reclaimable(const TxnImpl* t, TxnId key, std::uint64_t chunk) noexcept
+{
+    if (key <= t->oldest)
+        return true;
+    return key <= t->readersOldest && isExemptChunk(chunk) &&
+           exemptEpochOf(chunk) == t->exemptEpoch;
+}
 
 /// Absorb the next GC entry into the reclaim list. Only entries retired by a
 /// transaction no live snapshot can still see are eligible.
@@ -180,8 +217,7 @@ bool reclaimMore(TxnImpl* t)
         for (std::size_t i = 0; i < n; ++i)
             t->reclaim[joined + i] = t->meta.deferredPages[d + i];
         std::sort(t->reclaim.begin() + std::ptrdiff_t(joined), t->reclaim.end());
-        std::inplace_merge(t->reclaim.begin() + std::ptrdiff_t(t->reclaimPos),
-                           t->reclaim.begin() + std::ptrdiff_t(joined), t->reclaim.end());
+        mergeReclaimed(t, joined);
         t->inlineAbsorbed = true;
         return true;
     }
@@ -195,14 +231,25 @@ bool reclaimMore(TxnImpl* t)
         t->reclaimDrained = true;
         return false;
     }
-    const Slice k = cursorKey(c);
-    if (k.size() != kFreeKeyBytes)
-        throw Error(ErrorCode::Corrupted, "invalid free-list key length");
-    const TxnId key = freeKeyTxn(k);
-    const std::uint64_t chunk = freeKeyChunk(k);
-    if (key > t->oldest) {
-        t->reclaimDrained = true;
-        return false;
+    TxnId key;
+    std::uint64_t chunk;
+    for (;;) {
+        const Slice k = cursorKey(c);
+        if (k.size() != kFreeKeyBytes)
+            throw Error(ErrorCode::Corrupted, "invalid free-list key length");
+        key = freeKeyTxn(k);
+        chunk = freeKeyChunk(k);
+        if (key > t->readersOldest) {
+            t->reclaimDrained = true;
+            return false;
+        }
+        if (reclaimable(t, key, chunk))
+            break;
+        // Waits for the next sync; this transaction passes over it.
+        if (!cursorNext(c)) {
+            t->reclaimDrained = true;
+            return false;
+        }
     }
     const Slice v = cursorValue(c);
     const std::size_t n = v.size() / sizeof(PageNo);
@@ -215,19 +262,28 @@ bool reclaimMore(TxnImpl* t)
     // Keep the unspent part fully ordered, not just the new tail: allocating a
     // multi-page overflow run scans it for a contiguous stretch.
     std::sort(t->reclaim.begin() + std::ptrdiff_t(joined), t->reclaim.end());
-    std::inplace_merge(t->reclaim.begin() + std::ptrdiff_t(t->reclaimPos),
-                       t->reclaim.begin() + std::ptrdiff_t(joined), t->reclaim.end());
+    mergeReclaimed(t, joined);
     t->consumed.emplace_back(key, chunk);
+    t->freeTreeDelta -= std::int64_t(n);
     // Resume after this chunk; past the last chunk number, at the next id.
     t->reclaimNext = chunk == kInlineChunk ? key + 1 : key;
     t->reclaimNextChunk = chunk == kInlineChunk ? 0 : chunk + 1;
     return n > 0;
 }
 
-void refreshRegion(TxnImpl* t, std::shared_ptr<MappedRegion> r)
+/// Moves the transaction and its ancestors onto the mapping a growth just
+/// published (only where the mapping cannot grow in place). The root keeps
+/// every mapping the tree has used until it ends: slices handed to the caller
+/// and pointers the writer still holds address them.
+void refreshRegion(TxnImpl* t, const std::shared_ptr<MappedRegion>& r)
 {
-    for (TxnImpl* x = t; x; x = x->parent)
+    TxnImpl* root = t->root();
+    for (TxnImpl* x = t; x; x = x->parent) {
+        if (x->region == r)
+            continue;
+        root->seen.push_back(std::move(x->region));
         x->region = r;
+    }
 }
 
 }  // namespace
@@ -242,7 +298,7 @@ PageNo TxnImpl::allocPages(unsigned count)
 
     TxnImpl* r = root();
     // Scanning for a contiguous run is linear in the reclaim list, so cap how
-    // many times a single multi-page request may absorb-and-rescan. Falling
+    // much a single multi-page request may absorb-and-rescan. Falling
     // through to the end of the file is always correct, and those pages come
     // back through the free list like any others.
     constexpr int kRunScanBudget = 4;
@@ -250,22 +306,30 @@ PageNo TxnImpl::allocPages(unsigned count)
         auto& rc = r->reclaim;
         std::size_t& pos = r->reclaimPos;
         if (!r->noSpend && pos < rc.size()) {
-            if (count == 1)
-                return rc[pos++];
-            if (attempt < kRunScanBudget) {
-                // The list is sorted, so a contiguous stretch of `count` pages shows
-                // up as a matching first and last page number.
-                for (std::size_t i = pos; i + count <= rc.size(); ++i) {
-                    if (rc[i] + count - 1 == rc[i + count - 1]) {
-                        const PageNo p = rc[i];
-                        rc.erase(rc.begin() + std::ptrdiff_t(i),
-                                 rc.begin() + std::ptrdiff_t(i + count));
-                        return p;
-                    }
+            if (count == 1) {
+                const PageNo p = rc[pos++];
+                if (env->deferredMeta())
+                    env->noteBorn(p, 1);
+                return p;
+            }
+            // The list is sorted, so a contiguous stretch of `count` pages shows
+            // up as a matching first and last page number.
+            for (std::size_t i = pos; i + count <= rc.size(); ++i) {
+                if (rc[i] + count - 1 == rc[i + count - 1]) {
+                    const PageNo p = rc[i];
+                    rc.erase(rc.begin() + std::ptrdiff_t(i),
+                             rc.begin() + std::ptrdiff_t(i + count));
+                    if (env->deferredMeta())
+                        env->noteBorn(p, count);
+                    return p;
                 }
             }
         }
-        if (count > 1 && attempt >= kRunScanBudget)
+        // Counted in chunks' worth of pages scanned, so a free list of many
+        // small entries gets the same search as one of a few full ones.
+        if (count > 1 && attempt >= kRunScanBudget &&
+            (rc.size() - pos >= kRunScanBudget * freeChunkPages(pageSize()) ||
+             attempt >= kRunScanBudget * 16))
             break;
         if (!reclaimMore(r))
             break;
@@ -278,8 +342,11 @@ PageNo TxnImpl::allocPages(unsigned count)
     if (need > region->m.size) {
         std::lock_guard<std::mutex> lk(env->mtx);
         env->growLocked(need);
-        refreshRegion(this, env->region);
+        if (env->region != region)
+            refreshRegion(this, env->region);
     }
+    if (env->deferredMeta())
+        env->noteBorn(p, count);
     lastPgno = p + count - 1;
     return p;
 }
@@ -330,10 +397,16 @@ void flushNamedTrees(TxnImpl* t)
 void updateFreelist(TxnImpl* t)
 {
     // Keep room to copy a free-tree path and split it before absorption is
-    // disabled. Otherwise small commits can spend the inline free entry, then
-    // extend the file for GC bookkeeping while older free chunks go unused.
+    // disabled -- and, for a commit that will write chunks of its own rather
+    // than an inline entry, about half a page per chunk. Otherwise small
+    // commits can spend the inline free entry, then extend the file for GC
+    // bookkeeping while older free chunks go unused.
     if (t->treeAt(kFreeDbi).root != kInvalidPage) {
-        const std::size_t reserve = 2 * (std::size_t(t->treeAt(kFreeDbi).depth) + 1);
+        const std::size_t chunkPages = freeChunkPages(t->pageSize());
+        const std::size_t retired = t->pending.size() + t->loose.size();
+        const std::size_t chunkReserve =
+            retired > 16 ? (retired + chunkPages - 1) / chunkPages / 2 + 1 : 0;
+        const std::size_t reserve = 2 * (std::size_t(t->treeAt(kFreeDbi).depth) + 1) + chunkReserve;
         while (t->reclaim.size() - t->reclaimPos + t->loose.size() < reserve)
             if (!reclaimMore(t))
                 break;
@@ -346,8 +419,8 @@ void updateFreelist(TxnImpl* t)
     // would grow by a few pages on every single commit, for ever.
     t->noAbsorb = true;
 
+    // The environment's list stays as it is until this commit is published.
     t->pending.insert(t->pending.end(), t->env->carryOver.begin(), t->env->carryOver.end());
-    t->env->carryOver.clear();
 
     CursorImpl c;
     c.txn = t;
@@ -376,6 +449,7 @@ void updateFreelist(TxnImpl* t)
         for (std::size_t i = 0; i < n; ++i)
             writeLittle(w.data() + i * sizeof(PageNo), PageNo(t->meta.deferredPages[d + i]));
         t->inlineAbsorbed = true;
+        t->freeTreeDelta += std::int64_t(n);
     }
     t->inlineOurs = false;
     t->inlinePages.clear();
@@ -396,6 +470,22 @@ void updateFreelist(TxnImpl* t)
     constexpr std::size_t kInlineMax = 16;
     bool inlineFreed = false;
     std::vector<PageNo>& remainder = t->gcRemainder;
+    // Under Lazy and None, what this commit absorbed and did not spend goes
+    // back under `oldest`, which no absorbed entry is newer than, instead of
+    // under our own id: there it would wait for the next sync although no
+    // snapshot that matters names it. The chunk numbers carry our id, so no
+    // other commit writes the same keys (see remainderChunk).
+    const bool keepReusable = t->env->deferredMeta() && t->txnid < kRemainderTxnLimit;
+    std::size_t writtenOld = 0;     ///< chunks currently recorded under `oldest`
+    std::size_t writtenExempt = 0;  ///< exempt chunks currently recorded under our id
+    std::size_t listed = 0;         ///< pages the chunks written so far list
+    static const std::vector<PageNo> kNone;
+    // Of what this commit retired, the pages handed out since the last sync
+    // are named by no durable snapshot: they go into exempt chunks, which only
+    // readers hold back. The rest waits for the next sync.
+    std::vector<PageNo>& pinned = t->gcPinned;
+    std::vector<PageNo>& exempt = t->gcExempt;
+    const std::vector<PageNo>* retired = &freed;
     for (int round = 0;; ++round) {
         freed.insert(freed.end(), t->pending.begin(), t->pending.end());
         t->pending.clear();
@@ -425,9 +515,49 @@ void updateFreelist(TxnImpl* t)
         // the unspent remainder of what it absorbed goes into the tree. The
         // next small commit then absorbs the inline entry, needs nothing from
         // the tree, and writes no free-list page at all.
-        inlineFreed = !freed.empty() && freed.size() <= kInlineMax;
-        const std::vector<PageNo>& record =
-            inlineFreed ? remainder.assign(remainderBegin, t->reclaim.end()), remainder : acc;
+        remainder.assign(remainderBegin, t->reclaim.end());
+        const std::size_t oldChunks = (remainder.size() + chunkPages - 1) / chunkPages;
+        const bool useOldKeys = keepReusable && oldChunks <= kRemainderChunks;
+        pinned.clear();
+        exempt.clear();
+        if (useOldKeys) {
+            for (const PageNo p : freed)
+                (t->env->isBorn(p) ? exempt : pinned).push_back(p);
+        } else {
+            pinned.assign(freed.begin(), freed.end());
+        }
+        retired = useOldKeys ? &pinned : &freed;
+        inlineFreed = !retired->empty() && retired->size() <= kInlineMax;
+        const std::vector<PageNo>& record = useOldKeys    ? (inlineFreed ? kNone : pinned)
+                                            : inlineFreed ? remainder
+                                                          : acc;
+        const std::size_t exemptChunks =
+            useOldKeys ? (exempt.size() + chunkPages - 1) / chunkPages : 0;
+        for (std::size_t i = 0; i < exemptChunks; ++i) {
+            const std::size_t first = i * chunkPages;
+            const std::size_t n = std::min(chunkPages, exempt.size() - first);
+            WritableSlice w;
+            treePut(c, freeKey(t->txnid, exemptChunk(t->exemptEpoch, i)).slice(),
+                    Slice(nullptr, n * sizeof(PageNo)), PutMode::Upsert, &w);
+            for (std::size_t index = 0; index < n; ++index)
+                writeLittle(w.data() + index * sizeof(PageNo), exempt[first + index]);
+        }
+        for (std::size_t i = exemptChunks; i < writtenExempt; ++i)
+            treeDel(c, freeKey(t->txnid, exemptChunk(t->exemptEpoch, i)).slice());
+        writtenExempt = exemptChunks;
+        const std::size_t keptOld = useOldKeys ? oldChunks : 0;
+        for (std::size_t i = 0; i < keptOld; ++i) {
+            const std::size_t first = i * chunkPages;
+            const std::size_t n = std::min(chunkPages, remainder.size() - first);
+            WritableSlice w;
+            treePut(c, freeKey(t->oldest, remainderChunk(t->txnid, i)).slice(),
+                    Slice(nullptr, n * sizeof(PageNo)), PutMode::Upsert, &w);
+            for (std::size_t index = 0; index < n; ++index)
+                writeLittle(w.data() + index * sizeof(PageNo), remainder[first + index]);
+        }
+        for (std::size_t i = keptOld; i < writtenOld; ++i)
+            treeDel(c, freeKey(t->oldest, remainderChunk(t->txnid, i)).slice());
+        writtenOld = keptOld;
 
         const std::size_t chunks = (record.size() + chunkPages - 1) / chunkPages;
         for (std::size_t i = 0; i < chunks; ++i) {
@@ -443,6 +573,7 @@ void updateFreelist(TxnImpl* t)
         for (std::size_t i = chunks; i < written; ++i)
             treeDel(c, freeKey(t->txnid, i).slice());
         written = chunks;
+        listed = record.size() + (useOldKeys ? remainder.size() + exempt.size() : 0);
         if (acc.empty())
             break;
 
@@ -451,15 +582,17 @@ void updateFreelist(TxnImpl* t)
         if (settled || round + 1 >= kMaxRounds)
             break;
     }
+    t->freeTreeDelta += std::int64_t(listed);
     if (inlineFreed) {
-        t->inlinePages.assign(freed.begin(), freed.end());
+        t->inlinePages.assign(retired->begin(), retired->end());
         t->inlineOurs = true;
     }
 
     // Pages freed too late to make it into the entry above roll into the next
     // writer, which records them then. Until then they are referenced by
     // nothing and listed nowhere, which is safe -- nothing can hand them out.
-    auto& carry = t->env->carryOver;
+    auto& carry = t->carryNext;
+    carry.clear();
     carry.insert(carry.end(), t->pending.begin(), t->pending.end());
     carry.insert(carry.end(), t->loose.begin(), t->loose.end());
     // Both lists share the meta page's array: if they would not fit
@@ -489,11 +622,9 @@ void updateFreelist(TxnImpl* t)
 #endif
 constexpr bool kWriteThroughMapping = NOSQL_WRITE_THROUGH_MAPPING != 0;
 
-/// Write dirty pages into the file, then flush exactly the ranges we touched.
-/// This flush is a barrier, not a hint: it blocks until the data is off every
-/// write-back cache in the stack, so writeMeta() below cannot race it even if
-/// the OS/controller/drive reorder writes freely on either side of the call.
-/// See docs/design.md, "Durability and the memory map".
+/// Write dirty pages into the file and record the runs they occupy. Nothing
+/// is flushed here: writeMeta() decides, by durability mode, whether this
+/// commit flushes the data before its meta page.
 void writePages(TxnImpl* t)
 {
     EnvImpl* e = t->env;
@@ -502,7 +633,8 @@ void writePages(TxnImpl* t)
     {
         std::lock_guard<std::mutex> lk(e->mtx);
         e->growLocked((t->lastPgno + 1) * std::uint64_t(ps));
-        refreshRegion(t, e->region);
+        if (e->region != t->region)
+            refreshRegion(t, e->region);
     }
     std::byte* base = t->region->m.base;
 
@@ -560,15 +692,65 @@ void writePages(TxnImpl* t)
     }
     if (!kWriteThroughMapping)
         writeSpans();
-
-    if (e->dura != Durability::None)
-        os::flushData(e->fd, t->region->m, runs, ps);
 }
 
-/// Runs only after writePages()'s flush has returned, so the new meta page
-/// can never reach stable storage before the pages it points to. Torn writes
-/// of this page specifically are handled by the two-slot checksum scheme in
-/// loadMeta() (Env.cpp), not by write ordering.
+std::int64_t steadyNs() noexcept
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+/// Writes `m` into the meta slot that does not hold the newest durable meta,
+/// so a torn write leaves that one in charge. Caller holds syncMtx.
+unsigned storeMeta(EnvImpl& e, const os::Mapping& view, const Meta& m)
+{
+    const unsigned slot = 1u - e.durableSlot;
+    Page* mp = reinterpret_cast<Page*>(view.base + slot * e.pageSize);
+    mp->pgno = slot;
+    mp->flags = P_META;
+    mp->nkeys = 0;
+    *metaOf(mp) = m;
+    return slot;
+}
+
+void markDurable(EnvImpl& e, TxnId id, unsigned slot)
+{
+    {
+        std::lock_guard<std::mutex> lk(e.mtx);
+        e.durableTxn = id;
+    }
+    e.durableSlot = slot;
+}
+
+/// The deferred-meta sync: every data page of every commit up to `m`, then
+/// its meta page, each flushed before the next step. Caller holds syncMtx.
+void syncTo(EnvImpl& e, const os::Mapping& view, const Meta& m)
+{
+    e.syncRuns.assign(1, {0, m.lastPgno});
+    os::flushData(e.fd, view, e.syncRuns, e.pageSize);
+    const unsigned slot = storeMeta(e, view, m);
+    os::flushRange(e.fd, view, std::size_t(slot) * e.pageSize, e.pageSize);
+    markDurable(e, m.txnid, slot);
+    e.lastSyncNs.store(steadyNs(), std::memory_order_relaxed);
+}
+
+/// Makes the commit visible to new transactions.
+void publish(EnvImpl& e, TxnImpl* t, const Meta& m)
+{
+    std::lock_guard<std::mutex> lk(e.mtx);
+    e.meta = m;
+    e.carryOver.swap(t->carryNext);
+    e.freeTreePages = std::uint64_t(std::int64_t(e.freeTreePages) + t->freeTreeDelta);
+    e.commitGen.store(m.txnid, std::memory_order_release);
+}
+
+/// Builds the new meta and publishes it. What reaches the file, and when,
+/// depends on the durability mode; in every mode a meta page is written only
+/// after the data it names has been flushed, so it can never reach stable
+/// storage before those pages. Torn writes of the meta page itself are
+/// handled by the two-slot checksum scheme in loadMeta() (env.cpp), not by
+/// write ordering.
 void writeMeta(TxnImpl* t)
 {
     EnvImpl* e = t->env;
@@ -588,41 +770,64 @@ void writeMeta(TxnImpl* t)
     m.commitId = newIdentity();
     // The inline slot: ours, or still the snapshot's entry if nothing
     // absorbed or moved it (then it carries forward unchanged), or empty.
-    std::vector<PageNo> inlineKeep;
+    // Both share the array with the deferred pages, which go first.
+    const std::vector<PageNo>& carry = t->carryNext;
+    const std::size_t d = t->meta.deferredCount;
+    const std::size_t inlineCount = t->inlineOurs        ? t->inlinePages.size()
+                                    : !t->inlineAbsorbed ? std::size_t(t->meta.inlineCount)
+                                                         : 0;
+    if (carry.size() + inlineCount > m.deferredPages.size())
+        throw Error(ErrorCode::MapFull,
+                    "deferred free-page budget exceeded; reduce transaction size");
+    m.deferredPages = {};
+    std::copy(carry.begin(), carry.end(), m.deferredPages.begin());
     TxnId inlineTxn = 0;
     if (t->inlineOurs) {
-        inlineKeep = t->inlinePages;
+        std::copy(t->inlinePages.begin(), t->inlinePages.end(),
+                  m.deferredPages.begin() + std::ptrdiff_t(carry.size()));
         inlineTxn = t->txnid;
-    } else if (!t->inlineAbsorbed && t->meta.inlineCount) {
-        const std::size_t d = t->meta.deferredCount;
-        for (std::size_t i = 0; i < t->meta.inlineCount; ++i)
-            inlineKeep.push_back(t->meta.deferredPages[d + i]);
+    } else if (inlineCount) {
+        for (std::size_t i = 0; i < inlineCount; ++i)
+            m.deferredPages[carry.size() + i] = t->meta.deferredPages[d + i];
         inlineTxn = t->meta.inlineTxn;
     }
-    if (e->carryOver.size() + inlineKeep.size() > m.deferredPages.size())
-        throw Error(ErrorCode::MapFull, "deferred free-page budget exceeded; reduce transaction size");
-    m.deferredCount = std::uint32_t(e->carryOver.size());
-    m.inlineCount = std::uint32_t(inlineKeep.size());
+    m.deferredCount = std::uint32_t(carry.size());
+    m.inlineCount = std::uint32_t(inlineCount);
     m.inlineTxn = inlineTxn;
-    m.deferredPages = {};
-    std::copy(e->carryOver.begin(), e->carryOver.end(), m.deferredPages.begin());
-    std::copy(inlineKeep.begin(), inlineKeep.end(), m.deferredPages.begin() + std::ptrdiff_t(e->carryOver.size()));
     m.checksum = metaChecksum(m);
 
-    const unsigned slot = metaSlotFor(t->txnid);
-    Page* mp = e->mapPage(*t->region, slot);
-    mp->pgno = slot;
-    mp->flags = P_META;
-    mp->nkeys = 0;
-    *metaOf(mp) = m;
-
-    if (e->dura == Durability::Safe)
-        os::flushRange(e->fd, t->region->m, std::size_t(slot * e->pageSize), e->pageSize);
-
-    {
-        std::lock_guard<std::mutex> lk(e->mtx);
-        e->meta = m;
-        e->commitGen.store(m.txnid, std::memory_order_release);
+    const bool lazyDue =
+        e->dura == Durability::Lazy &&
+        steadyNs() - e->lastSyncNs.load(std::memory_order_relaxed) >= e->syncIntervalNs;
+    if (e->dura == Durability::Safe || e->dura == Durability::NoMetaSync) {
+        std::lock_guard<std::mutex> sl(e->syncMtx);
+        // A barrier, not a hint: it blocks until the data is off every
+        // write-back cache in the stack, so the meta write below cannot race
+        // it even if the OS, controller or drive reorder writes freely on
+        // either side. See docs/design.md, "Durability and the memory map".
+        os::flushData(e->fd, t->region->m, t->flushRuns, e->pageSize);
+        // The same barrier carried the previous NoMetaSync meta to the device.
+        if (e->unflushedTxn) {
+            markDurable(*e, e->unflushedTxn, e->unflushedSlot);
+            e->unflushedTxn = 0;
+        }
+        const unsigned slot = storeMeta(*e, t->region->m, m);
+        if (e->dura == Durability::Safe) {
+            os::flushRange(e->fd, t->region->m, std::size_t(slot) * e->pageSize, e->pageSize);
+            markDurable(*e, m.txnid, slot);
+        } else {
+            e->unflushedTxn = m.txnid;
+            e->unflushedSlot = slot;
+        }
+        publish(*e, t, m);
+    } else if (lazyDue) {
+        std::lock_guard<std::mutex> sl(e->syncMtx);
+        syncTo(*e, t->region->m, m);
+        publish(*e, t, m);
+    } else {
+        // Lazy before its interval, and None: the meta lives in memory only.
+        // Readers take their snapshot from e->meta, never from the file.
+        publish(*e, t, m);
     }
     // After the flush, so a woken waiter's snapshot always contains the commit.
     e->commitCv.notify_all();
@@ -659,7 +864,7 @@ void commitNested(TxnImpl* t)
     // Fold the child's view of every sub-database back into the parent, but
     // keep the parent's own "needs writing back" bits: it may have dirtied a
     // tree before the child ever opened it.
-    p->dbs.resize(t->dbs.size());
+    p->resizeDbs(t->dbs.size());
     for (std::size_t i = 0; i < t->dbs.size(); ++i) {
         const std::uint8_t wasDirty = p->dbs[i].dirty;
         p->dbs[i] = t->dbs[i];
@@ -744,10 +949,11 @@ void txnCommit(TxnImpl* t)
     // meta page -- nothing is published until writeMeta succeeds -- but the
     // writer slot still has to be handed back.
     //
-    // Running out of room (MapFull) before the first page is written is the
-    // one failure that is a plain refusal rather than a fault: the file has
-    // not been touched, so the store stays usable and only this transaction is
-    // lost. Everything else poisons the handle (see Env::writeTxn).
+    // Any failure before the first page is written (MapFull, or an IoError
+    // such as ENOSPC from growing the file) is a plain refusal rather than a
+    // fault: no page a snapshot names has been touched, so the store stays
+    // usable and only this transaction is lost. Everything after that point
+    // poisons the handle (see Env::writeTxn).
     bool untouched = true;
     try {
         flushNamedTrees(t);
@@ -764,17 +970,48 @@ void txnCommit(TxnImpl* t)
         // the dirty buffers held. Cannot fail the commit: see ShipWriter.
         if (e->ship)
             e->ship->capture(e->meta, t->flushRuns, t->region->m.base);
-    } catch (const Error& err) {
-        if (!(untouched && err.code() == ErrorCode::MapFull))
-            e->failed.store(true);
-        finishWriter(t);
-        throw;
     } catch (...) {
-        e->failed.store(true);
+        if (!untouched)
+            e->failed.store(true);
         finishWriter(t);
         throw;
     }
     finishWriter(t);
+}
+
+void syncEnv(EnvImpl& e, bool force)
+{
+    Meta m;
+    os::Mapping view;
+    std::shared_ptr<MappedRegion> keep;
+    TxnId durable;
+    {
+        std::lock_guard<std::mutex> lk(e.mtx);
+        m = e.meta;
+        keep = e.region;  // where the mapping can move, this one stays mapped
+        view = e.region->m;
+        durable = e.durableTxn;
+    }
+    if (e.deferredMeta()) {
+        // A failed flush may have lost pages the in-memory meta names; it
+        // must never be written. The store reopens on its last durable meta.
+        if (e.failed.load())
+            throw Error(ErrorCode::BadTransaction,
+                        "commit failed; close and reopen the environment");
+        if (m.txnid > durable)
+            syncTo(e, view, m);
+        else if (force)
+            os::syncFile(e.fd, true);
+        return;
+    }
+    if (!force && e.dura == Durability::Safe)
+        return;
+    os::flushRange(e.fd, view, 0, view.size);
+    os::syncFile(e.fd, true);
+    if (e.unflushedTxn) {
+        markDurable(e, e.unflushedTxn, e.unflushedSlot);
+        e.unflushedTxn = 0;
+    }
 }
 
 void txnAbort(TxnImpl* t)

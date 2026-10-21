@@ -9,6 +9,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <chrono>
+#include <thread>
+
 #include "nosql/internal/io_observer.hpp"
 #include "nosql/internal/os.hpp"
 #ifndef NOSQL_TEST_NO_BLOB
@@ -167,7 +170,10 @@ TEST(fileTruncatedBehindTheProcessIsAnErrorNotSigbus)
     Env env = Env::configure().initialSize(1u << 20).open(scratch.file());
     env.write([](Txn& txn) { txn.mainDb().put("key", "value"); });
     CHECK(::truncate(scratch.file().c_str(), 4096) == 0);
+    // Readers check at most every 100 ms; writers every time.
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
     CHECK_THROWS(env.readTxn(), ErrorCode::IoError);
+    CHECK_THROWS(env.readTxn(), ErrorCode::IoError);  // not only the first reader
     CHECK_THROWS(env.writeTxn(), ErrorCode::IoError);
 }
 
@@ -264,6 +270,60 @@ TEST(reachingMaxSizeIsARefusalNotAFault)
     // The store is not poisoned: it reads, and it takes a write that fits.
     env.read([&](Txn& txn) { CHECK_EQ(txn.mainDb().at("k0").string(), payload); });
     env.write([&](Txn& txn) { txn.mainDb().erase("k0"); });
+}
+
+TEST(growthFailureAtCommitIsARefusalNotAFault)
+{
+    // ENOSPC from growing the file before any page is written leaves every
+    // snapshot untouched, so it refuses the commit without poisoning the store.
+    tst::Scratch scratch("grow-failure");
+    Env env = Env::configure().pageSize(4096).initialSize(16 * 4096).growthStep(4096).open(
+        scratch.file());
+    const std::string value(300, 'v');
+    env.write([&](Txn& txn) {
+        for (int i = 0; i < 2000; ++i)
+            txn.mainDb().put(tst::keyOf(i), value);
+    });
+    bool armed = false;
+    bool refused = false;
+    std::uint64_t left = 2000;
+    {
+        ScopedIoObserver fault([&](IoEvent event, std::size_t) {
+            if (armed && event == IoEvent::Reserve)
+                throw Error(ErrorCode::IoError, "injected ENOSPC");
+        });
+        // A reader pins the old pages, so the free-list write at commit has to
+        // take new pages from the end of the file and sooner or later grow it.
+        Txn pin = env.readTxn();
+        for (int round = 0; round < 100 && !refused; ++round) {
+            armed = false;
+            try {
+                env.write([&](Txn& txn) {
+                    Db db = txn.mainDb();
+                    for (int i = 0; i < 20; ++i)
+                        db.erase(tst::keyOf(round * 20 + i));
+                    armed = true;  // only the commit below may fail
+                });
+                left -= 20;
+            } catch (const Error& e) {
+                CHECK(e.code() == ErrorCode::IoError);
+                CHECK(armed);
+                refused = true;
+            }
+        }
+        armed = false;
+    }
+    CHECK(refused);
+    // Not poisoned: the store reads, takes another commit, and is whole.
+    env.write([&](Txn& txn) { txn.mainDb().put("after", "yes"); });
+    env.read([&](Txn& txn) {
+        checkIntegrity(txn);
+        CHECK_EQ(txn.mainDb().at("after").string(), std::string("yes"));
+        CHECK_EQ(txn.mainDb().count(), left + 1);
+    });
+    env.close();
+    env = Env::configure().open(scratch.file());
+    env.read([](Txn& txn) { checkIntegrity(txn); });
 }
 
 TEST(sharedHandlesReadConcurrentlyAndKeepTheStoreOpen)

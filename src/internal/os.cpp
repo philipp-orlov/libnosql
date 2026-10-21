@@ -50,6 +50,14 @@ struct alignas(64) PageAllocation
 
 constexpr std::size_t kMappedAllocationMin = 64u << 10;
 
+#if !defined(_WIN32)
+#ifdef MAP_NORESERVE
+constexpr int kNoReserve = MAP_NORESERVE;
+#else
+constexpr int kNoReserve = 0;
+#endif
+#endif
+
 #ifdef _WIN32
 [[noreturn]] void fail(ErrorCode code, const char* what)
 {
@@ -116,6 +124,40 @@ void freePage(void* p) noexcept
         ::munmap(allocation, allocation->bytes);
     else
         std::free(allocation);
+#endif
+}
+
+void* mapMemory(std::size_t bytes)
+{
+#ifdef _WIN32
+    void* memory = ::VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* memory =
+        ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (memory == MAP_FAILED)
+        memory = nullptr;
+#endif
+    if (!memory)
+        throw Error(ErrorCode::OutOfMemory, "page buffer slab allocation failed");
+    return memory;
+}
+
+void unmapMemory(void* p, std::size_t bytes) noexcept
+{
+#ifdef _WIN32
+    (void)bytes;
+    ::VirtualFree(p, 0, MEM_RELEASE);
+#else
+    ::munmap(p, bytes);
+#endif
+}
+
+void discardMemory(void* p, std::size_t bytes) noexcept
+{
+#ifdef _WIN32
+    (void)::VirtualAlloc(p, bytes, MEM_RESET, PAGE_READWRITE);
+#else
+    (void)::madvise(p, bytes, MADV_DONTNEED);
 #endif
 }
 
@@ -286,6 +328,16 @@ Mapping mapFile(FileHandle h, std::size_t size, bool writable)
     m.size = size;
     m.section = sec;
     return m;
+}
+
+Mapping mapFileReserved(FileHandle h, std::size_t size, std::size_t, bool writable)
+{
+    return mapFile(h, size, writable);
+}
+
+bool extendMapping(FileHandle, Mapping&, std::size_t, bool)
+{
+    return false;
 }
 
 void unmap(Mapping& m) noexcept
@@ -587,10 +639,62 @@ Mapping mapFile(FileHandle fd, std::size_t size, bool writable)
     return m;
 }
 
+Mapping mapFileReserved(FileHandle fd, std::size_t size, std::size_t reserve, bool writable)
+{
+    // Only address space: PROT_NONE private memory is not charged against the
+    // commit limit, and MAP_NORESERVE asks for no swap either. The file is
+    // then mapped over the front of it, and later extents follow in place.
+    const std::size_t sp = systemPageSize();
+    const std::size_t mapped = (size + sp - 1) & ~(sp - 1);
+    const std::size_t span = std::max(mapped, (reserve + sp - 1) & ~(sp - 1));
+    void* base = ::mmap(nullptr, span, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | kNoReserve, -1, 0);
+    if (base == MAP_FAILED)
+        fail(ErrorCode::IoError, "mmap (address space reservation for maxSize)");
+    const int prot = writable ? (PROT_READ | PROT_WRITE) : PROT_READ;
+    if (mapped && ::mmap(base, mapped, prot, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED) {
+        const int e = errno;
+        ::munmap(base, span);
+        errno = e;
+        fail(ErrorCode::IoError, "mmap");
+    }
+    Mapping m;
+    m.base = static_cast<std::byte*>(base);
+    m.size = size;
+    m.reserved = span;
+    return m;
+}
+
+bool extendMapping(FileHandle fd, Mapping& m, std::size_t size, bool writable)
+{
+    if (!m.reserved || size > m.reserved)
+        return false;
+    // The system page that holds the old end is already mapped; it is the
+    // same page-cache page whatever the file size, so it needs no remapping.
+    const std::size_t sp = systemPageSize();
+    const std::size_t from = (m.size + sp - 1) & ~(sp - 1);
+    const std::size_t to = (size + sp - 1) & ~(sp - 1);
+    if (to > from) {
+        const int prot = writable ? (PROT_READ | PROT_WRITE) : PROT_READ;
+        if (::mmap(m.base + from, to - from, prot, MAP_SHARED | MAP_FIXED, fd, off_t(from)) ==
+            MAP_FAILED) {
+            const int e = errno;
+            // A failed MAP_FIXED may already have dropped the reservation there;
+            // take the range back so no other mapping can land inside ours.
+            (void)::mmap(m.base + from, to - from, PROT_NONE,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | kNoReserve, -1, 0);
+            errno = e;
+            fail(ErrorCode::IoError, "mmap (extend)");
+        }
+    }
+    if (size > m.size)
+        m.size = size;
+    return true;
+}
+
 void unmap(Mapping& m) noexcept
 {
     if (m.base)
-        ::munmap(m.base, m.size);
+        ::munmap(m.base, m.reserved ? m.reserved : m.size);
     m = Mapping{};
 }
 

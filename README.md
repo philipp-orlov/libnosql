@@ -142,14 +142,15 @@ is built):
 | `overflow` | large values, overflow runs, reclaim of runs |
 | `reclaim` | free list, GC rules, drop returning pages |
 | `steady` | long-run plateau: page count and file size stop moving |
-| `memory` | allocation-free warm reuse, bounded scratch, mapping ownership and allocation failures |
+| `memory` | allocation-free warm reuse, slab page buffers, bounded scratch, mapping ownership and allocation failures |
+| `allocbudget` | zero heap allocations per warm transaction, a flat heap across churn rounds, slices that survive a growth |
 | `mvcc` | snapshot isolation, readers versus writer, reader pinning |
 | `torture` | randomized operation mixes checked against a `std::map` oracle |
 | `mq` | queue semantics: FIFO, leases, redelivery, dead-lettering |
 | `mqsteady` | queues under sustained send/receive: no unbounded growth |
 | `replication` | checkpoints, base images, bundle format, apply, divergence |
 | `replicationtorture` | randomized workloads: a replica must match the primary exactly |
-| `fault` | deterministic I/O and partial-write failures around commit/apply/compaction |
+| `fault` | deterministic I/O and partial-write failures around commit/apply/compaction; power cuts at each step of a `NoMetaSync` commit and of a `Lazy`/`None` sync |
 | `format` | little-endian bytes, 64-bit page/run hashes, catalog separation, compaction and unsupported-format rejection |
 | `checksum` | golden digests, independent reference equality, streaming splits, alignment and concurrency |
 | `tar` | the `BlobStorage` side-car archive and its index |
@@ -207,7 +208,7 @@ default, so `nosql::Env store("app.db")` works too.
 | setting | default | meaning |
 |---|---|---|
 | `pageSize(n)` | 4096 (new store) | power of two in [1024, 65536]. An existing store's page size is adopted automatically; pinning a different one is an error. |
-| `maxSize(n)` | 64 GiB | hard ceiling; exceeding it raises `MapFull`. Address space is *not* reserved up front. A ceiling for a database that owns its disk, not a budget: set it from your own capacity if the volume is shared. |
+| `maxSize(n)` | 64 GiB | hard ceiling; exceeding it raises `MapFull`. On POSIX a writable store reserves this much address space at open (no memory or swap), so growth never moves the mapping. A ceiling for a database that owns its disk, not a budget: set it from your own capacity if the volume is shared. |
 | `initialSize(n)` | 16 pages | pre-size the file to avoid early growth. |
 | `growthStep(n)` | max(1 MiB, 64 pages) | minimum growth increment; growth is also geometric. |
 | `maxDbs(n)` | 128 | how many named sub-databases can be open at once. |
@@ -218,6 +219,7 @@ default, so `nosql::Env store("app.db")` works too.
 | `preallocate(b)` | on | `fallocate` when the file grows, so a full disk is an `IoError` at growth instead of a fault later; the file then occupies its whole size on disk. |
 | `allowNetworkFilesystem(b)` | off | NFS, SMB, FUSE and similar are refused with `ErrorCode::Unsupported` (Linux): `flock` is not dependable there and remote truncation arrives as SIGBUS. |
 | `sync(Durability)` | `Durability::Safe` | see below. |
+| `syncInterval(d)` | 1 second | under `Durability::Lazy`, the first commit this long after the last sync runs the next one; zero syncs every commit. |
 | `cacheReadChecksums(b)` | off | let readers trust a page check this process already made; see the integrity tradeoff below. |
 | `revalidateAfter(d)` | 1 minute | how long a cached page check may be trusted; zero means for ever. |
 | `bufferCache(n)` | 32 MiB | page buffers kept recycled between transactions. |
@@ -335,13 +337,19 @@ when the tree shape changes underneath them.
 |---|---|---|---|
 | `Durability::Safe` (default) | flush data, write meta, flush meta | last commit intact | last commit intact |
 | `Durability::NoMetaSync` | flush data, write meta | last commit intact | consistent, may lose recent commits |
-| `Durability::None` | nothing | consistent, may lose recent commits | consistent, may lose recent commits |
+| `Durability::Lazy` | nothing, but a commit at least `syncInterval` after the last sync syncs | opens on the last sync | opens on the last sync |
+| `Durability::None` | nothing; only `Env::sync()` and closing sync | opens on the last sync | opens on the last sync |
 
 Every mode is *consistent* — the store always opens on some committed
-snapshot, never on a half-written one. The modes differ only in how many
-recent commits a crash can take with it. `Env::sync(true)` forces everything
-out at any time, which is how you make a `Durability::None`-mode bulk load
-durable.
+snapshot, never on a half-written one, after a process crash and after a power
+loss alike. The modes differ only in how many recent commits a crash can take
+with it. Under `Lazy` and `None` the newest meta lives in memory until a sync:
+flush the data, write the meta, flush its page. `Lazy` is group commit: two
+device flushes per interval however many commits land in it. Nothing syncs on a
+timer, so call `Env::sync()` on an idle `Lazy` store to bound what a crash can
+lose; closing the store syncs too. `Env::sync()` blocks neither readers nor the
+writer, and is how you make a `Durability::None`-mode bulk load durable.
+`EnvStats::durableTxn` is the newest commit on stable storage.
 
 ### Maintenance
 
@@ -638,9 +646,9 @@ left unbuilt.
 Shadow paging, as in LMDB. `docs/design.md` has the full write-up; the short
 version:
 
-* Pages 0 and 1 are meta pages, alternating by transaction-id parity, each
-  checksummed. Open picks the newest one that validates, so a torn meta write
-  costs you the last commit and nothing else.
+* Pages 0 and 1 are meta pages, each checksummed; a meta is always written into
+  the one not holding the newest durable meta. Open picks the newest one that
+  validates, so a torn meta write costs you the last commit and nothing else.
 * A write transaction copies every page it touches to a new page number and
   rewrites the parent pointer, all the way up to the root. Nothing an older
   snapshot can reach is ever overwritten.
@@ -653,13 +661,15 @@ version:
   good to fall back on. A commit that freed only a few pages (up to 16) lists
   them in the meta page instead; the next commit takes them from there first,
   so a run of small commits writes no free-list page at all. If a reader still
-  pins that entry, the next commit moves it into the tree.
+  pins that entry, the next commit moves it into the tree. Under `Lazy` and
+  `None` the newest durable snapshot pins reclamation like a reader does, except
+  for pages written since it, which it never named.
 * The file is mapped read/write and, by default, written by `memcpy` into the map,
   then flushed with a data barrier before meta publication (compile with
-  `-DNOSQL_WRITE_THROUGH_MAPPING=0` to write runs with `pwritev` instead). Growing the
-  file publishes a new
-  mapping and keeps the old ones alive until the transactions that saw them
-  are gone.
+  `-DNOSQL_WRITE_THROUGH_MAPPING=0` to write runs with `pwritev` instead). On
+  POSIX the mapping sits in an address range reserved for `maxSize` and grows in
+  place; on Windows growing the file publishes a new mapping and keeps the old
+  ones alive until the transactions that saw them are gone.
 
 `docs/design.md` also ends with a short reconstruction order: the primitives to
 implement and test, in dependency order, and the fault-injection hooks the tests use.
@@ -731,18 +741,20 @@ taskset -c 0 ./build/examples/bench 500000 100 4096 transaction
 
 ## Running for a long time
 
-Page recycling stores free-list links inside idle buffers, so returning a buffer
-never allocates bookkeeping or swallows an allocation exception. Power-of-two
-classes also recycle large overflow runs when their rounded size fits the budget.
-Backing allocations of 64 KiB or more use anonymous OS mappings, separating them
-from small heap objects. Smaller buffers use the system allocator on cache misses.
+Page buffers never touch the heap: they are carved from 1 MiB slabs the pool maps
+from the OS, one power-of-two class of pages per slab, with the slab's
+bookkeeping in its own first page. Idle buffers within `bufferCache` stay
+resident and hold their own free-list links, so returning one never allocates;
+past the budget a buffer's memory goes back to the OS and an empty slab is
+unmapped. One large transaction therefore leaves `bufferCache` behind, not a
+heap full of freed page-sized blocks.
 
 Transaction scratch retains up to 2 MiB of container capacity per transaction,
 including its dirty-page table, whose occupancy bitmap keeps visiting and
 clearing it proportional to the pages a transaction actually dirtied rather than
 to the capacity an earlier bulk load grew it to. Capacity exceeding that budget
 is released. Public cursors are recycled through a small per-thread pool, so a
-range scan or a join's inner probe allocates no cursor object. The pool holds at most 32 transactions; active or
+range scan or a join's inner probe allocates no cursor object. The pool holds at most 8 transactions; active or
 externally retained transaction handles can add further objects. Named-database
 slots, arena chunks, public cursors and queue objects are separate allocations.
 
@@ -756,12 +768,14 @@ the copy-on-write commit protocol and file format are unchanged, with no WAL.
 The Linux static-build allocation probes measure zero `new`, page-backing
 allocation and direct free/unmap calls over 1,000 warmed 256 KiB overwrite/read
 transactions, and over 12 warmed batches of 8,192 records (`tests/test_memory.cpp`
-prints `new=0 backing=0 frees=0` for both). These are specific steady-state
-regressions, not a promise that every workload or the whole process is allocation-free.
+prints `new=0 backing=0 frees=0` for both), and `tests/test_alloc_budget.cpp`
+asserts zero heap allocations per warm write and read transaction under `None`,
+`Lazy` and `Safe`. These are specific steady-state regressions, not a promise
+that every workload or the whole process is allocation-free.
 
 `Env::Options::dirtyLimit(bytes)` defaults to 256 MiB of active dirty buffers
 (zero disables the limit); `bufferCache(bytes)` separately limits idle buffer
-payload bytes, excluding allocation headers and OS mapping-rounding overhead.
+payload bytes, excluding slab headers and power-of-two class rounding.
 Compaction uses a streaming page builder, retaining one page per active level
 and chunking large values instead of buffering a destination transaction.
 Source snapshot state, catalog names, and the integrity bitmap remain additional

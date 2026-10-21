@@ -5,7 +5,8 @@ target_link_libraries(nosql_testmain PUBLIC nosql)
 # even where the snake_case source file needs an underscore ("test_mq_steady.cpp").
 set(NOSQL_TEST_LIST Basic:basic Env:env Cursor:cursor Named:named Nested:nested
     Overflow:overflow Reclaim:reclaim Steady:steady Memory:memory
-    Mvcc:mvcc Torture:torture Format:format Checksum:checksum Hardening:hardening)
+    Mvcc:mvcc Torture:torture Format:format Checksum:checksum Hardening:hardening
+    AllocBudget:alloc_budget)
 if(NOSQL_WITH_MQ)
     list(APPEND NOSQL_TEST_LIST Mq:mq MqSteady:mq_steady)
 endif()
@@ -30,6 +31,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT BUILD_SHARED_LIBS)
     target_link_options(test_memory PRIVATE
         "LINKER:--wrap=aligned_alloc" "LINKER:--wrap=free"
         "LINKER:--wrap=mmap" "LINKER:--wrap=munmap")
+    target_compile_definitions(test_allocbudget PRIVATE NOSQL_TEST_WRAP_ALLOCATIONS)
+    target_link_options(test_allocbudget PRIVATE "LINKER:--wrap=aligned_alloc")
 endif()
 
 if(NOSQL_WITH_BLOB)

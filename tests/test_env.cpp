@@ -3,11 +3,14 @@
 
 // Store-level behaviour: geometry, Durability modes, locking, compaction.
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
+#include <mutex>
 #include <thread>
 #include <vector>
 
 #include "nosql/nosql.hpp"
+#include "nosql/internal/io_observer.hpp"
 #include "tests/test_util.hpp"
 
 using namespace nosql;
@@ -128,7 +131,8 @@ TEST(mapFullIsReportedNotCrashed)
 
 TEST(durabilityModesAllRoundTrip)
 {
-    for (Durability d : {Durability::Safe, Durability::NoMetaSync, Durability::None}) {
+    for (Durability d :
+         {Durability::Safe, Durability::NoMetaSync, Durability::None, Durability::Lazy}) {
         tst::Scratch s("env");
         {
             Env e = Env::configure().sync(d).open(s.file());
@@ -144,6 +148,120 @@ TEST(durabilityModesAllRoundTrip)
             checkIntegrity(t);
         });
     }
+}
+
+namespace {
+
+/// Device flushes (data barriers, meta barriers) that `fn` causes.
+template <class F>
+std::pair<unsigned, unsigned> barriersOf(F&& fn)
+{
+    unsigned data = 0, meta = 0;
+    internal::os::ScopedIoObserver observer([&](internal::os::IoEvent event, std::size_t) {
+        data += event == internal::os::IoEvent::DataBarrier;
+        meta += event == internal::os::IoEvent::MetaBarrier;
+    });
+    fn();
+    return {data, meta};
+}
+
+}  // namespace
+
+TEST(lazyDurabilitySyncsOncePerInterval)
+{
+    tst::Scratch s("env");
+    using std::chrono::milliseconds;
+    const auto put = [](Env& e, int i) {
+        e.write([&](Txn& t) { t.mainDb().put(tst::keyOf(i), "v"); });
+    };
+    {
+        // A zero interval syncs every commit, like Safe.
+        Env e =
+            Env::configure().sync(Durability::Lazy).syncInterval(milliseconds(0)).open(s.file());
+        CHECK(barriersOf([&] { put(e, 0); }) == std::make_pair(1u, 1u));
+        CHECK_EQ(e.stats().durableTxn, e.stats().lastTxn);
+    }
+    {
+        Env e =
+            Env::configure().sync(Durability::Lazy).syncInterval(milliseconds(200)).open(s.file());
+        const std::uint64_t durable = e.stats().durableTxn;
+        CHECK(barriersOf([&] {
+                  for (int i = 1; i < 6; ++i)
+                      put(e, i);
+              }) == std::make_pair(0u, 0u));
+        CHECK_EQ(e.stats().durableTxn, durable);
+        CHECK_EQ(e.stats().lastTxn, durable + 5);
+        // Readers see every commit, durable or not.
+        e.read([](Txn& t) { CHECK_EQ(t.mainDb().count(), std::uint64_t(6)); });
+        std::this_thread::sleep_for(milliseconds(250));
+        CHECK(barriersOf([&] { put(e, 6); }) == std::make_pair(1u, 1u));
+        CHECK_EQ(e.stats().durableTxn, e.stats().lastTxn);
+        put(e, 7);
+        CHECK(barriersOf([&] { e.sync(false); }) == std::make_pair(1u, 1u));
+        CHECK_EQ(e.stats().durableTxn, e.stats().lastTxn);
+        // Nothing new: nothing to flush.
+        CHECK(barriersOf([&] { e.sync(false); }) == std::make_pair(0u, 0u));
+        put(e, 8);
+    }
+    // Closing synced the last commit.
+    Env e = Env::configure().readOnly().open(s.file());
+    e.read([](Txn& t) { CHECK_EQ(t.mainDb().count(), std::uint64_t(9)); });
+}
+
+TEST(durableTxnFollowsTheMode)
+{
+    for (Durability d : {Durability::Safe, Durability::NoMetaSync, Durability::None}) {
+        tst::Scratch s("env");
+        Env e = Env::configure().sync(d).open(s.file());
+        for (int i = 0; i < 3; ++i)
+            e.write([&](Txn& t) { t.mainDb().put(tst::keyOf(i), "v"); });
+        const EnvStats st = e.stats();
+        if (d == Durability::Safe)
+            CHECK_EQ(st.durableTxn, st.lastTxn);
+        else if (d == Durability::NoMetaSync)
+            CHECK_EQ(st.durableTxn, st.lastTxn - 1);  // flushed with the next commit
+        else
+            CHECK_EQ(st.durableTxn, std::uint64_t(0));
+        e.sync(false);
+        CHECK_EQ(e.stats().durableTxn, st.lastTxn);
+    }
+}
+
+TEST(syncDoesNotBlockReadersDuringTheFlush)
+{
+    tst::Scratch s("env");
+    Env e = Env::configure().sync(Durability::None).open(s.file());
+    e.write([](Txn& t) { t.mainDb().put("k", "v"); });
+    std::mutex m;
+    std::condition_variable cv;
+    bool flushing = false, released = false;
+    std::thread syncer([&] {
+        internal::os::ScopedIoObserver observer([&](internal::os::IoEvent event, std::size_t) {
+            if (event != internal::os::IoEvent::Sync)
+                return;
+            std::unique_lock<std::mutex> lk(m);
+            flushing = true;
+            cv.notify_all();
+            cv.wait_for(lk, std::chrono::seconds(5), [&] { return released; });
+        });
+        e.sync();
+    });
+    {
+        std::unique_lock<std::mutex> lk(m);
+        cv.wait(lk, [&] { return flushing; });
+    }
+    // The flush is in progress; a reader and a writer still get through.
+    const auto t0 = std::chrono::steady_clock::now();
+    e.read([](Txn& t) { CHECK_EQ(t.mainDb().at("k").string(), std::string("v")); });
+    e.write([](Txn& t) { t.mainDb().put("k2", "v2"); });
+    const auto waited = std::chrono::steady_clock::now() - t0;
+    {
+        std::lock_guard<std::mutex> lk(m);
+        released = true;
+    }
+    cv.notify_all();
+    syncer.join();
+    CHECK(waited < std::chrono::seconds(2));
 }
 
 TEST(compactRebuildsADenseCopy)
