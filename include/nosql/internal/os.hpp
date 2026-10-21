@@ -20,12 +20,15 @@ using FileHandle = int;
 inline constexpr FileHandle kInvalidFile = -1;
 #endif
 
-/// A live mapping of the whole file. Recreated (never resized in place) when
-/// the file grows, so readers holding an older mapping stay valid.
+/// A live mapping of the whole file. Where mapFileReserved() could reserve
+/// address space (POSIX), growth maps the new extent in place and the base
+/// never moves. Elsewhere (Windows) the mapping is recreated when the file
+/// grows, so readers holding an older mapping stay valid.
 struct Mapping
 {
     std::byte* base = nullptr;
     std::size_t size = 0;
+    std::size_t reserved = 0;  ///< address space held from `base`; 0 for a plain mapping
 #ifdef _WIN32
     void* section = nullptr;  // file mapping HANDLE
 #endif
@@ -107,6 +110,15 @@ struct Span
 void writeAtV(FileHandle, std::uint64_t offset, const Span* parts, unsigned count);
 
 Mapping mapFile(FileHandle, std::size_t size, bool writable);
+/// Reserves `reserve` bytes of address space (no memory, no swap) and maps the
+/// first `size` bytes of the file at its start, so extendMapping() can later
+/// grow the mapping without moving it. Where the platform cannot reserve
+/// (Windows), this is mapFile() and `reserved` stays 0.
+Mapping mapFileReserved(FileHandle, std::size_t size, std::size_t reserve, bool writable);
+/// Maps the file up to `size` bytes in place, inside the reservation of a
+/// mapping from mapFileReserved(). False when the mapping has no reservation
+/// or `size` exceeds it; the caller then makes a new mapping.
+bool extendMapping(FileHandle, Mapping&, std::size_t size, bool writable);
 void unmap(Mapping&) noexcept;
 /// Flush [offset, offset+length) of a writable mapping through to storage.
 /// Blocks until the range is durable on the device (msync(MS_SYNC), or
@@ -133,5 +145,13 @@ void advise(const Mapping&, std::size_t offset, std::size_t length, Advice) noex
 
 void* allocPage(std::size_t size);
 void freePage(void*) noexcept;
+
+/// Anonymous read-write memory straight from the OS, page aligned; throws
+/// ErrorCode::OutOfMemory. Never touches the process heap.
+void* mapMemory(std::size_t bytes);
+void unmapMemory(void* p, std::size_t bytes) noexcept;
+/// Gives the physical pages behind [p, p+bytes) back to the OS while keeping
+/// the address range; the next touch faults in fresh (unspecified) contents.
+void discardMemory(void* p, std::size_t bytes) noexcept;
 
 }  // namespace nosql::internal::os

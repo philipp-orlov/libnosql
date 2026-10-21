@@ -204,6 +204,43 @@ TEST(readersStayValidAcrossAStoreGrowth)
     checkReadersAcrossGrowth(true);
 }
 
+/// A writer that grows the file keeps the slices it already holds: a read
+/// transaction ending on another thread must not unmap the mapping they point
+/// into (the remap-on-growth path once did exactly that).
+TEST(heldSliceSurvivesGrowthAndAConcurrentReader)
+{
+    tst::Scratch s("mvcc");
+    Env e = Env::configure()
+                .pageSize(4096)
+                .initialSize(16 * 4096)
+                .growthStep(4096)
+                .sync(Durability::None)
+                .open(s.file());
+    const std::string value(1000, 'h');
+    e.write([&](Txn& t) { t.mainDb().put("anchor", value); });
+    const std::uint64_t mapBefore = e.stats().mapSize;
+
+    Txn w = e.writeTxn();
+    Db d = w.mainDb();
+    const Slice held = d.at("anchor");
+    for (int i = 0; i < 400; ++i)
+        d.put(tst::keyOf(i), value);
+    std::thread([&] {
+        Env other = e.share();
+        Txn r = other.readTxn();
+        CHECK_EQ(r.mainDb().at("anchor").string(), value);
+        r.abort();
+    }).join();
+    CHECK_EQ(held.string(), value);
+    CHECK(e.stats().mapSize > mapBefore);
+    CHECK_EQ(held.string(), value);
+    w.commit();
+    e.read([&](Txn& t) {
+        checkIntegrity(t);
+        CHECK_EQ(t.mainDb().count(), std::uint64_t(401));
+    });
+}
+
 namespace {
 
 /// Small commits under now-and-then pinned readers, optionally with large

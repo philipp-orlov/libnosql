@@ -4,9 +4,11 @@
 #pragma once
 
 #include <cstddef>
-#include <cstring>
+#include <cstdint>
 #include <limits>
 #include <mutex>
+#include <utility>
+#include <vector>
 
 #include "nosql/internal/format.hpp"
 #include "nosql/internal/os.hpp"
@@ -18,13 +20,19 @@ namespace nosql::internal {
 /// Copy-on-write means a busy writer allocates and frees one page-sized block
 /// per page it touches. Handing that stream to the system allocator is the
 /// textbook way to fragment a heap that has to stay healthy for months, so
-/// the buffers are bucketed by run length and reused instead.
+/// page buffers never come from the heap at all: they are carved from slabs
+/// the pool maps from the OS itself.
 ///
-/// Buckets are powers of two in pages; a request is served
-/// from the bucket that fits, so every buffer in a bucket is exactly the same
-/// size and slots straight back in on release. Idle buffers hold their own
-/// free-list links, so recycling never allocates bookkeeping. Large runs are
-/// rounded only when their size class fits the configured cache budget.
+/// Buckets are powers of two in pages; a request is served from the bucket
+/// that fits, so every buffer in a bucket is exactly the same size and slots
+/// straight back in on release. A slab (1 MiB, or 64 pages if that is more)
+/// holds buffers of one bucket only; a bucket larger than that gets a slab
+/// of its own. Up to the configured budget, released buffers stay resident
+/// on a free list that holds its links in the idle buffers themselves. Past
+/// it, a buffer's memory goes back to the OS (its address stays with the
+/// slab), and a slab with nothing left in use or kept is unmapped. Every
+/// slab's bookkeeping lives in its own first pages, so recycling never
+/// allocates from the heap either.
 class BufferPool
 {
 public:
@@ -33,63 +41,16 @@ public:
     BufferPool() = default;
     BufferPool(const BufferPool&) = delete;
     BufferPool& operator=(const BufferPool&) = delete;
-    ~BufferPool() { purge(); }
+    ~BufferPool();
 
-    void configure(std::size_t pageSize, std::size_t capBytes) noexcept
-    {
-        page_size_ = pageSize;
-        cap_ = capBytes;
-    }
+    void configure(std::size_t pageSize, std::size_t capBytes);
 
-    Page* acquire(unsigned npages)
-    {
-        const int c = classOf(npages);
-        if (c >= 0) {
-            std::lock_guard<std::mutex> lk(mtx_);
-            auto& bucket = free_[c];
-            if (bucket) {
-                Page* p = bucket;
-                Page* next;
-                std::memcpy(&next, p, sizeof next);
-                bucket = next;
-                retained_ -= classPages(c) * page_size_;
-                return p;
-            }
-        }
-        const std::size_t pages = c >= 0 ? classPages(c) : npages;
-        return static_cast<Page*>(os::allocPage(pages * page_size_));
-    }
-
-    void release(Page* buf, unsigned npages) noexcept
-    {
-        const int c = classOf(npages);
-        if (c >= 0) {
-            const std::size_t bytes = classPages(c) * page_size_;
-            std::lock_guard<std::mutex> lk(mtx_);
-            if (bytes <= cap_ - retained_) {
-                std::memcpy(buf, &free_[c], sizeof free_[c]);
-                free_[c] = buf;
-                retained_ += bytes;
-                return;
-            }
-        }
-        os::freePage(buf);
-    }
-
-    void purge() noexcept
-    {
-        std::lock_guard<std::mutex> lk(mtx_);
-        for (auto& bucket : free_) {
-            while (bucket) {
-                Page* p = bucket;
-                Page* next;
-                std::memcpy(&next, p, sizeof next);
-                bucket = next;
-                os::freePage(p);
-            }
-        }
-        retained_ = 0;
-    }
+    Page* acquire(unsigned npages);
+    void release(Page* buf, unsigned npages) noexcept;
+    /// Hands back a transaction's whole buffer list under one lock.
+    void release(const std::pair<Page*, unsigned>* items, std::size_t count) noexcept;
+    /// Gives every kept buffer back to the OS.
+    void purge() noexcept;
 
     std::size_t retainedBytes() const noexcept
     {
@@ -104,25 +65,38 @@ public:
     }
 
 private:
-    int classOf(unsigned npages) const noexcept
+    struct Slab;
+
+    static int classOf(unsigned npages) noexcept
     {
-    #if defined(__GNUC__) || defined(__clang__)
+#if defined(__GNUC__) || defined(__clang__)
         const unsigned bucket = npages <= 1 ? 0 : kClasses - __builtin_clz(npages - 1);
-    #else
+#else
         unsigned bucket = 0;
         for (unsigned remaining = npages > 1 ? npages - 1 : 0; remaining; remaining >>= 1)
             ++bucket;
-    #endif
-        if (bucket >= kClasses ||
-            (npages > 16 && classPages(bucket) > cap_ / page_size_))
-            return -1;
-        return static_cast<int>(bucket);
+#endif
+        return bucket < kClasses ? static_cast<int>(bucket) : -1;
     }
     static std::size_t classPages(int c) noexcept { return std::size_t(1) << c; }
 
+    // Callers hold mtx_.
+    Page* carve(int c);
+    Slab* newSlab(int c);
+    Slab* slabOf(const Page* buf) const noexcept;
+    void giveBack(Page* buf, int c) noexcept;
+    void toSlab(Page* buf, int c) noexcept;
+    void settle() noexcept;
+    void unlinkOpen(Slab* s) noexcept;
+
     mutable std::mutex mtx_;
-    Page* free_[kClasses]{};
+    Page* free_[kClasses]{};    ///< kept buffers, linked through their first bytes
+    Slab* open_[kClasses]{};    ///< slabs with a buffer to hand out, per bucket
+    std::vector<Slab*> slabs_;  ///< every slab, by address
+    Slab* touched_ = nullptr;   ///< slabs that took buffers back since the last settle()
     std::size_t page_size_ = kDefaultPageSize;
+    std::size_t slab_bytes_ = 1u << 20;
+    std::size_t system_page_ = 4096;
     std::size_t cap_ = 0;
     std::size_t retained_ = 0;
 };

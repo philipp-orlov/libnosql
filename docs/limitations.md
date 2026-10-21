@@ -43,24 +43,38 @@ in the "Terminology" section of `docs/design.md`.
   Only store format 7 is supported.
 * **Keys are capped** at roughly a quarter page (1004 bytes at 4 KiB); see
   `Env::maxKeySize()`. Values are capped at 4 GiB. Empty keys are rejected.
-* **64-bit only.** The design maps the whole file, and keeps stale
-  mappings alive across a growth, which needs a roomy address space. CMake
-  refuses to configure for a 32-bit target.
+* **64-bit only.** The design maps the whole file and, on POSIX, reserves
+  `maxSize` of address space for it at open (address space only: no memory or
+  swap); on Windows it keeps stale mappings alive across a growth instead. Both
+  need a roomy address space: a process with `RLIMIT_AS` set must leave room for
+  every open store's `maxSize`, and a 39-bit address space (512 GiB) holds a few
+  64 GiB stores. CMake refuses to configure for a 32-bit target.
 * **Local filesystems only, by default.** The store is memory mapped and
   protected by `flock`. On a network or user-space filesystem (NFS, SMB, FUSE,
   Ceph, 9p and the like, recognised by `statfs` type on Linux) the lock is not
   dependable across hosts and a remote truncation or I/O error arrives as
   SIGBUS, so `open` refuses with `ErrorCode::Unsupported` unless
   `allowNetworkFilesystem()` is set. Detection is Linux-only; elsewhere nothing is
-  refused. A file shortened behind the process is caught as a transaction begins
-  (`ErrorCode::IoError`), which cannot close the race, only the persistent case.
+  refused. A file shortened behind the process is caught as a write transaction
+  begins, and within 100 ms by readers (`ErrorCode::IoError`), which cannot close
+  the race, only the persistent case.
 * **Failures that poison the handle.** A failed data or meta flush during commit,
   a failed `Env::sync()`, or a failed archive fsync in `BlobStorage` makes the
   handle refuse further work (`ErrorCode::BadTransaction`) until it is closed and
   reopened, because the kernel may have dropped dirty pages and report success to
-  a retry. Reopening recovers from the last checksummed meta page. Running into
-  `maxSize` (or a full disk at growth) before the first page is written is
-  different: only that transaction is lost.
+  a retry. Reopening recovers from the last checksummed meta page. Any failure
+  before the first page is written (running into `maxSize`, a full disk at
+  growth) is different: only that transaction is lost.
+* **`Lazy` and `None` lose everything since the last sync on any crash.** The
+  newest meta lives in memory until a sync, so after a process crash as after a
+  power loss the store opens on the last sync. `Lazy` syncs only from a commit
+  (once per `syncInterval`), `Env::sync()` or close; there is no timer thread, so
+  an idle `Lazy` store needs `Env::sync()` from the caller to bound the loss. The
+  file may hold up to about twice the data of the last sync while pages that
+  snapshot names wait for the next one. A ship log captures every commit,
+  durable or not, so after a power loss a replica may hold commits the primary
+  no longer has; its checkpoint then no longer matches and it needs a new base.
+  `checkpointOf()` on such a store reports its last sync.
 * **Files are created owner-only.** A new store gets mode 0600 (`fileMode()`
   overrides it), is opened close-on-exec, is never opened through a symbolic
   link, and is refused if the effective user does not own it (root excepted).
@@ -80,9 +94,11 @@ in the "Terminology" section of `docs/design.md`.
 * **Memory budgets cover specific ownership, not total RSS.** The idle page pool
   is capped by `bufferCache`; active pages by `dirtyLimit`. Finished writers
   release buffers and retain at most 2 MiB of scratch container capacity per
-  transaction; excess capacity is discarded. Page/run buffers of at least 64 KiB
-  use OS mappings; smaller buffers still use the system allocator on cache misses.
-  Payload budgets exclude allocator headers and OS mapping-rounding overhead.
+  transaction; excess capacity is discarded. Page buffers come from slabs mapped
+  from the OS, never from the heap; past `bufferCache` their memory goes back to
+  the OS and empty slabs are unmapped. Slab headers (one system page per slab)
+  and the power-of-two rounding of each buffer's class are outside the payload
+  budgets.
   Arena scratch, OS cache, and shipping segment/transaction descriptors still
   consume memory. External coalescing bounds its dirty buffers, not total RSS.
   Warm allocation-free core workloads are tested, but cold starts, changing
@@ -108,8 +124,10 @@ in the "Terminology" section of `docs/design.md`.
 * **Sub-database handles are transaction-local.** `maxDbs` limits live named
   databases, not historical names. Snapshot slots may allocate and nested
   transactions copy that state; this is not a lock-free registry.
-* **`Env::stats().freePages` opens a short read transaction** to total up the
-  free list, so it is O(free-list size), not O(1).
+* **Deleting compacts the page at once.** Removing a node moves the bytes below
+  it and fixes up every slot, O(page) per delete; a delete-then-reinsert of
+  every member of a group is the slowest way to rewrite it (upsert instead). A
+  lazy scheme would need a garbage count in the page header, a format change.
 * **Splits rebuild both pages** from a decoded entry list rather than shuffling
   bytes in place. Splits are a small fraction of inserts and this is where
   subtle bugs live; the cost is bounded by one page.

@@ -28,6 +28,7 @@ endif()
 
 add_library(nosql
     src/internal/os.cpp
+    src/internal/buffer_pool.cpp
     src/internal/checksum.cpp
     src/env.cpp
     src/txn.cpp

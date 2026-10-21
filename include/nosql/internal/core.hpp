@@ -52,7 +52,9 @@ inline constexpr unsigned kMainDbi = 1;  ///< user keys
 inline constexpr unsigned kCatalogDbi = 2;
 
 /// A whole-file mapping, kept alive by every transaction that observed it.
-/// Growing the store publishes a new one; stale ones die with their readers.
+/// Where the address range is reserved (POSIX) there is one for the life of
+/// the environment and growth extends it in place. Elsewhere growing the
+/// store publishes a new one; stale ones die with their transactions.
 struct MappedRegion
 {
     os::Mapping m;
@@ -86,11 +88,54 @@ struct EnvImpl
     std::atomic<std::uint64_t> dirtyBytes{0};
 
     std::shared_ptr<MappedRegion> region;  ///< current mapping
-    /// Mappings replaced by a growth. Page pointers handed out before the
-    /// growth still point into these, so they are held until every transaction
-    /// that could have seen one has finished.
+    /// Mappings replaced by a growth (only where the mapping cannot grow in
+    /// place). Page pointers handed out before the growth still point into
+    /// these, so they are held until every transaction that could have seen
+    /// one has finished.
     std::vector<std::shared_ptr<MappedRegion>> staleRegions;
     Meta meta{};  ///< newest committed snapshot
+
+    /// Newest meta known to be on stable storage (guarded by `mtx`) and the
+    /// slot holding it (guarded by `syncMtx`). The next meta page written goes
+    /// into the other slot, so a torn write always leaves this one, and
+    /// reclamation never recycles a page this snapshot still names.
+    TxnId durableTxn = 0;
+    unsigned durableSlot = 0;
+    /// NoMetaSync only: a meta written into the mapping but not flushed. The
+    /// next data flush carries it to the device. Guarded by `syncMtx`.
+    TxnId unflushedTxn = 0;
+    unsigned unflushedSlot = 0;
+    /// Serializes every meta-page write and flush: commits that flush and
+    /// Env::sync(). Taken before `mtx`, never while holding it, and never
+    /// held across anything but the sync itself.
+    std::mutex syncMtx;
+    /// Durability::Lazy: minimum time between syncs, and when the last one
+    /// finished (steady clock, nanoseconds).
+    std::int64_t syncIntervalNs = 0;
+    std::atomic<std::int64_t> lastSyncNs{0};
+    /// When a reader last checked the file against the mapping (steady
+    /// clock, nanoseconds; see checkFileIntact in api.cpp).
+    std::atomic<std::int64_t> lastIntactCheckNs{0};
+    /// Lazy and None, writer only: a bit per page handed out while
+    /// `bornEpoch` was the newest durable commit. That snapshot never names
+    /// such a page, so once retired it waits for readers, not for a sync.
+    std::vector<std::uint64_t> born;
+    TxnId bornEpoch = 0;
+    void noteBorn(PageNo first, unsigned count)
+    {
+        const std::size_t need = std::size_t((first + count - 1) / 64 + 1);
+        if (born.size() < need)
+            born.resize(std::max(need, born.size() * 2));
+        for (PageNo p = first; p < first + count; ++p)
+            born[std::size_t(p / 64)] |= std::uint64_t(1) << (p % 64);
+    }
+    bool isBorn(PageNo p) const noexcept
+    {
+        const std::size_t w = std::size_t(p / 64);
+        return w < born.size() && ((born[w] >> (p % 64)) & 1u);
+    }
+    /// The one-run page list a whole-store data flush passes to os::flushData.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> syncRuns;
 
     /// Named sub-database roots as of one committed snapshot. A snapshot's
     /// directory never changes, so read transactions on the same snapshot
@@ -101,11 +146,14 @@ struct EnvImpl
     {
         std::mutex mtx;
         TxnId txnid = 0;
+        /// The first `used` entries are this snapshot's; the rest keep their
+        /// name buffers for the next snapshot to reuse.
         std::vector<std::pair<std::string, Tree>> trees;
+        std::size_t used = 0;
         static constexpr std::size_t kMax = 256;
     } subdbs;
 
-    /// Guards `meta`, `region` and the reader table.
+    /// Guards `meta`, `durableTxn`, `region`, `carryOver` and the reader table.
     mutable std::mutex mtx;
     /// Serializes write transactions (one writer at a time, in-process).
     /// Timed, so a writer can give up after Env::writeTxn(timeout).
@@ -154,20 +202,32 @@ struct EnvImpl
     /// object keeps those capacities and makes a steady-state transaction
     /// allocation-free. An entry is reusable exactly when the pool holds the
     /// only reference to it. Declared after `buffers` so it is destroyed first.
+    /// Each pooled object may keep up to TxnImpl::kRetainedScratchBytes of
+    /// container capacity, so the cap bounds that retention at 16 MiB.
     std::vector<std::shared_ptr<TxnImpl>> txnPool;
-    static constexpr std::size_t kTxnPoolCap = 32;
+    static constexpr std::size_t kTxnPoolCap = 8;
     std::shared_ptr<TxnImpl> acquireTxn();        // caller must not hold mtx
     std::shared_ptr<TxnImpl> acquireTxnLocked();  // caller holds mtx
 
     /// Pages freed by an earlier commit that did not fit in that commit's
     /// free-list update; folded into the next write transaction.
     std::vector<PageNo> carryOver;
+    /// Pages the newest snapshot's free tree lists: counted once at open,
+    /// then kept up to date by each commit, so EnvStats::freePages needs no
+    /// walk. Guarded by `mtx`.
+    std::uint64_t freeTreePages = 0;
 
     /// Replication capture, present only when Options::shipTo() was set.
     /// Touched by the commit path alone, which serialises on writeMtx.
     std::unique_ptr<ShipWriter> ship;
 
     ~EnvImpl();
+
+    /// Lazy and None keep the newest meta in memory until a sync.
+    bool deferredMeta() const noexcept
+    {
+        return dura == Durability::Lazy || dura == Durability::None;
+    }
 
     Page* mapPage(const MappedRegion& r, PageNo p) const noexcept
     {
@@ -177,6 +237,9 @@ struct EnvImpl
     void growLocked(std::uint64_t neededBytes);
     void releaseStaleRegions();  // caller holds mtx
 };
+
+/// Make the newest commit durable (see Env::sync). Caller holds `syncMtx`.
+void syncEnv(EnvImpl& e, bool force);
 
 /// The environment behind a public handle, or ErrorCode::InvalidArgument once
 /// it has been closed.
@@ -202,6 +265,10 @@ struct TxnImpl
 
     TxnId txnid = 0;
     std::shared_ptr<MappedRegion> region;
+    /// Root write transaction only: mappings this transaction tree moved off
+    /// after a growth that had to remap. Slices and page pointers taken
+    /// before the growth still address them, so they live until it ends.
+    std::vector<std::shared_ptr<MappedRegion>> seen;
     Meta meta{};  ///< snapshot for readers; the target meta for writers
     PageNo lastPgno = 0;
     std::uint64_t namedDbs = 0;
@@ -232,6 +299,7 @@ struct TxnImpl
     /// keeps a transaction's set-up to a single allocation and the three fields
     /// on the same cache line.
     std::vector<DbSlot> dbs;
+    std::vector<std::string> spareNames;  ///< see resizeDbs
 
     /// A free-list chunk: the transaction that retired its pages, and its
     /// number within that transaction's entries.
@@ -241,6 +309,13 @@ struct TxnImpl
     std::vector<GcKey> gcKeys;
     std::vector<PageNo> gcRemainder;  ///< updateFreelist scratch, kept between commits
     std::vector<PageNo> gcAdd, gcAcc;
+    std::vector<PageNo> gcPinned, gcExempt;  ///< `gcAdd` split by EnvImpl::isBorn
+    /// The environment's next `carryOver`, built by the commit and swapped in
+    /// only once it is published: a commit refused part-way leaves the
+    /// environment's list as it was.
+    std::vector<PageNo> carryNext;
+    /// Root write transaction: pages its free tree lists minus the snapshot's.
+    std::int64_t freeTreeDelta = 0;
 
     // --- reclaim state, root write transaction only ---
     std::vector<PageNo> reclaim;  ///< sorted free pages pulled from the GC tree
@@ -249,6 +324,10 @@ struct TxnImpl
     TxnId reclaimNext = 0;        ///< scan cursor into the GC tree ...
     std::uint64_t reclaimNextChunk = 0;  ///< ... and the chunk to resume at
     TxnId oldest = 0;             ///< newest GC key we may touch
+    /// Lazy and None: newest GC key readers alone allow, and the durable
+    /// commit that exempt chunks must name to be reusable up to it.
+    TxnId readersOldest = 0;
+    TxnId exemptEpoch = 0;
     bool reclaimDrained = false;
     /// The snapshot's inline free-list entry (Meta::inlineTxn) went into
     /// `reclaim`, so the slot is free for this commit's own entry.
@@ -330,7 +409,31 @@ struct TxnImpl
     void ensureDbs(unsigned dbi)
     {
         if (dbs.size() <= dbi)
-            dbs.resize(dbi + 1);
+            resizeDbs(dbi + 1);
+    }
+    /// Resize `dbs`, parking the names of slots that go and handing them to
+    /// slots that come, so a recycled transaction reuses their buffers.
+    void resizeDbs(std::size_t n)
+    {
+        while (dbs.size() > n) {
+            spareNames.push_back(std::move(dbs.back().name));
+            dbs.pop_back();
+        }
+        while (dbs.size() < n) {
+            dbs.emplace_back();
+            if (!spareNames.empty()) {
+                dbs.back().name = std::move(spareNames.back());
+                dbs.back().name.clear();
+                spareNames.pop_back();
+            }
+        }
+    }
+    /// dbs = from, through resizeDbs.
+    void copyDbs(const std::vector<DbSlot>& from)
+    {
+        resizeDbs(from.size());
+        for (std::size_t i = 0; i < from.size(); ++i)
+            dbs[i] = from[i];
     }
 };
 
@@ -355,6 +458,8 @@ struct CursorImpl
     /// Second buffer the anchor is swapped into while re-searching, so
     /// re-anchoring never has to give a buffer back to the allocator.
     std::vector<std::byte> anchorSpare;
+    /// Cursor::erase's copy of the key it erases, kept for its capacity.
+    std::vector<std::byte> erasedKey;
     /// Set for cursors handed to callers, so the transaction -- and the store
     /// under it -- outlive them.
     std::shared_ptr<TxnImpl> keepalive;

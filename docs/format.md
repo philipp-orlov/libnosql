@@ -236,8 +236,11 @@ The tar file and its required additive header checksum are unchanged.
 | 1 | meta page B |
 | 2 … `lastPgno` | branch, leaf and overflow pages |
 
-The two meta pages alternate by transaction-id parity: transaction *n* writes
-slot *n* mod 2. Open takes the valid one with the higher `txnid`.
+Each meta is written into the slot that does not hold the newest durable meta.
+Under `Durability::Safe` this is alternation by transaction-id parity (transaction
+*n* writes slot *n* mod 2); under `Lazy` and `None`, which write a meta only when
+they sync, two consecutive durable metas may share a parity. Open takes the valid
+slot with the higher `txnid`; a reader must not assume the parity rule.
 
 ## Tree Descriptor
 
@@ -329,3 +332,21 @@ inline entry before any tree chunk when `inlineTxn` is no newer than the
 oldest live snapshot; otherwise, at commit, it moves the entry into the tree
 under `(inlineTxn, 2^64 - 1)` -- a chunk number no commit writes for itself --
 before recording its own.
+
+The top two bits of the chunk number name two further kinds of entry, written
+only under `Durability::Lazy` and `None` (a store written by an older build has
+none, and one that has them opens unchanged in an older build, which treats
+chunk numbers as opaque):
+
+| chunk number | entry |
+|---|---|
+| `0 ...` (bits 63, 62 clear) | the `c`-th chunk of what `K` retired, as above |
+| `10 W(47) i(15)` | pages commit `W` absorbed and did not spend, filed back under `K`, the reclamation frontier `W` ran with; `i` numbers its chunks |
+| `01 E(47) i(15)` | pages `K` retired that were handed out after commit `E` became the newest durable one, so that snapshot never named them |
+| `2^64 - 1` | a moved inline entry |
+
+The first two kinds are reusable once every live snapshot and the newest durable one
+are `K` or newer; the third once every live snapshot is, provided `E` is still
+the newest durable commit (otherwise it is treated as the first kind).
+Transaction ids of 2^47 and above do not fit these fields; such commits record
+everything under their own id as described above.

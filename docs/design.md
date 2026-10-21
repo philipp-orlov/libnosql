@@ -99,13 +99,24 @@ On Linux the file's filesystem type is checked: network and user-space
 filesystems (NFS, SMB, FUSE, Ceph, 9p and others) are refused with
 `ErrorCode::Unsupported` unless `allowNetworkFilesystem()` is set, because
 `flock` is not dependable across hosts and a remote truncation or I/O error
-reaches the process as SIGBUS through the mapping. As each transaction begins,
-the file is checked to be at least as large as the mapping, turning a persistent
-truncation into `ErrorCode::IoError`.
+reaches the process as SIGBUS through the mapping. As each write transaction
+begins, and at most every 100 ms as a read transaction begins, the file is
+checked to be at least as large as the mapping, turning a persistent truncation
+into `ErrorCode::IoError`.
+
+On POSIX a writable store reserves `maxSize` of address space at open
+(`PROT_NONE`, `MAP_NORESERVE`: address space only, no memory or swap) and maps
+the file over the front of it. Growth maps the new extent in place with
+`MAP_FIXED`, so the base never moves, pointers and slices handed out before a
+growth stay valid, and pages already faulted in stay mapped. There is one
+mapping for the life of the environment. Windows cannot reserve this way: there
+growth publishes a new mapping, and every transaction keeps each mapping it has
+used alive until it ends (a writer that grew keeps its old ones too).
 
 A new file is sized to `max(initialSize, 16 pages)` and grows geometrically (at
 least `growthStep`, default `max(1 MiB, 64 pages)`, and an eighth of the current
-size) up to `maxSize` (default 64 GiB; address space is not reserved up front).
+size) up to `maxSize` (default 64 GiB; reserved as address space on POSIX, see
+below).
 With `preallocate()` (default on) growth calls `fallocate`, so a full disk fails at
 growth with `ErrorCode::IoError`. An existing store's page size is adopted;
 requesting a different one is `ErrorCode::Incompatible`, as is a store of another
@@ -119,8 +130,9 @@ the store closes when the last handle and transaction are gone.
 
 The environment serializes writers with a mutex. Readers acquire short metadata
 locks to register their snapshot and obtain a mapping, but do not hold the writer
-mutex during reads. Each transaction retains its mapping; growth publishes a new
-mapping while existing readers keep theirs alive.
+mutex during reads. On POSIX the mapping never moves; on Windows each transaction
+retains the mappings it has seen, and growth publishes a new mapping while
+existing transactions keep theirs alive.
 
 Writes copy committed pages into private buffers and update parent links through
 the root. Nested writers first see their own dirty pages, then ancestor dirty
@@ -148,9 +160,14 @@ The message queue's blocking receive is built on this.
 3. Sort dirty pages, zero slotted free gaps, seal final images, clear the affected
    read-cache bits, and write them into the file.
 4. Complete the data durability barrier required by the selected mode.
-5. Write the new meta into slot `txnid & 1`, then complete the meta durability barrier.
+5. Write the new meta into the slot that does not hold the newest durable meta,
+   then complete the meta durability barrier, as the mode requires.
 6. Publish the snapshot and commit generation under the metadata mutex, notify
    waiters, capture the commit for shipping if enabled, and release the writer.
+
+Readers take their snapshot from the in-memory meta, never from the file, so
+publication does not wait for the file. Under `Lazy` and `None` steps 4 and 5
+are deferred to the next sync (below).
 
 ### Durability and the memory map
 
@@ -162,19 +179,48 @@ Linux it is one `fdatasync`; on Windows it is `FlushViewOfFile` over each writte
 run followed by one `FlushFileBuffers`. The meta page is flushed separately
 (`msync(MS_SYNC)` on its range, falling back to a file sync where the filesystem
 rejects that; `FlushViewOfFile` plus `FlushFileBuffers` on Windows).
-`Durability::Safe` requests both barriers; `NoMetaSync` omits the meta barrier;
-`None` omits explicit synchronization. These are different durability guarantees,
-not interchangeable benchmark modes. `Env::sync()` forces everything durable, for
-use under `None`.
+`Durability::Safe` requests both barriers on every commit. `NoMetaSync` requests
+the data barrier on every commit and writes the meta without its barrier; the
+next commit's data barrier carries it to the device. These are different
+durability guarantees, not interchangeable benchmark modes.
+
+### Deferred meta: `Lazy` and `None`
+
+Under `Lazy` and `None` a commit writes and seals its pages as usual but leaves
+the newest meta in memory only: no barrier and no meta write. A *sync* then
+makes everything up to the newest commit durable in three steps, each finished
+before the next: the data barrier over the whole store, the meta write into the
+slot not holding the newest durable meta, and the meta barrier. The file
+therefore only ever holds metas whose pages are on the device. The protocol is
+the same copy-on-write without a log; only when the meta is flushed changes.
+
+What runs a sync: under `Lazy`, the first commit that finds
+`Options::syncInterval()` (default one second) elapsed since the last sync
+runs it before it returns, so a busy store makes two device flushes per
+interval whatever its commit rate (group commit). `Env::sync()` runs one under
+either mode, and so does the store closing (the last handle and transaction
+going away; that sync cannot report a failure, so call `Env::sync()` first to see
+one). There is no timer thread: a `Lazy` store that stops committing keeps its
+newest commits in memory until one of those happens, so a caller that needs the
+interval bound while idle calls `Env::sync()` from a timer of its own. `None`
+never syncs on its own. A crash of either kind, process or power, reopens the
+store on the last sync.
+
+Reclamation is pinned at the newest durable commit (below), which is what keeps
+the snapshot a crash falls back to intact. `Env::sync()` serializes with the
+commit path on its own mutex and holds neither the metadata mutex nor the
+writer slot across the I/O, so readers and the writer carry on during it.
+`EnvStats::durableTxn` reports the newest commit known to be on stable storage.
 
 ### The meta page's own durability
 
 The meta record is written only after the data barrier has returned, so a meta
 that reaches storage always points at pages that did too. Its own torn write is
-detected by its checksum rather than prevented by ordering: two meta slots
-alternate by transaction parity, open picks the newest valid one, and the
-reclamation rule below guarantees the preceding snapshot's pages were never
-overwritten, so a torn newest meta falls back to the previous snapshot.
+detected by its checksum rather than prevented by ordering: each meta goes into
+the slot that does not hold the newest durable meta (under `Safe` that is plain
+alternation by transaction parity), open picks the newest valid one, and the
+reclamation rule below guarantees the durable snapshot's pages were never
+overwritten, so a torn newest meta falls back to it.
 
 ### Failure
 
@@ -185,18 +231,34 @@ failed, with one exception below: further transactions raise
 `BadTransaction` until it is closed and reopened, and an exception does not prove
 the transaction never reached storage. A failed `Env::sync()` and a failed
 blob-archive fsync poison their handles the same way, because the kernel may drop
-dirty pages after a failed flush and report success to a retry. The exception is
-running out of `maxSize` (`MapFull`) before any page is written: the file is
-untouched, so only that transaction is lost.
+dirty pages after a failed flush and report success to a retry; a poisoned
+`Lazy` or `None` store never writes its in-memory meta. The exception is any
+failure before the first page is written (`MapFull`, or an `IoError` such as
+`ENOSPC` from growing the file): no page a snapshot names has been touched, so
+only that transaction is lost.
 
 ## Reclamation and Memory
+
+A free-list entry keyed by transaction T lists pages of snapshot T-1 that T
+retired. A writer may recycle it once every snapshot that matters is T or
+newer: every live reader's, and the newest durable one's. Under `Safe` the
+newest durable snapshot is the newest commit; under the other modes it lags
+(by one commit under `NoMetaSync`, by up to one sync interval under `Lazy`), and
+pinning reclamation there is what keeps the snapshot a crash falls back to
+intact. Pages handed out since the newest durable commit are an exception:
+that snapshot never named them, so when a later commit retires them they go
+into *exempt* chunks that only readers hold back. Each page of the durable
+snapshot therefore waits at most once per sync, and the file stays within about
+twice the data the last sync held, however long a `None` store runs unsynced.
 
 The free tree maps (retiring transaction id, chunk) keys to page-number arrays
 of at most one inline leaf node each. Eligible chunks are absorbed one at a time
 as allocations need them; contiguous runs service overflow values. At commit the
 absorbed chunks are deleted and the retired pages plus the unspent remainder are
 written under the new id, so the cost of a commit is bounded by what it retired
-and one chunk, not by the size of the list. The free tree's own COW updates also
+and one chunk, not by the size of the list. Under `Lazy` and `None` the unspent
+remainder goes back under the reclamation frontier instead of the new id, so it
+does not wait for the next sync. The free tree's own COW updates also
 retire pages, so the update is repeated until a pass changes nothing, with the
 sorted remainder merged in linear time. The loop is capped at eight rounds; on
 the last one the reclaim list is frozen so the write describes a fixed set. Pages
@@ -221,18 +283,17 @@ counts (`Db::countRange`) and `Cursor::skip` descend by them.
 `dirtyLimit` defaults to 256 MiB of active page buffers, including nested writers;
 a write that would exceed it fails with `ErrorCode::OutOfMemory`, and zero disables
 the limit. `bufferCache` defaults to 32 MiB and bounds idle buffer
-payload bytes. Power-of-two classes cover small pages and overflow runs; runs
-above 16 pages are rounded only when their class fits the cache budget. Uncached
-runs are released immediately. Cache links occupy idle buffer bytes, so release
-does not allocate bookkeeping, and acquire/release are constant-time under a mutex.
-
-`os::allocPage` provides 64-byte alignment with a private 64-byte ownership header.
-Requests of at least 64 KiB use anonymous `mmap` on POSIX or `VirtualAlloc` on
-Windows; smaller requests use the aligned system allocator. Matching frees read
-the header to select the correct release operation. Mapping-rounding overhead
-and allocation headers are outside the payload budgets. Recycling also avoids
-map/unmap calls after a cacheable working set warms up. No guarantee about a
-system allocator's fragmentation or process-wide allocation behavior is implied.
+payload bytes. Page buffers never come from the heap. Each request rounds up to
+a power-of-two class of pages, and each class is carved from slabs the pool maps
+from the OS itself (1 MiB, or 64 pages if that is more; a class larger than that
+gets a slab of its own). A slab's bookkeeping (two bitmaps) lives in its first
+system page. Up to `bufferCache` a released buffer stays resident on its class's
+free list, whose links occupy the idle buffer bytes. Past the budget its memory
+goes back to the OS (`madvise(MADV_DONTNEED)`, adjacent buffers in one call) while
+the slab keeps the address, and a slab with nothing in use or kept is unmapped.
+A transaction hands back its whole buffer list under one lock. After one large
+transaction the process therefore keeps `bufferCache` plus the slabs' unreturned
+address space, not a heap arena full of freed page-sized blocks.
 
 The environment's arena retains split/rebalance chunks and rewinds scoped
 allocations. Growth reserves descriptor capacity before acquiring a new chunk,
@@ -243,7 +304,7 @@ Each transaction retains up to 2 MiB of scratch container capacity across its
 dirty-page table, ownership/free-list/flush vectors and optional read-validation
 bitmap. Cleanup keeps capacities that fit and releases the rest without new
 allocations. This avoids repeatedly discarding useful buffers at an arbitrary
-element count. The 32 pooled transactions can retain at most 64 MiB of this
+element count. The 8 pooled transactions can retain at most 16 MiB of this
 scratch; active or externally retained handles can add transaction objects.
 Named-database slots, arena chunks, mappings and OS cache remain separate costs.
 
@@ -255,6 +316,13 @@ immediate uncached release, and scratch budgets. In the checked core workloads,
 batches make zero instrumented allocation/free calls (the test prints `new=0
 backing=0 frees=0` for both). Cold starts, changing
 working sets, public cursors, queues and workloads beyond budgets can allocate.
+
+`tests/test_alloc_budget.cpp` holds the policy as a test: zero heap allocations
+per warm write and read transaction (ten 512-byte rows and ten index entries
+per write over a fixed key set; a get and a 100-step scan per read) under
+`None`, `Lazy` and `Safe`; a heap whose total size and free space do not grow
+across rounds that rewrite a fifth of a 50,000-row store; and a held slice that
+survives a growth while a reader on another thread comes and goes.
 
 ## Integrity and Read Caching
 
@@ -282,7 +350,9 @@ no live snapshot can reference a page the writer is allowed to recycle. Relaxed
 atomics suffice: the writer's clears are ordered before the meta publication by
 the environment mutex every transaction takes to read the meta. The bitmap is
 sized for `maxSize` and capped at 4 MiB; higher page numbers verify on every
-access. Overflow runs cache only their starting page after checking the whole run.
+access. It is mapped from the OS, which hands it out zeroed, so only the words
+covering pages actually checked become resident, and a reset clears only up to
+the highest word ever set rather than the whole bitmap. Overflow runs cache only their starting page after checking the whole run.
 Failed validation never populates the cache.
 
 Bits survive transactions and are shared by every thread, which is what makes the

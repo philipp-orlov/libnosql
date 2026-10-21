@@ -6,6 +6,8 @@
 #include <cstring>
 #include <limits>
 #include <new>
+#include <utility>
+#include <vector>
 
 #include "nosql/nosql.hpp"
 #include "nosql/internal/arena.hpp"
@@ -184,6 +186,49 @@ TEST(disabledBufferCacheReturnsBackingStorageImmediately)
 #ifdef NOSQL_TEST_WRAP_ALLOCATIONS
     CHECK_EQ(measured.backing, 2u);
     CHECK_EQ(measured.releases, 2u);
+#endif
+}
+
+TEST(pageBuffersComeFromSlabsAndEmptySlabsAreUnmapped)
+{
+    // 600 single pages need three 1 MiB slabs at 4 KiB pages. With a budget
+    // of 64 pages, the rest goes back to the OS and slabs left with nothing
+    // kept are unmapped.
+    internal::BufferPool buffers;
+    buffers.configure(4096, 64 * 4096);
+    std::vector<internal::Page*> pages(600);
+    AllocationCounts measured;
+    {
+        AllocationProbe probe;
+        for (auto& page : pages) {
+            page = buffers.acquire(1);
+            CHECK(reinterpret_cast<std::uintptr_t>(page) % 4096 == 0);
+            std::memset(page, 0x5a, 4096);
+        }
+        std::vector<std::pair<internal::Page*, unsigned>> owned;
+        owned.reserve(pages.size());
+        for (auto* page : pages)
+            owned.emplace_back(page, 1u);
+        const auto heapBefore = counts.heap;
+        buffers.release(owned.data(), owned.size());
+        CHECK_EQ(counts.heap, heapBefore);
+        measured = counts;
+    }
+    CHECK_EQ(buffers.retainedBytes(), 64u * 4096);
+#ifdef NOSQL_TEST_WRAP_ALLOCATIONS
+    CHECK_EQ(measured.mapped, 3u);
+    // The kept pages are the first ones handed back, so all of them sit in
+    // the first slab and the other two are unmapped.
+    CHECK_EQ(measured.releases, 2u);
+#endif
+    {
+        AllocationProbe probe;
+        buffers.purge();
+        measured = counts;
+    }
+    CHECK_EQ(buffers.retainedBytes(), 0u);
+#ifdef NOSQL_TEST_WRAP_ALLOCATIONS
+    CHECK_EQ(measured.releases, 1u);
 #endif
 }
 

@@ -233,6 +233,7 @@ void checkIntegrity(Txn& t)
     CursorImpl fc;
     fc.txn = impl;
     fc.dbi = kFreeDbi;
+    std::uint64_t listed = 0;
     for (bool ok = cursorFirst(fc); ok; ok = cursorNext(fc)) {
         // A live writer has already handed out the pages of the entries it
         // absorbed; those keys are deleted at commit, so ignore them here.
@@ -245,6 +246,7 @@ void checkIntegrity(Txn& t)
         const Slice v = cursorValue(fc);
         if (v.size() % sizeof(PageNo) != 0)
             throw Error(ErrorCode::Corrupted, "invalid free-list value length");
+        listed += v.size() / sizeof(PageNo);
         for (std::size_t i = 0; i < v.size() / sizeof(PageNo); ++i) {
             PageNo page = 0;
             page = readLittle<PageNo>(v.data() + i * sizeof page);
@@ -259,6 +261,11 @@ void checkIntegrity(Txn& t)
         for (PageNo page = 0; page <= impl->lastPgno; ++page)
             if (!(c.seen[page / 64] & (std::uint64_t(1) << (page % 64))))
                 c.bad("allocated page is neither live nor free", page);
+        // The count EnvStats reports without a walk must match one.
+        std::lock_guard<std::mutex> lk(impl->env->mtx);
+        if (impl->env->meta.txnid == impl->meta.txnid && impl->env->freeTreePages != listed)
+            throw Error(ErrorCode::Corrupted,
+                        "integrity: free-page count differs from the free list");
     }
 }
 

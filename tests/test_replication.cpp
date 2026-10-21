@@ -105,7 +105,7 @@ TEST(checkpointTracksTheLastCommittedTransaction)
     tst::Scratch dir("repl");
     const fs::path store = dir.file();
     {
-        Env e = Env::configure().sync(Durability::None).open(store);
+        Env e = Env::configure().sync(Durability::NoMetaSync).open(store);
         CHECK_EQ(checkpointOf(store).txnid, 0u);
         for (int i = 0; i < 5; ++i) {
             put(e, std::uint64_t(i) * 10, std::uint64_t(i) * 10 + 10);
@@ -116,6 +116,19 @@ TEST(checkpointTracksTheLastCommittedTransaction)
     CHECK_EQ(c.txnid, 5u);
     CHECK(c.valid());
     CHECK(c == checkpointOf(store));
+}
+
+TEST(checkpointOfALazyStoreIsItsLastSync)
+{
+    // The file holds only durable meta pages, so that is what it reports.
+    tst::Scratch dir("repl");
+    const fs::path store = dir.file();
+    Env e = Env::configure().sync(Durability::Lazy).syncInterval(std::chrono::hours(1)).open(store);
+    for (int i = 0; i < 3; ++i)
+        put(e, std::uint64_t(i) * 10, std::uint64_t(i) * 10 + 10);
+    CHECK_EQ(checkpointOf(store).txnid, 0u);
+    e.sync();
+    CHECK_EQ(checkpointOf(store).txnid, e.stats().lastTxn);
 }
 
 TEST(checkpointsDistinguishIndependentStoresAndDivergentClones)
@@ -151,7 +164,7 @@ TEST(copySnapshotProducesAStoreAtTheSameCheckpoint)
     tst::Scratch dir("repl");
     const fs::path store = dir.file(), copy = dir.file("copy.db");
 
-    Env e = Env::configure().sync(Durability::None).open(store);
+    Env e = Env::configure().sync(Durability::NoMetaSync).open(store);
     put(e, 0, 500);
     const Checkpoint taken = checkpointOf(store);
     baseImage(e, copy);
@@ -166,7 +179,7 @@ TEST(copySnapshotIgnoresWritesThatLandWhileItRuns)
     tst::Scratch dir("repl");
     const fs::path store = dir.file(), copy = dir.file("copy.db");
 
-    Env e = Env::configure().sync(Durability::None).open(store);
+    Env e = Env::configure().sync(Durability::NoMetaSync).open(store);
     put(e, 0, 2000);
 
     Txn rt = e.readTxn();
@@ -184,7 +197,7 @@ TEST(copySnapshotIgnoresWritesThatLandWhileItRuns)
 TEST(copySnapshotRefusesAWriteTransactionAndAnExistingPath)
 {
     tst::Scratch dir("repl");
-    Env e = Env::configure().sync(Durability::None).open(dir.file());
+    Env e = Env::configure().sync(Durability::NoMetaSync).open(dir.file());
     put(e, 0, 10);
 
     Txn wt = e.writeTxn();
@@ -205,7 +218,7 @@ TEST(aBundleCarriesTheRangeItSays)
     tst::Scratch dir("repl");
     const fs::path store = dir.file(), ship = dir.file("ship"), bundle = dir.file("d.bundle");
 
-    Env e = Env::configure().sync(Durability::None).shipTo(ship).open(store);
+    Env e = Env::configure().sync(Durability::NoMetaSync).shipTo(ship).open(store);
     put(e, 0, 100);
     const Checkpoint base = checkpointOf(store);
     put(e, 100, 400);
@@ -230,7 +243,7 @@ TEST(applyingDeltasReproducesThePrimaryExactly)
     const fs::path store = dir.file(), ship = dir.file("ship");
     const fs::path replica = dir.file("replica.db"), bundle = dir.file("d.bundle");
 
-    Env e = Env::configure().sync(Durability::None).shipTo(ship).open(store);
+    Env e = Env::configure().sync(Durability::NoMetaSync).shipTo(ship).open(store);
     put(e, 0, 300);
     baseImage(e, replica);
     Checkpoint at = checkpointOf(replica);
@@ -272,7 +285,7 @@ TEST(applyIsIdempotentAndUpToDateIsNotAnError)
     const fs::path store = dir.file(), ship = dir.file("ship");
     const fs::path replica = dir.file("replica.db"), bundle = dir.file("d.bundle");
 
-    Env e = Env::configure().sync(Durability::None).shipTo(ship).open(store);
+    Env e = Env::configure().sync(Durability::NoMetaSync).shipTo(ship).open(store);
     put(e, 0, 50);
     baseImage(e, replica);
     const Checkpoint base = checkpointOf(replica);
@@ -292,7 +305,7 @@ TEST(aBundleDeliveredOutOfOrderIsRefused)
     const fs::path replica = dir.file("replica.db");
     const fs::path first = dir.file("1.bundle"), second = dir.file("2.bundle");
 
-    Env e = Env::configure().sync(Durability::None).shipTo(ship).open(store);
+    Env e = Env::configure().sync(Durability::NoMetaSync).shipTo(ship).open(store);
     put(e, 0, 50);
     baseImage(e, replica);
     const Checkpoint base = checkpointOf(replica);
@@ -319,7 +332,7 @@ TEST(aDivergedReplicaIsDetectedWhenTheDeltaIsBuilt)
     tst::Scratch dir("repl");
     const fs::path store = dir.file(), ship = dir.file("ship"), bundle = dir.file("d.bundle");
 
-    Env e = Env::configure().sync(Durability::None).shipTo(ship).open(store);
+    Env e = Env::configure().sync(Durability::NoMetaSync).shipTo(ship).open(store);
     put(e, 0, 50);
     const Checkpoint real = checkpointOf(store);
     put(e, 50, 100);
@@ -336,7 +349,7 @@ TEST(aCorruptOrTruncatedBundleIsRejectedBeforeTheReplicaIsTouched)
     const fs::path store = dir.file(), ship = dir.file("ship");
     const fs::path replica = dir.file("replica.db"), bundle = dir.file("d.bundle");
 
-    Env e = Env::configure().sync(Durability::None).shipTo(ship).open(store);
+    Env e = Env::configure().sync(Durability::NoMetaSync).shipTo(ship).open(store);
     put(e, 0, 50);
     baseImage(e, replica);
     const Checkpoint base = checkpointOf(replica);
@@ -365,13 +378,13 @@ TEST(aBundleFromADifferentPageSizeIsRefused)
     const fs::path store = dir.file(), ship = dir.file("ship"), bundle = dir.file("d.bundle");
     const fs::path replica = dir.file("replica.db");
 
-    Env e = Env::configure().pageSize(4096).sync(Durability::None).shipTo(ship).open(store);
+    Env e = Env::configure().pageSize(4096).sync(Durability::NoMetaSync).shipTo(ship).open(store);
     put(e, 0, 50);
     const Checkpoint base = checkpointOf(store);
     put(e, 50, 100);
     CHECK(ShipLog(ship).extract(base, bundle) == ShipStatus::Ok);
 
-    Env other = Env::configure().pageSize(8192).sync(Durability::None).open(replica);
+    Env other = Env::configure().pageSize(8192).sync(Durability::NoMetaSync).open(replica);
     put(other, 0, 50);
     other.close();
     CHECK_THROWS(applyBundle(replica, bundle), ErrorCode::Incompatible);
@@ -388,7 +401,7 @@ TEST(aReplicaPastTheRetentionWindowIsToldToTakeABase)
     // Tiny segments and a one-segment window, so the log rolls past a stale
     // replica within a handful of commits.
     Env e = Env::configure()
-                .sync(Durability::None)
+                .sync(Durability::NoMetaSync)
                 .shipTo(ship)
                 .shipSegmentSize(64 << 10)
                 .shipRetain(1)
@@ -436,7 +449,7 @@ TEST(pruneDropsOnlySegmentsNobodyNeeds)
     const fs::path store = dir.file(), ship = dir.file("ship");
 
     Env e = Env::configure()
-                .sync(Durability::None)
+                .sync(Durability::NoMetaSync)
                 .shipTo(ship)
                 .shipSegmentSize(32 << 10)
                 .shipRetain(1000)
@@ -463,7 +476,7 @@ TEST(everyCommitShipsEverythingItChanged)
 
     // Small pages, so splits, merges and overflow pages all happen within a
     // few hundred keys.
-    Env e = Env::configure().pageSize(1024).sync(Durability::None).shipTo(ship).open(store);
+    Env e = Env::configure().pageSize(1024).sync(Durability::NoMetaSync).shipTo(ship).open(store);
     put(e, 0, 200);
     baseImage(e, replica);
     Checkpoint at = checkpointOf(replica);
@@ -493,7 +506,7 @@ TEST(coalescingShipsAPageOnceWithItsFinalContents)
     const fs::path replica = dir.file("replica.db");
     const fs::path one = dir.file("one.bundle"), all = dir.file("all.bundle");
 
-    Env e = Env::configure().sync(Durability::None).shipTo(ship).open(store);
+    Env e = Env::configure().sync(Durability::NoMetaSync).shipTo(ship).open(store);
     put(e, 0, 100);
     baseImage(e, replica);
     const Checkpoint base = checkpointOf(replica);
@@ -529,7 +542,7 @@ TEST(shippingSurvivesTheStoreGrowingMidRange)
 
     // Start small enough that the writes below force the file to grow.
     Env e = Env::configure()
-                .sync(Durability::None)
+                .sync(Durability::NoMetaSync)
                 .initialSize(64 << 10)
                 .growthStep(64 << 10)
                 .shipTo(ship)

@@ -8,8 +8,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <new>
 
 #include "nosql/internal/format.hpp"
+#include "nosql/internal/os.hpp"
 
 namespace nosql::internal {
 
@@ -43,15 +45,25 @@ public:
     ValidationCache() = default;
     ValidationCache(const ValidationCache&) = delete;
     ValidationCache& operator=(const ValidationCache&) = delete;
+    ~ValidationCache()
+    {
+        if (words_)
+            os::unmapMemory(words_, wordCount_ * sizeof(std::uint64_t));
+    }
 
     /// Sizes the bitmap for the pages `maxFileBytes` can hold, capped at
-    /// kMaxBytes; page numbers beyond the cap are simply never cached.
+    /// kMaxBytes; page numbers beyond the cap are simply never cached. The
+    /// bitmap is mapped straight from the OS, which hands it out zeroed, so
+    /// only the words covering pages actually checked ever become resident,
+    /// and a reset clears only those.
     void configure(std::size_t pageSize, std::uint64_t maxFileBytes, std::chrono::nanoseconds resetEvery)
     {
         const std::uint64_t pages = maxFileBytes / pageSize + 1;
         std::uint64_t words = (pages + 63) / 64;
         words = std::min<std::uint64_t>(words, kMaxBytes / sizeof(std::uint64_t));
-        words_.reset(new std::atomic<std::uint64_t>[std::size_t(words)]());
+        static_assert(sizeof(std::atomic<std::uint64_t>) == sizeof(std::uint64_t));
+        void* memory = os::mapMemory(std::size_t(words) * sizeof(std::uint64_t));
+        words_ = ::new (memory) std::atomic<std::uint64_t>[std::size_t(words)];
         wordCount_ = std::size_t(words);
         resetEveryNs_ = resetEvery.count();
         lastResetNs_.store(nowNs(), std::memory_order_relaxed);
@@ -71,8 +83,12 @@ public:
     void markValidated(PageNo p) noexcept
     {
         const std::size_t w = std::size_t(p >> 6);
-        if (w < wordCount_)
-            words_[w].fetch_or(std::uint64_t(1) << (p & 63), std::memory_order_relaxed);
+        if (w >= wordCount_)
+            return;
+        words_[w].fetch_or(std::uint64_t(1) << (p & 63), std::memory_order_relaxed);
+        std::size_t high = highWords_.load(std::memory_order_relaxed);
+        while (w >= high &&
+               !highWords_.compare_exchange_weak(high, w + 1, std::memory_order_relaxed)) {}
     }
 
     /// The writer is about to make `count` pages from `first` hold new bytes.
@@ -115,19 +131,25 @@ public:
         // see, which is no worse than the moment before the interval elapsed.
         if (!lastResetNs_.compare_exchange_strong(last, now, std::memory_order_relaxed))
             return;
-        for (std::size_t w = 0; w < wordCount_; ++w)
-            words_[w].store(0, std::memory_order_relaxed);
+        clear();
     }
 
     /// Everything forgotten now, for tests and for an explicit re-check.
     void reset() noexcept
     {
-        for (std::size_t w = 0; w < wordCount_; ++w)
-            words_[w].store(0, std::memory_order_relaxed);
+        clear();
         lastResetNs_.store(nowNs(), std::memory_order_relaxed);
     }
 
 private:
+    /// Only the words a check has ever set: the pages in use, not maxSize.
+    void clear() noexcept
+    {
+        const std::size_t high = highWords_.load(std::memory_order_relaxed);
+        for (std::size_t w = 0; w < high; ++w)
+            words_[w].store(0, std::memory_order_relaxed);
+    }
+
     static std::int64_t nowNs() noexcept
     {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -135,8 +157,9 @@ private:
             .count();
     }
 
-    std::unique_ptr<std::atomic<std::uint64_t>[]> words_;
+    std::atomic<std::uint64_t>* words_ = nullptr;
     std::size_t wordCount_ = 0;
+    std::atomic<std::size_t> highWords_{0};  ///< words below this may have bits set
     std::int64_t resetEveryNs_ = 0;
     std::atomic<std::int64_t> lastResetNs_{0};
 };

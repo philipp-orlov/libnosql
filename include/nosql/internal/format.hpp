@@ -307,6 +307,35 @@ inline std::uint64_t readBig(const std::byte* in) noexcept
 /// it moves into the tree: never one a commit writes for its own chunks.
 inline constexpr std::uint64_t kInlineChunk = ~std::uint64_t(0);
 
+/// Chunk numbers with the top bit set hold pages a commit absorbed and did
+/// not spend, filed back under an older id (Durability::Lazy and None):
+/// the writing commit's id above, the chunk's index below, so two commits
+/// never write the same key. Ids from kRemainderTxnLimit on do not fit and
+/// file such pages under their own id instead.
+inline constexpr std::uint64_t kRemainderChunks = std::uint64_t(1) << 15;
+inline constexpr std::uint64_t kRemainderTxnLimit = std::uint64_t(1) << 47;
+inline constexpr std::uint64_t remainderChunk(TxnId writer, std::uint64_t index) noexcept
+{
+    return (std::uint64_t(1) << 63) | (writer << 15) | index;
+}
+
+/// Chunk numbers with bit 62 set (and 63 clear) hold pages a commit retired
+/// that were allocated while `epoch` was the newest durable commit, so that
+/// snapshot never named them (Durability::Lazy and None). While it is still
+/// the newest durable one, only readers hold such pages back.
+inline constexpr std::uint64_t exemptChunk(TxnId epoch, std::uint64_t index) noexcept
+{
+    return (std::uint64_t(1) << 62) | (epoch << 15) | index;
+}
+inline constexpr bool isExemptChunk(std::uint64_t chunk) noexcept
+{
+    return (chunk >> 62) == 1;
+}
+inline constexpr TxnId exemptEpochOf(std::uint64_t chunk) noexcept
+{
+    return (chunk & ~(std::uint64_t(3) << 62)) >> 15;
+}
+
 inline FreeKey freeKey(TxnId txnid, std::uint64_t chunk) noexcept
 {
     FreeKey k;
