@@ -743,6 +743,11 @@ void publish(EnvImpl& e, TxnImpl* t, const Meta& m)
     e.carryOver.swap(t->carryNext);
     e.freeTreePages = std::uint64_t(std::int64_t(e.freeTreePages) + t->freeTreeDelta);
     e.commitGen.store(m.txnid, std::memory_order_release);
+    e.occLog.record(m.txnid, e.occNext);
+    e.occNext = nullptr;
+    // Every reader's snapshot is at or after the oldest one pinned, so entries
+    // at or before it can no longer conflict with anything.
+    e.occLog.trim(e.readers.empty() ? TxnId(m.txnid) : TxnId(e.readers.front().first));
 }
 
 /// Builds the new meta and publishes it. What reaches the file, and when,
