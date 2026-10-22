@@ -161,7 +161,11 @@ void checkWarmTransactions(Durability mode, bool cachedChecksums)
         t.db(kIndex, DbFlags::Create);
     });
     Workload work{env};
-    const int warm = mode == Durability::Safe ? 450 : 1000;
+    // Safe needs longer to warm: the free list's commit scratch reaches its
+    // high-water mark late in this workload, and it does so later once separator
+    // keys are shorter. The high-water mark is reached once, after which the
+    // measured window allocates nothing.
+    const int warm = mode == Durability::Safe ? 2000 : 1000;
     const int measured = mode == Durability::Safe ? 50 : 1000;
     for (int i = 0; i < warm; ++i)
         work.write();
