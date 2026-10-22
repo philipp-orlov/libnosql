@@ -6,7 +6,7 @@ target_link_libraries(nosql_testmain PUBLIC nosql)
 set(NOSQL_TEST_LIST Basic:basic Env:env Cursor:cursor Named:named Nested:nested
     Overflow:overflow Reclaim:reclaim Steady:steady Memory:memory
     Mvcc:mvcc Torture:torture Format:format Checksum:checksum Hardening:hardening
-    AllocBudget:alloc_budget Optimistic:optimistic)
+    AllocBudget:alloc_budget Optimistic:optimistic Separators:separators)
 if(NOSQL_WITH_MQ)
     list(APPEND NOSQL_TEST_LIST Mq:mq MqSteady:mq_steady)
 endif()

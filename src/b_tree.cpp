@@ -448,6 +448,19 @@ void emit(Page* p, unsigned at, const Entry& e, bool leaf) noexcept
 
 /// Pick a boundary so both halves fit, preferring a balanced split but
 /// honouring the append/prepend fast paths that keep bulk loads dense.
+/// The shortest key that can separate two adjacent children: any s with
+/// left < s <= right does, because keys routed left sort below s and keys routed
+/// right sort at or above it. A prefix of `right` is the shortest such key in
+/// byte order, and it is never empty.
+Slice shortestSeparator(Slice left, Slice right) noexcept
+{
+    const std::size_t n = std::min(left.size(), right.size());
+    std::size_t d = 0;
+    while (d < n && left.data()[d] == right.data()[d])
+        ++d;
+    return Slice(right.data(), std::min(right.size(), d + 1));
+}
+
 unsigned chooseSplit(const Entry* e, unsigned n, unsigned newindx, bool leaf, std::size_t usable,
                      Arena& scratch)
 {
@@ -578,7 +591,13 @@ void splitPage(CursorImpl& c, int level, unsigned newindx, const Entry& ne)
 
     // Promote the separator first. This may cascade all the way to a new root,
     // but it never touches `mp` or `np`, so the pointers below stay good.
-    branchInsert(c, level - 1, ents[split].key, sn, rightCount);
+    // Byte order needs only the shortest prefix of the right leaf's first key
+    // that still sorts after the left leaf's last key. Other orders keep the
+    // whole key: a prefix is not a separator under them.
+    Slice sep = ents[split].key;
+    if (leaf && comparatorFor(tr.flags) == &cmpLexicographic)
+        sep = shortestSeparator(ents[split - 1].key, ents[split].key);
+    branchInsert(c, level - 1, sep, sn, rightCount);
 
     pageInit(mp, mp->pgno, mp->flags, ps);
     for (unsigned i = 0; i < count; ++i) {
