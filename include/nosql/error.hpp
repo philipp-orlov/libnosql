@@ -26,6 +26,7 @@ enum class ErrorCode
     Busy,  ///< store locked by another process, or the writer slot stayed taken past a timeout
     IoError,
     OutOfMemory,
+    Conflict,  ///< optimistic transaction used a key a later commit changed; retry it
 };
 
 const char* toString(ErrorCode) noexcept;

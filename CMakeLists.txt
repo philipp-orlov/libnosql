@@ -34,6 +34,7 @@ add_library(nosql
     src/txn.cpp
     src/b_tree.cpp
     src/api.cpp
+    src/optimistic.cpp
     src/verify.cpp
 )
 if(NOSQL_WITH_BLOB)

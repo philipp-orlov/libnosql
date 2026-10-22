@@ -519,6 +519,7 @@ const char* toString(ErrorCode c) noexcept
         case ErrorCode::Busy: return "store is busy";
         case ErrorCode::IoError: return "i/o error";
         case ErrorCode::OutOfMemory: return "out of memory";
+        case ErrorCode::Conflict: return "optimistic transaction conflict";
     }
     return "unknown error";
 }

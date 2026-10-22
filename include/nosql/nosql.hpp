@@ -38,6 +38,7 @@ class Env;
 class Txn;
 class Db;
 class Cursor;
+class OptimisticTxn;
 
 // ---------------------------------------------------------------- enums ---
 
@@ -655,6 +656,7 @@ private:
     Txn beginWriter();  // the writer slot is held
     friend class Options;
     friend class Txn;
+    friend class OptimisticTxn;  // commit publishes the keys it wrote
     explicit Env(std::shared_ptr<internal::EnvImpl> e) noexcept : impl_(std::move(e)) {}
     /// Shared so that a transaction (and any handle it produced) keeps the file
     /// and its mapping alive even if the `Env` object is destroyed first.

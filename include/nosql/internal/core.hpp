@@ -16,6 +16,7 @@
 #include "nosql/internal/arena.hpp"
 #include "nosql/internal/buffer_pool.hpp"
 #include "nosql/internal/format.hpp"
+#include "nosql/internal/occ_log.hpp"
 #include "nosql/internal/os.hpp"
 #include "nosql/internal/page_table.hpp"
 #include "nosql/internal/validation_cache.hpp"
@@ -171,6 +172,13 @@ struct EnvImpl
     /// per-transaction arena would hand the allocator a fresh multi-page chunk
     /// on every commit -- exactly what it exists to avoid. See internal/Arena.hpp.
     Arena writeScratch;
+
+    /// Keys written by recent commits, for validating optimistic transactions;
+    /// see occ_log.hpp. Touched only under writeMtx.
+    OccLog occLog;
+    /// Keys the commit about to publish wrote, set by an optimistic commit while
+    /// it holds writeMtx. Null for a plain write, which occLog records as unknown.
+    const std::vector<std::uint64_t>* occNext = nullptr;
 
     /// Page buffers recycled across transactions. Carries its own lock: it is
     /// touched from transaction teardown, which can run after writeMtx has
