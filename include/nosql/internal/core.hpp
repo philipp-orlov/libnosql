@@ -351,6 +351,7 @@ struct EnvImpl
     }
     TxnId oldestSnapshot() const;  // caller holds mtx
     void growLocked(std::uint64_t neededBytes);
+    void shrinkLocked(std::uint64_t bytes);  // caller holds mtx and the write slot
     void releaseStaleRegions();  // caller holds mtx
 };
 
