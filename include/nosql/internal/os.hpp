@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -19,6 +20,33 @@ inline constexpr FileHandle kInvalidFile = nullptr;
 using FileHandle = int;
 inline constexpr FileHandle kInvalidFile = -1;
 #endif
+
+/// Test support: sees every byte the store puts in a file, through a system
+/// call or through the shared mapping, and every flush, in program order, so
+/// a test can rebuild what the device may hold after a power cut at any point:
+/// what was flushed, plus any part of what was not. Null outside such tests;
+/// a write then costs one relaxed load.
+class WriteRecorder
+{
+public:
+    virtual ~WriteRecorder() = default;
+    virtual void written(FileHandle, std::uint64_t offset, const void* data,
+                         std::size_t length) = 0;
+    virtual void resized(FileHandle, std::uint64_t bytes) = 0;
+    /// [offset, offset + length) is on the device, the whole file when length
+    /// is 0, its size included.
+    virtual void flushed(FileHandle, std::uint64_t offset, std::uint64_t length) = 0;
+};
+inline std::atomic<WriteRecorder*> writeRecorder{nullptr};
+
+/// For stores into the shared mapping, which no system call sees: called
+/// after the bytes are in place.
+inline void recordMappedWrite(FileHandle fd, std::uint64_t offset, const void* data,
+                              std::size_t length)
+{
+    if (WriteRecorder* r = writeRecorder.load(std::memory_order_relaxed))
+        r->written(fd, offset, data, length);
+}
 
 /// A live mapping of the whole file. Where mapFileReserved() could reserve
 /// address space (POSIX), growth maps the new extent in place and the base

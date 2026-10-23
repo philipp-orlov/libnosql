@@ -304,6 +304,7 @@ void formatStore(EnvImpl& e)
         m.txnid = 0;
         m.checksum = metaChecksum(m);
         *metaOf(p) = m;
+        os::recordMappedWrite(e.fd, std::uint64_t(slot) * e.pageSize, p, e.pageSize);
     }
     os::flushRange(e.fd, e.region->m, 0, 2 * e.pageSize);
     os::syncFile(e.fd, true);

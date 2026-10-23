@@ -690,6 +690,7 @@ void writePages(TxnImpl* t)
         if (kWriteThroughMapping) {
             os::observeIo(os::IoEvent::Write, std::size_t(n) * ps);
             std::memcpy(base + p * ps, buf, std::size_t(n) * ps);
+            os::recordMappedWrite(e->fd, p * std::uint64_t(ps), base + p * ps, std::size_t(n) * ps);
             os::observeIo(os::IoEvent::WriteProgress, std::size_t(n) * ps);
         } else {
             spans.push_back(os::Span{buf, std::size_t(n) * ps});
@@ -716,6 +717,7 @@ unsigned storeMeta(EnvImpl& e, const os::Mapping& view, const Meta& m)
     mp->flags = P_META;
     mp->nkeys = 0;
     *metaOf(mp) = m;
+    os::recordMappedWrite(e.fd, std::uint64_t(slot) * e.pageSize, mp, e.pageSize);
     return slot;
 }
 

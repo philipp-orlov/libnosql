@@ -130,7 +130,7 @@ no network, and every case cleans up its own scratch directory under the
 system temp path. `ctest` exits non-zero if anything fails, so a pipeline
 needs nothing more than the three commands above.
 
-Twenty test binaries are registered in a full build, each with a 900-second timeout
+Twenty-five test binaries are registered in a full build, each with a 900-second timeout
 (the `mq`, `mqsteady`, replication and `tar` entries exist only when their subsystem
 is built):
 
@@ -148,6 +148,10 @@ is built):
 | `allocbudget` | zero heap allocations per warm transaction, a flat heap across churn rounds, slices that survive a growth |
 | `mvcc` | snapshot isolation, readers versus writer, reader pinning |
 | `torture` | randomized operation mixes checked against a `std::map` oracle |
+| `optimistic` | `OptimisticTxn`: conflict detection, retries, group commit, escalation |
+| `separators` | shortest branch separators at splits, rebalances and bulk loads |
+| `pipeline` | pipelined `Safe` commits: visibility only once durable, failure handling |
+| `power` | every write and flush recorded and replayed: at each point, images that keep any subset of the unflushed sectors must open whole on a committed snapshot no older than the last one reported durable, in every durability mode |
 | `mq` | queue semantics: FIFO, leases, redelivery, dead-lettering |
 | `mqsteady` | queues under sustained send/receive: no unbounded growth |
 | `replication` | checkpoints, base images, bundle format, apply, divergence |
