@@ -147,6 +147,10 @@ struct EnvStats
     /// in the queue behind the group being applied.
     std::uint32_t optimisticCommits = 0;
     std::uint32_t optimisticQueued = 0;
+    /// Pages written early by spilling (Env::Options::dirtyLimit) since the
+    /// environment opened, and how many of them a write read back.
+    std::uint64_t spilledPages = 0;
+    std::uint64_t unspilledPages = 0;
 };
 
 // ------------------------------------------------------------------ db ----

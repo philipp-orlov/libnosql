@@ -294,6 +294,65 @@ TEST(aSpillWithoutAWriteStillReanchorsCursors)
     });
 }
 
+/// Pages a transaction keeps rewriting stay in memory while the ones it
+/// wrote once go to the file: a spill sends the least recently touched first,
+/// so the hot pages are seldom read back.
+TEST(spillingSendsTheColdestPagesFirst)
+{
+    tst::Scratch scratch("spill-coldest");
+    Env env = spilling().open(scratch.file());
+    State expect;
+    env.write([&](Txn& txn) {
+        Db db = txn.mainDb();
+        std::mt19937_64 rng(5);
+        for (int i = 0; i < 20000; ++i) {
+            // Ascending, so a page filled once is not touched again...
+            const std::string cold = "cold/" + tst::keyOf(std::uint64_t(i));
+            db.put(cold, tst::blob(100, std::uint64_t(i)));
+            expect[cold] = tst::blob(100, std::uint64_t(i));
+            // ...and a few pages' worth rewritten all along.
+            const std::string hot = "hot/" + tst::keyOf(rng() % 60);
+            db.put(hot, tst::blob(40, std::uint64_t(i)));
+            expect[hot] = tst::blob(40, std::uint64_t(i));
+        }
+    });
+    const EnvStats s = env.stats();
+    CHECK(s.spilledPages > 300u);
+    CHECK(s.unspilledPages * 20 < s.spilledPages);
+    env.read([&](Txn& txn) { CHECK(contentsOf(txn) == expect); });
+}
+
+/// Keys so long that branch pages, which never spill, outgrow half the
+/// budget: a spill then finds too little to write, and the transaction goes
+/// on until it commits or the budget refuses it, with no wrong page.
+TEST(aTreeOfMostlyBranchPagesSpillsWhatItCan)
+{
+    tst::Scratch scratch("spill-branches");
+    Env env = spilling().open(scratch.file());
+    State expect;
+    const std::size_t keyBytes = env.maxKeySize() - 16;
+    std::mt19937_64 rng(9);
+    bool refused = false;
+    try {
+        env.write([&](Txn& txn) {
+            Db db = txn.mainDb();
+            for (int i = 0; i < 4000; ++i) {
+                std::string key = tst::keyOf(rng() % 100000);
+                key.resize(keyBytes, 'k');
+                db.put(key, "v");
+                expect[key] = "v";
+            }
+        });
+    } catch (const Error& e) {
+        CHECK(e.code() == ErrorCode::OutOfMemory);
+        refused = true;
+        expect.clear();
+    }
+    CHECK(env.stats().spilledPages > 0u);
+    env.read([&](Txn& txn) { CHECK(contentsOf(txn) == expect); });
+    std::printf("    (%s)\n", refused ? "refused at the budget" : "committed");
+}
+
 /// With spilling off the budget is a hard limit, as before.
 TEST(spillingOffFailsAtTheBudget)
 {

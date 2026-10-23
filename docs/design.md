@@ -402,9 +402,15 @@ counts (`Db::countRange`) and `Cursor::skip` descend by them.
 `dirtyLimit` defaults to 256 MiB of active page buffers, including nested writers;
 zero disables the limit. A write that may pass it spills first (`TxnImpl::spill`,
 called on entry to `put`, `reserve`, `erase` and the cursor writes, never inside a
-descent, which holds page pointers): starting with the outermost transaction, it
-seals leaf and overflow pages in page order and writes them where they will commit,
-until half the budget is free. Those page numbers are free in every snapshot,
+descent, which holds page pointers): from this transaction and its ancestors, it
+picks the least recently touched leaf and overflow pages until half the budget
+would be free, then seals them and writes them, in page order, where they will
+commit. Every write that touches a dirty buffer stamps it with a clock in the
+checksum trailer, which sealing overwrites, so the order costs no memory. A spill
+that wrote every page it could and still missed its aim (branch pages, which stay,
+fill the rest) marks itself exhausted; none other is tried, and none rescans the
+dirty pages on every write, until a write makes a leaf or overflow page dirty
+again. `EnvStats::spilledPages` and `unspilledPages` count both directions. Those page numbers are free in every snapshot,
 durable or visible, so the early write is as safe as the one at commit, and the
 `power` suite replays power cuts through spilling commits. The buffer's memory
 goes back to the OS (`discardMemory`) but its address stays owned, so a stale
@@ -616,8 +622,11 @@ instruction counts below come from callgrind and do not move. `bench_features`
 Prefix keys hold the same tree in 39% fewer leaves, so lookups touch fewer pages;
 a scan pays for assembling each key. A transaction four times a 16 MiB
 `dirtyLimit`, random keys: 1.74 us per put held in memory (80 MiB of dirty
-buffers), 5.96 us spilling (dirty buffers never above 16 MiB); random keys bring
-spilled leaves back again and again, so spilling is a ceiling on memory, not free.
+buffers), 5.60 us spilling (dirty buffers never above 16 MiB; 5.96 us when spills
+went in page order); random keys bring spilled leaves back again and again, so
+spilling is a ceiling on memory, not free. Where writes have a hot set it pays
+less: the `spill` suite's transaction of ascending inserts that keeps rewriting
+60 keys read back 172 of 1,485 spilled pages in page order and none coldest first.
 
 Checking every page a reader follows (see Integrity) against the code before it,
 in instructions per operation over 100,000 entries of 100 bytes: insert in batches
