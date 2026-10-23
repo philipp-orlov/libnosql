@@ -1008,6 +1008,9 @@ bool descendFirst(CursorImpl& c)
     while (isBranch(c.pg[c.top])) {
         if (c.idx[c.top] >= c.pg[c.top]->nkeys)
             return false;
+        // A damaged child pointer can make a cycle: the path has a fixed depth.
+        if (c.top + 1 >= kMaxDepth)
+            throw Error(ErrorCode::Corrupted, "b-tree exceeded maximum depth");
         c.pg[c.top + 1] =
             c.txn->getPage(checkedChild(c.pg[c.top], c.idx[c.top], c.txn->pageSize()));
         ++c.top;
@@ -1021,6 +1024,9 @@ bool descendLast(CursorImpl& c)
     while (isBranch(c.pg[c.top])) {
         if (c.idx[c.top] >= c.pg[c.top]->nkeys)
             return false;
+        // A damaged child pointer can make a cycle: the path has a fixed depth.
+        if (c.top + 1 >= kMaxDepth)
+            throw Error(ErrorCode::Corrupted, "b-tree exceeded maximum depth");
         c.pg[c.top + 1] =
             c.txn->getPage(checkedChild(c.pg[c.top], c.idx[c.top], c.txn->pageSize()));
         ++c.top;
