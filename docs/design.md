@@ -386,7 +386,16 @@ snapshot therefore waits at most once per sync, and the file stays within about
 twice the data the last sync held, however long a `None` store runs unsynced.
 
 The free tree maps (retiring transaction id, chunk) keys to page-number arrays
-of at most one inline leaf node each. Eligible chunks are absorbed one at a time
+of at most one inline leaf node each. In a store at format 8 a chunk may instead
+hold its pages as runs of consecutive pages (`internal/free_list.hpp`): a varint
+count, then each run's gap from the end of the one before and its length less
+one. An array's length is a multiple of eight and the runs' never is (a zero byte
+pads it when it would be), so the two forms need no tag, and a chunk takes runs
+only when they are shorter. What a commit frees is mostly runs: deleting 100,000
+keys (some 5,600 pages) while a reader pins them added 18 pages to the file as
+arrays and 6 as runs. A store at 7 keeps arrays, which older builds read; readers
+check either form whole, and the count it claims against a chunk's limit, before
+handing out any page. Eligible chunks are absorbed one at a time
 as allocations need them; contiguous runs service overflow values. At commit the
 absorbed chunks are deleted and the retired pages plus the unspent remainder are
 written under the new id, so the cost of a commit is bounded by what it retired
