@@ -42,7 +42,7 @@ TxnImpl* writable(TxnImpl* t)
 }
 
 /// Before a write: spills when the dirty budget may not hold it (a descent's
-/// path split at every level, a sibling, and the value). The caller's key and
+/// path split at every level, a sibling, and the value's buffer). The caller's key and
 /// value may point into the very pages that go, so they are copied into
 /// `keep` first and redirected there.
 void makeRoom(TxnImpl* t, unsigned dbi, Slice& key, Slice& value, std::string& keep)
@@ -50,14 +50,17 @@ void makeRoom(TxnImpl* t, unsigned dbi, Slice& key, Slice& value, std::string& k
     const std::size_t ps = t->pageSize();
     const std::uint64_t depth =
         dbi < t->dbs.size() && t->dbs[dbi].loaded ? std::uint64_t(t->dbs[dbi].tree.depth) : 0;
-    if (!t->wantsSpill((depth + 2) * 3 * ps + value.size()))
+    // A value of more than a page takes a buffer of its size class.
+    const std::uint64_t valueBytes = t->env->buffers.allocationSize(
+        unsigned((kPageHdr + value.size() + kPageChecksumBytes + ps - 1) / ps));
+    if (!t->wantsSpill((depth + 2) * 3 * ps + valueBytes))
         return;
     keep.reserve(key.size() + (value.data() ? value.size() : 0));
     if (key.size())
         keep.assign(reinterpret_cast<const char*>(key.data()), key.size());
     if (value.data())
         keep.append(reinterpret_cast<const char*>(value.data()), value.size());
-    t->spill();
+    t->spill((depth + 2) * ps + valueBytes);  // what the write takes unless it splits
     key = Slice(keep.data(), key.size());
     if (value.data())
         value = Slice(keep.data() + key.size(), value.size());

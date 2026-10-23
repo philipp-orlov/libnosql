@@ -611,9 +611,10 @@ struct TxnImpl
     }
     /// Writes this transaction's and its ancestors' leaf and overflow pages to
     /// the file, at the page numbers they will commit at, until half the dirty
-    /// budget is free, and hands their buffers' memory back. Only between
-    /// operations: no page pointer of an internal descent may be live.
-    void spill();
+    /// budget is free and `room` bytes more fit, and hands their buffers'
+    /// memory back. Only between operations: no page pointer of an internal
+    /// descent may be live.
+    void spill(std::uint64_t room);
     /// The buffer of spilled page or overflow run `p`, read back in and dirty
     /// again; null if `p` is not one this transaction spilled.
     Page* unspill(PageNo p);

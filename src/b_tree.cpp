@@ -2079,7 +2079,7 @@ std::uint64_t treeRelocate(TxnImpl* t, unsigned dbi, PageNo limit)
             if (t->wantsSpill(std::uint64_t(copies) * ps + runBytes)) {
                 // Spilling invalidates the path: find the leaf again after.
                 appendLeafKey(leaf, 0, ps, resume);
-                t->spill();
+                t->spill(std::uint64_t(copies) * ps + runBytes);
                 if (!cursorSeek(c, Slice(resume.data(), resume.size())))
                     return moved;
                 resume.clear();
