@@ -18,7 +18,8 @@ TEST(littleEndianFieldsHaveGoldenBytes)
         CHECK_EQ(bytes[index], index + 1);
     CHECK_EQ(internal::readLittle<std::uint64_t>(bytes), 0x0807060504030201ull);
     CHECK_EQ(sizeof(internal::Page), 16u);
-    CHECK_EQ(internal::kFormatVersion, 7u);
+    CHECK_EQ(internal::kFormatVersion, 8u);
+    CHECK_EQ(internal::kOldestFormatVersion, 7u);
     CHECK_EQ(internal::kPageChecksumBytes, 8u);
     CHECK_EQ(sizeof(internal::Meta), 968u);
     CHECK_EQ(offsetof(internal::Meta, catalogTree), 440u);
@@ -242,7 +243,8 @@ TEST(pageAndRunTrailersUseFullXxh3Digest)
 
 TEST(unsupportedFormatsAreRejected)
 {
-    for (unsigned version : {0u, internal::kFormatVersion + 1}) {
+    for (unsigned version :
+         {0u, internal::kOldestFormatVersion - 1, internal::kFormatVersion + 1}) {
         tst::Scratch scratch("unsupported-format");
         { Env env = Env::configure().open(scratch.file()); }
         {

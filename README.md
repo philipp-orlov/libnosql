@@ -130,7 +130,7 @@ no network, and every case cleans up its own scratch directory under the
 system temp path. `ctest` exits non-zero if anything fails, so a pipeline
 needs nothing more than the three commands above.
 
-Twenty-six test binaries are registered in a full build, each with a 900-second timeout
+Twenty-seven test binaries are registered in a full build, each with a 900-second timeout
 (the `mq`, `mqsteady`, replication and `tar` entries exist only when their subsystem
 is built):
 
@@ -152,6 +152,7 @@ is built):
 | `separators` | shortest branch separators at splits, rebalances and bulk loads |
 | `pipeline` | pipelined `Safe` commits: visibility only once durable, failure handling |
 | `spill` | transactions many times `dirtyLimit`: same pages as unbounded, nested commit and abort, cursors and arguments across a spill |
+| `prefix` | `DbFlags::PrefixKeys`: the same contents as a plain tree in fewer leaves, seeks and scans, nesting, compaction, the format version |
 | `power` | every write and flush recorded and replayed: at each point, images that keep any subset of the unflushed sectors must open whole on a committed snapshot no older than the last one reported durable, in every durability mode |
 | `mq` | queue semantics: FIFO, leases, redelivery, dead-lettering |
 | `mqsteady` | queues under sustained send/receive: no unbounded growth |
@@ -272,7 +273,11 @@ The parent is frozen until the child commits (changes fold in) or aborts
 main tree. `DbFlags::Create` creates on demand; `DbFlags::IntegerKey` compares
 keys as fixed-width little-endian `uint32_t`/`uint64_t` (the width is fixed by the
 first insertion); `DbFlags::ReverseKey` compares back to
-front.
+front. `DbFlags::PrefixKeys`, for byte-ordered sub-databases, stores the prefix a
+leaf's keys share once per leaf, so keys like `tenant/0042/orders/...` take fewer
+pages; a key a cursor returns from such a database is assembled in the cursor and
+is valid until the cursor moves. Creating one raises the store's format version
+from 7 to 8, which older builds refuse to open; a store without one stays at 7.
 
 Sub-database descriptors live in a separate catalog tree, not in the main tree, so
 they never show up as rows in it and a user key and a sub-database may share a name.
@@ -808,7 +813,8 @@ inserts. It favors bounded long-run storage over skipping that bookkeeping.
 ## Scope
 
 Deliberately **not** implemented: multi-process writers, duplicate keys
-(`DUPSORT`), custom comparator callbacks, encryption and compression.
+(`DUPSORT`), custom comparator callbacks, encryption and value compression
+(keys can share their leaf's prefix with `DbFlags::PrefixKeys`).
 `docs/limitations.md` records every simplification and its reasoning, so none
 of them get mistaken for oversights.
 

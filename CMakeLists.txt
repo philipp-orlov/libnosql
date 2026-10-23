@@ -12,6 +12,8 @@ option(NOSQL_ENABLE_ASAN "Build with address+undefined sanitizers" OFF)
 option(NOSQL_ENABLE_TSAN "Build with the thread sanitizer" OFF)
 option(NOSQL_PIPELINE_COMMITS_DEFAULT
        "Make Env::Options::pipelineCommits() default to on (the suite runs this way in CI)" OFF)
+option(NOSQL_PREFIX_KEYS_DEFAULT
+       "Give every new byte-ordered tree, the main one included, DbFlags::PrefixKeys (the suite runs this way in CI)" OFF)
 # Subsystems layered on the key-value store. A consumer that uses only the KV
 # layer (libsql does) switches off what it does not use: less code to build,
 # patch and audit, and no parsers of segment or archive files from disk.
@@ -76,6 +78,9 @@ if(NOSQL_ENABLE_ASAN AND NOT MSVC)
 endif()
 if(NOSQL_PIPELINE_COMMITS_DEFAULT)
     target_compile_definitions(nosql PUBLIC NOSQL_PIPELINE_COMMITS_DEFAULT=1)
+endif()
+if(NOSQL_PREFIX_KEYS_DEFAULT)
+    target_compile_definitions(nosql PUBLIC NOSQL_PREFIX_KEYS_DEFAULT=1)
 endif()
 if(NOSQL_ENABLE_TSAN AND NOT MSVC)
     if(NOSQL_ENABLE_ASAN)

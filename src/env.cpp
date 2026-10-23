@@ -285,12 +285,13 @@ void formatStore(EnvImpl& e)
 {
     Meta m{};
     std::memcpy(m.magic, kMagic, sizeof m.magic);
-    m.version = kFormatVersion;
+    // The oldest version that reads it, until it holds a PrefixKeys tree.
+    m.version = NOSQL_PREFIX_KEYS_DEFAULT ? kFormatVersion : kOldestFormatVersion;
     m.pageSize = std::uint32_t(e.pageSize);
     m.lastPgno = 1;  // the two meta pages
     m.fileSize = e.region->m.size;
     m.freeTree = emptyTree();  // 16-byte big-endian keys under byte order
-    m.mainTree = emptyTree();
+    m.mainTree = emptyTree(NOSQL_PREFIX_KEYS_DEFAULT ? std::uint32_t(DbFlags::PrefixKeys) : 0u);
     m.catalogTree = emptyTree();
     m.storeId = newIdentity();
     m.commitId = newIdentity();
@@ -343,9 +344,10 @@ std::size_t probePageSize(const MappedRegion& r)
     const Meta* m = metaOf(reinterpret_cast<const Page*>(r.m.base));
     if (!magicOk(*m))
         throw Error(ErrorCode::Corrupted, "not a libnosql store (bad magic number)");
-    if (m->version != kFormatVersion)
+    if (m->version < kOldestFormatVersion || m->version > kFormatVersion)
         throw Error(ErrorCode::Incompatible, "store format version " + std::to_string(m->version) +
                                                  ", this build speaks " +
+                                                 std::to_string(kOldestFormatVersion) + " to " +
                                                  std::to_string(kFormatVersion));
     throw Error(ErrorCode::Corrupted, "both meta pages failed validation");
 }

@@ -27,7 +27,11 @@ inline constexpr PageNo kInvalidPage = ~PageNo(0);
 /// Stored verbatim so the first bytes of the file read as the name in any hex
 /// dump. Padded to 16 so every 64-bit field after it stays 8-byte aligned.
 inline constexpr char kMagic[16] = "NOSQL-ORLOV";
-inline constexpr std::uint32_t kFormatVersion = 7;
+/// The newest format this build writes and reads: 8 added P_PREFIX leaves
+/// (DbFlags::PrefixKeys). A store keeps the oldest version that can read it,
+/// 7, until it first holds such a sub-database, so older builds open it.
+inline constexpr std::uint32_t kFormatVersion = 8;
+inline constexpr std::uint32_t kOldestFormatVersion = 7;
 inline constexpr std::size_t kPageChecksumBytes = 8;
 
 using Identity = std::array<std::uint64_t, 2>;
@@ -62,6 +66,7 @@ enum PageFlags : std::uint16_t
     P_LEAF = 1u << 1,
     P_OVERFLOW = 1u << 2,
     P_META = 1u << 3,
+    P_PREFIX = 1u << 4,  ///< leaf storing its keys' shared prefix once (key_prefix.hpp)
 };
 
 /// 16-byte slotted-page header. `lower` is the end of the uint16 slot array,
@@ -453,7 +458,7 @@ inline bool magicOk(const Meta& m) noexcept
 
 inline bool metaValid(const Meta& m, std::size_t expectPageSize) noexcept
 {
-    return magicOk(m) && m.version == kFormatVersion &&
+    return magicOk(m) && m.version >= kOldestFormatVersion && m.version <= kFormatVersion &&
            (expectPageSize == 0 || m.pageSize == expectPageSize) && m.checksum == metaChecksum(m);
 }
 

@@ -90,6 +90,26 @@ an empty 64 KiB page therefore has `upper == 65528`, without a sentinel.
 Large values use a contiguous overflow run with one checksum at the run's end.
 The resulting value can still be returned as one borrowed `Slice`.
 
+A sub-database created with `DbFlags::PrefixKeys` (byte order only) may hold
+`P_PREFIX` leaves (`internal/key_prefix.hpp`). Such a leaf stores the bytes all its
+keys start with once, in a block at the top of the node area just under the
+checksum: the prefix, then its length as a u16, padded to four bytes. Its nodes
+hold only what follows. The block sits above every node, so deleting a node, which
+compacts the node area from `upper`, never moves it. The prefix is what the page's
+first and last key share, used only when that saves room; the working format is
+the file format, so readers search such a page in place: the key is placed against
+the prefix once and the binary search runs on the rest. Inserting a key that does
+not start with the prefix, or that only fits compressed, lays the page out afresh
+from its whole entries, or splits it. Splits choose a boundary by compressed size,
+and rebalancing reads both siblings whole and lays them out again, merged or with
+one entry moved. Branch pages are not compressed, and their separators are cut
+from whole keys as everywhere. A cursor assembles a key from such a leaf in its
+own buffer. `compact()` stages each leaf's entries to pack it by compressed size.
+Format version 8 adds this; a store is raised to it by the commit that creates its
+first such sub-database and is otherwise written as 7, which older builds read.
+A build with `NOSQL_PREFIX_KEYS_DEFAULT` gives every byte-ordered tree the flag,
+main tree included, and the whole suite passes that way.
+
 Persisted integers are explicitly little-endian. User values are opaque.
 Integer-key trees select four- or eight-byte keys on first insertion and reject
 mixed widths. Application encodings must honor this ordering contract.
@@ -582,7 +602,7 @@ replaying a correct record with its flushes taken out must fail some, and does.
 It models a device that honours flushes; one that acknowledges a flush it has not
 performed is outside what any ordering can survive.
 
-The suite is 26 CTest binaries in a full build (20 core, `mq` and `mqsteady`,
+The suite is 27 CTest binaries in a full build (21 core, `mq` and `mqsteady`,
 `replication`, `replicationtorture` and `fault`, and `tar`); the optional-layer
 tests are registered only when their subsystem is built, and `hardening` covers the
 file-safety and failure-poisoning behavior of "Opening a Store" and "Failure".
