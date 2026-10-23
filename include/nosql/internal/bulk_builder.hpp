@@ -128,11 +128,11 @@ public:
                 throw Error(ErrorCode::InvalidArgument, "bulk integer key width mismatch");
             tree_.flags |= std::uint32_t(key.size()) << 16;
         }
-        previous_ = key.string();
         const bool big = leafNodeSize(key.size(), value.size(), false) > maxNodeSize(file_.pageSize());
         const auto bytes = leafNodeSize(key.size(), value.size(), big);
         if (pageRoom(leaf_.page()) < bytes + 2)
-            flushLeaf();
+            flushLeaf();  // previous_ is still the flushed leaf's last key
+        previous_ = key.string();
         if (leaf_.page()->nkeys == 0)
             leaf_.minimum = key.string();
         auto* node = static_cast<LeafNode*>(leaf_.node(bytes));
@@ -213,7 +213,13 @@ private:
         const std::uint64_t entries = leaf_.page()->nkeys;
         const auto number = file_.writePage(leaf_.page());
         ++tree_.leafPages;
+        // In byte order the separator needs only enough of this leaf's first key
+        // to sort after the previous leaf's last; it serves every level above,
+        // where it bounds the same two subtrees. The first leaf's is never stored.
+        if (!lastOfPrevious_.empty() && comparatorFor(tree_.flags) == &cmpLexicographic)
+            leaf_.minimum.resize(shortestSeparator(lastOfPrevious_, leaf_.minimum).size());
         child(0, leaf_.minimum, number, entries);
+        lastOfPrevious_ = previous_;
         leaf_.reset(P_LEAF);
     }
 
@@ -222,6 +228,7 @@ private:
     Buffer leaf_;
     std::vector<Buffer> levels_;
     std::string previous_;
+    std::string lastOfPrevious_;  ///< last key of the leaf flushed before this one
 };
 
 }  // namespace nosql::internal

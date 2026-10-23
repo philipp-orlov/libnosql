@@ -77,10 +77,12 @@ mutable slot registry.
 Leaf and branch pages use slots growing upward and packed nodes growing downward.
 Branch slot zero is the empty-key, minus-infinity child. A branch key is a
 separator: keys routed to its left child sort below it, and keys routed to its
-right child sort at or above it. Any key in that gap is valid. When a leaf
-splits, byte-ordered trees store the shortest prefix of the right leaf's first
-key that still sorts after the left leaf's last key; trees with other orderings
-keep the whole key, since a prefix is not a separator under them. Stores written
+right child sort at or above it. Any key in that gap is valid. Wherever a
+separator comes from two adjacent leaves (a leaf split, a rebalancing shift
+between leaf siblings, and the bulk builder behind `compact()`), byte-ordered
+trees store the shortest prefix of the right leaf's first key that still sorts
+after the left leaf's last key; trees with other orderings keep the whole key,
+since a prefix is not a separator under them. Stores written
 either way open the same, because the layout is unchanged. Nodes are aligned to
 four bytes. The last eight bytes of each slotted page hold its XXH3-64 checksum;
 an empty 64 KiB page therefore has `upper == 65528`, without a sentinel.

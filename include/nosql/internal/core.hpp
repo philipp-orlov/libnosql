@@ -31,6 +31,19 @@ int cmpReverse(Slice, Slice) noexcept;
 int cmpInteger(Slice, Slice) noexcept;
 CompareFn comparatorFor(std::uint32_t DbFlags) noexcept;
 
+/// The shortest key that can separate two adjacent children in byte order: any
+/// s with left < s <= right does, because keys routed left sort below s and keys
+/// routed right sort at or above it. A prefix of `right` is the shortest such
+/// key, and it is never empty. Only valid for cmpLexicographic trees.
+inline Slice shortestSeparator(Slice left, Slice right) noexcept
+{
+    const std::size_t n = std::min(left.size(), right.size());
+    std::size_t d = 0;
+    while (d < n && left.data()[d] == right.data()[d])
+        ++d;
+    return Slice(right.data(), std::min(right.size(), d + 1));
+}
+
 #ifdef NOSQL_NO_REPLICATION
 /// Stand-in when change shipping is compiled out: never instantiated (shipTo
 /// is refused), present so the commit path needs no conditionals.
