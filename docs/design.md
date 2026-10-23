@@ -477,9 +477,10 @@ from the file has its header checked with the checksum (`validateHeader`: page
 type, slot array, a 4-aligned `upper`, the prefix block), and a reader checks each
 node it reaches before following it (`checkNode` in the searches, descents,
 ranks and cursor reads), so no slot, key or value it follows leaves the page. That
-costs a few comparisons per node visited and measured nothing on point lookups.
-Where a writer copies a page to change it, and where the read cache checks a page
-once for many reads, every node is checked (`validateNodes`). A tree pointer that
+costs a few comparisons per node visited. A writer checks the node it rewrites
+or deletes, and every node where it reads them all (a split, a relayout, a
+rebalance); a scan checks each leaf once as it enters it, and the read cache once
+per page for many reads (`validateNodes`). A tree pointer that
 lands on an overflow run, an overflow pointer that lands on a tree page, a value
 longer than its run, and a free-list entry naming a page outside the store are all
 `Corrupted`; dropping a cyclic tree stops at the depth limit. The `corrupt` suite
@@ -597,6 +598,33 @@ includes key formatting in its lookup loop. The example targets are named
 `example_<name>` but the binaries are plain `bench`, `baseline`, `mq` and so on.
 Record compiler, filesystem, CPU,
 storage, cache state and repetitions before drawing comparative conclusions.
+
+### Optional features and the cost of checked pages
+
+Measured on 2026-10-23 in a shared x86-64 cloud container (AVX2 checksum kernel,
+Release, GCC 13), where wall-clock times moved 10-30% between identical runs; the
+instruction counts below come from callgrind and do not move. `bench_features`
+(300,000 entries, 48-byte values, one run):
+
+| workload | plain keys | `PrefixKeys` |
+|---|---:|---:|
+| leaf pages for keys like `tenant/0001/orders/2026-10-17/000000012345` | 11,296 | 6,932 |
+| get random, one transaction | 2,688 ns | 2,230 ns |
+| scan ordered (cursor) | 37 ns | 52 ns |
+| insert random, batches of 1,000 | 4,499 ns | 4,196 ns |
+
+Prefix keys hold the same tree in 39% fewer leaves, so lookups touch fewer pages;
+a scan pays for assembling each key. A transaction four times a 16 MiB
+`dirtyLimit`, random keys: 1.74 us per put held in memory (80 MiB of dirty
+buffers), 5.96 us spilling (dirty buffers never above 16 MiB); random keys bring
+spilled leaves back again and again, so spilling is a ceiling on memory, not free.
+
+Checking every page a reader follows (see Integrity) against the code before it,
+in instructions per operation over 100,000 entries of 100 bytes: insert in batches
+of 1,000 7,505 to 8,170 (+9%), random get 6,949 to 7,433 (+7%), one-put commit
+63,114 to 66,844 (+6%), cursor scan 145 to 190 per entry (+31%, mostly one check per
+node as a scan enters each leaf). The first version, every node of every page on
+every read, cost 25-50% on lookups; checking only the nodes visited is what remains.
 
 ## Verification and Reconstruction
 

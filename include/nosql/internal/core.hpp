@@ -645,6 +645,10 @@ struct CursorImpl
     std::vector<std::byte> erasedKey;
     /// The key last read from a P_PREFIX leaf, assembled whole (leafKeyAt).
     std::vector<std::byte> keyBuf;
+    /// The leaf whose every node Cursor::next's fast path has checked, so the
+    /// rest of a scan through it reads them unchecked. Only that path, which
+    /// runs where the page cannot change under the cursor, trusts it.
+    const Page* scannedLeaf = nullptr;
     /// Set for cursors handed to callers, so the transaction -- and the store
     /// under it -- outlive them.
     std::shared_ptr<TxnImpl> keepalive;
@@ -696,17 +700,34 @@ void cursorRevalidate(CursorImpl& c);
 Slice cursorKey(CursorImpl& c);
 /// Leaf `p`'s key `i` whole: in place, or on a P_PREFIX leaf assembled in the
 /// cursor, where it lasts until the cursor reads another.
-Slice leafKeyAt(CursorImpl& c, const Page* p, unsigned i);
+Slice leafKeyAssembled(CursorImpl& c, const Page* p, unsigned i);
+inline Slice leafKeyAt(CursorImpl& c, const Page* p, unsigned i)
+{
+    if (p->flags & P_PREFIX)
+        return leafKeyAssembled(c, p, i);
+    return checkedLeafKey(p, i, c.txn->pageSize() - kPageChecksumBytes);
+}
 Slice cursorValue(CursorImpl& c);
 /// The value of leaf node `i`; out of line only for overflow values.
 Slice leafValueOverflow(TxnImpl* t, const Page* p, unsigned i);
 inline Slice leafValue(TxnImpl* t, const Page* p, unsigned i)
 {
-    checkNode(p, i, t->pageSize());
-    const LeafNode* n = lnode(p, i);
+    const LeafNode* n = checkedLeafNode(p, i, nodeTop(p, t->pageSize()));
     if (!(n->flags & N_BIGDATA))
         return Slice(reinterpret_cast<const std::byte*>(n) + sizeof(LeafNode) + n->ksize, n->vsize);
     return leafValueOverflow(t, p, i);
+}
+
+/// Leaf node `i`'s key and value at once, the node checked once: what a
+/// cursor step hands back.
+NOSQL_ALWAYS_INLINE void leafEntryAt(CursorImpl& c, const Page* p, unsigned i, Slice& key,
+                                     Slice& value)
+{
+    const LeafNode* n = checkedLeafNode(p, i, nodeTop(p, c.txn->pageSize()));
+    const auto* body = reinterpret_cast<const std::byte*>(n) + sizeof(LeafNode);
+    key = (p->flags & P_PREFIX) ? leafKeyAssembled(c, p, i) : Slice(body, n->ksize);
+    value =
+        (n->flags & N_BIGDATA) ? leafValueOverflow(c.txn, p, i) : Slice(body + n->ksize, n->vsize);
 }
 
 /// Insert or overwrite. `out` (optional) receives the writable value area,

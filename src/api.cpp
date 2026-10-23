@@ -100,6 +100,7 @@ struct CursorPool
     {
         c->keepalive.reset();
         c->envKeep.reset();
+        c->scannedLeaf = nullptr;
         c->txn = nullptr;
         c->dbi = 0;
         c->top = -1;
@@ -810,8 +811,7 @@ bool landed(CursorImpl& c, bool ok, Slice& key, Slice& value)
 {
     if (!ok)
         return false;
-    key = leafKeyAt(c, c.pg[c.top], c.idx[c.top]);
-    value = leafValue(c.txn, c.pg[c.top], c.idx[c.top]);
+    leafEntryAt(c, c.pg[c.top], c.idx[c.top], key, value);
     return true;
 }
 
@@ -835,8 +835,16 @@ bool Cursor::next(Slice& key, Slice& value)
         const unsigned i = c->idx[c->top] + 1u;
         if (i < p->nkeys) {
             c->idx[c->top] = std::uint16_t(i);
-            key = leafKeyAt(*c, p, i);
-            value = leafValue(c->txn, p, i);
+            // A scan reads every node of the leaf: check them all once.
+            if (c->scannedLeaf != p) {
+                validateNodes(p, c->txn->pageSize());
+                c->scannedLeaf = p;
+            }
+            const LeafNode* n = lnode(p, i);
+            const auto* body = reinterpret_cast<const std::byte*>(n) + sizeof(LeafNode);
+            key = (p->flags & P_PREFIX) ? leafKeyAssembled(*c, p, i) : Slice(body, n->ksize);
+            value = (n->flags & N_BIGDATA) ? leafValueOverflow(c->txn, p, i)
+                                           : Slice(body + n->ksize, n->vsize);
             return true;
         }
     }

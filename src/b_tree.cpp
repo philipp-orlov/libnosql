@@ -27,6 +27,12 @@
 #include "nosql/internal/key_prefix.hpp"
 
 namespace nosql::internal {
+
+void throwNodeOutOfRange()
+{
+    throw Error(ErrorCode::Corrupted, "node out of range");
+}
+
 namespace {
 
 // ------------------------------------------------------------ page prims ---
@@ -187,7 +193,7 @@ unsigned branchSearchWith(const Page* p, Slice key, Cmp cmp, std::size_t ps)
     unsigned lo = 1, hi = p->nkeys, best = 0;
     while (lo < hi) {
         const unsigned mid = lo + (hi - lo) / 2;
-        if (cmp(checkedKey(p, mid, top), key) <= 0) {
+        if (cmp(checkedBranchKey(p, mid, top), key) <= 0) {
             best = mid;
             lo = mid + 1;
         } else {
@@ -213,7 +219,7 @@ unsigned leafLowerBoundWith(const Page* p, Slice key, Cmp cmp, bool* exact, std:
     *exact = false;
     while (lo < hi) {
         const unsigned mid = lo + (hi - lo) / 2;
-        const int c = cmp(checkedKey(p, mid, top), key);
+        const int c = cmp(checkedLeafKey(p, mid, top), key);
         if (c == 0) {
             *exact = true;
             return mid;
@@ -247,7 +253,7 @@ unsigned leafLowerBound(const Page* p, Slice key, CompareFn cmp, bool* exact, st
 /// `key` against leaf `p`'s key `i`, prefix included.
 int againstLeafKey(const Page* p, unsigned i, Slice key, CompareFn cmp, std::size_t ps)
 {
-    const Slice stored = checkedKey(p, i, nodeTop(p, ps));
+    const Slice stored = checkedLeafKey(p, i, nodeTop(p, ps));
     if (!(p->flags & P_PREFIX))
         return cmp(key, stored);
     Slice rest;
@@ -344,7 +350,7 @@ unsigned branchSearchIn(const Page* p, Slice key, CompareFn cmp, const Bounds& b
     const std::size_t top = nodeTop(p, ps);
     const unsigned guess = 1 + guessSlot(b, key, n - 1);
     return searchFrom(1, n, guess,
-                      [&](unsigned i) { return lex(checkedKey(p, i, top), key) <= 0; }) -
+                      [&](unsigned i) { return lex(checkedBranchKey(p, i, top), key) <= 0; }) -
            1;
 }
 
@@ -356,9 +362,10 @@ unsigned leafLowerBoundIn(const Page* p, Slice key, CompareFn cmp, const Bounds&
         return leafLowerBound(p, key, cmp, exact, ps);
     const LexCmp lex;
     const std::size_t top = nodeTop(p, ps);
-    const unsigned i = searchFrom(0, n, guessSlot(b, key, n),
-                                  [&](unsigned j) { return lex(checkedKey(p, j, top), key) < 0; });
-    *exact = i < n && lex(checkedKey(p, i, top), key) == 0;
+    const unsigned i = searchFrom(0, n, guessSlot(b, key, n), [&](unsigned j) {
+        return lex(checkedLeafKey(p, j, top), key) < 0;
+    });
+    *exact = i < n && lex(checkedLeafKey(p, i, top), key) == 0;
     return i;
 }
 
@@ -407,8 +414,6 @@ Page* touchLevel(CursorImpl& c, int lvl)
         c.pg[lvl] = back;  // the same page number: the parent needs no update
         return back;
     }
-    // Every node, before a writer edits the copy by the sizes they claim.
-    validateNodes(p, t->pageSize());
     const PageNo np = t->allocPages(1);
     Page* d = t->allocBuffer(np, p->flags, 1);
     std::memcpy(d, p, t->pageSize());
@@ -635,6 +640,7 @@ void splitPage(CursorImpl& c, int level, unsigned newindx, const Entry& ne)
     std::byte* copy = t->scratch().alloc(ps, 64);
     std::memcpy(copy, mp, ps);
     const Page* src = reinterpret_cast<const Page*>(copy);
+    validateNodes(src, ps);  // every entry is read by its claimed size
 
     const unsigned count = unsigned(src->nkeys) + 1;
     Entry* ents = reinterpret_cast<Entry*>(
@@ -733,6 +739,7 @@ bool relayoutLeaf(CursorImpl& c, unsigned at, const Entry& ne)
     std::byte* copy = t->scratch().alloc(ps, 64);
     std::memcpy(copy, p, ps);
     const Page* src = reinterpret_cast<const Page*>(copy);
+    validateNodes(src, ps);  // every entry is read by its claimed size
     const unsigned count = unsigned(src->nkeys) + 1;
     Entry* ents = reinterpret_cast<Entry*>(
         t->scratch().alloc(std::size_t(count) * sizeof(Entry), alignof(Entry)));
@@ -844,7 +851,7 @@ void rebalance(CursorImpl& c)
         }
         // A single-child root is pure overhead: pull the child up.
         while (isBranch(p) && p->nkeys == 1) {
-            const PageNo ch = branchChild(p, 0);
+            const PageNo ch = checkedChild(p, 0, ps);
             t->freePage(p->pgno);
             --tr.branchPages;
             tr.root = ch;
@@ -858,6 +865,7 @@ void rebalance(CursorImpl& c)
     }
 
     Page* parent = c.pg[c.top - 1];
+    validateNodes(parent, ps);  // the sibling's slot is read below, then nodes move
     const unsigned pidx = c.idx[c.top - 1];
     const unsigned sidx = (pidx == 0) ? pidx + 1 : pidx - 1;
     if (sidx >= parent->nkeys)
@@ -869,7 +877,6 @@ void rebalance(CursorImpl& c)
     if (Page* back = t->isOwnDirty(spgno) ? nullptr : t->unspill(spgno)) {
         sib = back;
     } else if (!t->isOwnDirty(spgno)) {
-        validateNodes(sib, ps);
         const PageNo np = t->allocPages(1);
         Page* d = t->allocBuffer(np, sib->flags, 1);
         std::memcpy(d, sib, ps);
@@ -883,6 +890,11 @@ void rebalance(CursorImpl& c)
     Page* left = pIsLeft ? p : sib;
     Page* right = pIsLeft ? sib : p;
     const unsigned ridx = pIsLeft ? sidx : pidx;  // parent slot of `right`
+    // Every entry of all three is read or moved by its claimed size below. A
+    // copied page is only checked node by node as a writer reaches them; here
+    // they are all reached.
+    validateNodes(left, ps);
+    validateNodes(right, ps);
     if (leaf && compresses(tr)) {
         rebalancePrefixed(c, left, right, ridx, pIsLeft);
         return;
@@ -1180,9 +1192,9 @@ bool treeSearch(CursorImpl& c, Slice key, bool* exact)
         // The child's keys lie between the separators either side of it.
         const std::size_t top = nodeTop(p, ps);
         if (i > 0)
-            b.low = checkedKey(p, i, top);
+            b.low = checkedBranchKey(p, i, top);
         if (i + 1u < p->nkeys)
-            b.high = checkedKey(p, i + 1, top);
+            b.high = checkedBranchKey(p, i + 1, top);
         c.pg[c.top + 1] = c.txn->getPage(checkedChild(p, i, ps));
         ++c.top;
     }
@@ -1406,11 +1418,9 @@ Slice cursorKey(CursorImpl& c)
     return leafKeyAt(c, c.pg[c.top], c.idx[c.top]);
 }
 
-Slice leafKeyAt(CursorImpl& c, const Page* p, unsigned i)
+Slice leafKeyAssembled(CursorImpl& c, const Page* p, unsigned i)
 {
     checkNode(p, i, c.txn->pageSize());
-    if (!(p->flags & P_PREFIX))
-        return nodeKey(p, i);
     c.keyBuf.clear();
     appendLeafKey(p, i, c.txn->pageSize(), c.keyBuf);
     return Slice(c.keyBuf.data(), c.keyBuf.size());
@@ -1493,6 +1503,7 @@ bool treePut(CursorImpl& c, Slice key, Slice value, PutMode mode, WritableSlice*
     unsigned at = c.idx[c.top];
 
     if (exact) {
+        checkNode(p, at, ps);  // its value is rewritten or deleted by its size
         LeafNode* n = lnode(p, at);
         const bool oldbig = (n->flags & N_BIGDATA) != 0;
         auto* body = reinterpret_cast<std::byte*>(n) + sizeof(LeafNode) + n->ksize;
@@ -1636,6 +1647,7 @@ void treeDelCurrent(CursorImpl& c)
     touchPath(c);  // idempotent: already-owned pages are left alone
     Page* p = c.pg[c.top];
     const unsigned i = c.idx[c.top];
+    checkNode(p, i, t->pageSize());  // nodeDel moves bytes by its size
     LeafNode* n = lnode(p, i);
     if (n->flags & N_BIGDATA)
         overflowRelease(t, tr, bigPgno(n));
