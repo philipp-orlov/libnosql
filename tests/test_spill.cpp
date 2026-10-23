@@ -5,6 +5,7 @@
 // read back, rewritten, freed, carried through nested transactions and
 // thrown away on abort.
 
+#include <algorithm>
 #include <map>
 #include <random>
 #include <vector>
@@ -399,6 +400,54 @@ TEST(aValueOfHalfTheBudgetSpillsWhatItNeeds)
             expect[tst::keyOf(i)] = value;
             CHECK(env.stats().dirtyBytes <= 64u << 10);
         }
+    });
+    env.read([&](Txn& txn) { CHECK(contentsOf(txn) == expect); });
+}
+
+/// Overwriting a value with one of another length frees the old run inside
+/// the transaction: its buffer is reused or handed back by a spill, never
+/// left counted against the budget for nothing.
+TEST(freedRunsDoNotFillTheBudget)
+{
+    tst::Scratch scratch("spill-runs");
+    Env env = spilling().open(scratch.file());
+    State expect;
+    std::uint64_t peak = 0;
+    env.write([&](Txn& txn) {
+        Db db = txn.mainDb();
+        for (int i = 0; i < 3000; ++i) {
+            const std::string key = tst::keyOf(i % 3);
+            const std::string value = tst::blob(i % 2 ? 9000 : 13000, std::uint64_t(i));
+            db.put(key, value);
+            expect[key] = value;
+            peak = std::max(peak, env.stats().dirtyBytes);
+        }
+    });
+    // Three live values need no spill at all; freed runs counted against the
+    // budget once forced thousands of pages out.
+    CHECK(peak <= kLimit / 4);
+    CHECK_EQ(env.stats().spilledPages, 0u);
+    env.read([&](Txn& txn) { CHECK(contentsOf(txn) == expect); });
+}
+
+/// A nested transaction's buffers outlive its abort, in its parent: the
+/// parent reuses them, and a spill hands them back.
+TEST(abortedChildrenDoNotFillTheBudget)
+{
+    tst::Scratch scratch("spill-abort");
+    Env env = spilling().open(scratch.file());
+    State expect;
+    env.write([&](Txn& txn) {
+        for (int round = 0; round < 200; ++round) {
+            Txn child = txn.nested();
+            Db db = child.mainDb();
+            for (int i = 0; i < 40; ++i)
+                db.put(tst::keyOf(round * 40 + i), tst::blob(i % 8 ? 300 : 6000, std::uint64_t(i)));
+            child.abort();
+            CHECK(env.stats().dirtyBytes <= kLimit);
+        }
+        txn.mainDb().put("kept", "1");
+        expect["kept"] = "1";
     });
     env.read([&](Txn& txn) { CHECK(contentsOf(txn) == expect); });
 }

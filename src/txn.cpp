@@ -50,9 +50,10 @@ void TxnImpl::releaseResources()
         spilled.release();  // a spilling transaction's table is not worth keeping
     spillPool.clear();
     spillList.clear();
-    // `pool` only ever holds buffers that are also in `owned`, so dropping the
-    // references here is enough.
+    // `pool` and `runPool` only ever hold buffers that are also in `owned`,
+    // so dropping the references here is enough.
     pool.clear();
+    runPool.clear();
     dirty.clear();
     loose.clear();
     retiredLocal.clear();
@@ -84,6 +85,7 @@ void TxnImpl::releaseResources()
     };
     trim(owned);
     trim(pool);
+    trim(runPool);
     trim(loose);
     trim(pending);
     trim(retiredLocal);
@@ -174,6 +176,20 @@ void chargeDirty(const EnvImpl* env, std::uint64_t bytes)
 
 }  // namespace
 
+Page* TxnImpl::reuseRun(unsigned npages)
+{
+    const std::size_t size = env->buffers.allocationSize(npages);
+    for (std::size_t i = 0; i < runPool.size(); ++i) {
+        if (env->buffers.allocationSize(runPool[i].second) == size) {
+            Page* buf = runPool[i].first;
+            runPool[i] = runPool.back();
+            runPool.pop_back();
+            return buf;
+        }
+    }
+    return nullptr;
+}
+
 Page* TxnImpl::allocBuffer(PageNo p, std::uint16_t flags, unsigned npages)
 {
     Page* buf = nullptr;
@@ -181,6 +197,8 @@ Page* TxnImpl::allocBuffer(PageNo p, std::uint16_t flags, unsigned npages)
         // Freed earlier in this same transaction, so it is already in `owned`.
         buf = pool.back();
         pool.pop_back();
+    } else if (Page* run = npages > 1 ? reuseRun(npages) : nullptr) {
+        buf = run;  // in `owned` and counted already, like `pool`'s
     } else if (npages == 1 && !spillPool.empty()) {
         // Also in `owned`, but its memory went back to the OS: counted again.
         const auto bytes = env->buffers.allocationSize(1);
@@ -401,7 +419,7 @@ void TxnImpl::freePage(PageNo p, unsigned count)
     if (Page* buf = dirty.find(p)) {
         // Ours: nothing committed points at it, so it is reusable right away.
         dirty.erase(p);
-        pool.push_back(buf);
+        recycle(buf, count);
         for (unsigned k = 0; k < count; ++k)
             loose.push_back(p + k);
         return;
@@ -1040,6 +1058,7 @@ void commitNested(TxnImpl* t)
     p->owned.insert(p->owned.end(), t->owned.begin(), t->owned.end());
     t->owned.clear();
     p->pool.insert(p->pool.end(), t->pool.begin(), t->pool.end());
+    p->runPool.insert(p->runPool.end(), t->runPool.begin(), t->runPool.end());
     p->spillPool.insert(p->spillPool.end(), t->spillPool.begin(), t->spillPool.end());
     p->spilledBytes += t->spilledBytes;
     t->spilledBytes = 0;
@@ -1056,7 +1075,7 @@ void commitNested(TxnImpl* t)
             // An overflow run is retired page by page but held under its first
             // page: the whole run is free, and the rest of it follows here.
             const unsigned n = isOverflow(buf) ? ovPages(buf) : 1u;
-            p->pool.push_back(buf);
+            p->recycle(buf, n);
             p->dirty.erase(pgno);
             for (unsigned k = 0; k < n; ++k)
                 p->loose.push_back(pgno + k);
@@ -1140,14 +1159,19 @@ void abortNested(TxnImpl* t)
     TxnImpl* p = t->parent;
 
     // Hand the buffers up rather than releasing them: a cursor belonging to the
-    // parent may still hold a pointer into one until it next re-anchors.
+    // parent may still hold a pointer into one until it next re-anchors. They
+    // stay counted in dirtyBytes, so the parent recycles them as its own.
     p->owned.insert(p->owned.end(), t->owned.begin(), t->owned.end());
     t->owned.clear();
     t->dirty.forEach([&](PageNo pgno, Page* buf) {
         const unsigned n = isOverflow(buf) ? ovPages(buf) : 1u;
+        p->recycle(buf, n);
         for (unsigned k = 0; k < n; ++k)
             p->loose.push_back(pgno + k);
     });
+    p->pool.insert(p->pool.end(), t->pool.begin(), t->pool.end());
+    p->runPool.insert(p->runPool.end(), t->runPool.begin(), t->runPool.end());
+    p->spillPool.insert(p->spillPool.end(), t->spillPool.begin(), t->spillPool.end());
     // Spilled ones too; their bytes in the file are as dead as a buffer's.
     t->spilled.forEach([&](PageNo pgno, Page*) {
         const Page* written = t->env->mapPage(*t->region, pgno);
@@ -1396,6 +1420,26 @@ void TxnImpl::spill(std::uint64_t room)
     // that has not been touched for a while is the least likely to be soon,
     // so the least likely to be read back. Branch pages stay: nearly every
     // write descends through them, and they are a small share of any tree.
+    // Recycled buffers first: no page uses them, so they need no write.
+    std::uint64_t idle = 0;
+    for (TxnImpl* a = this; a; a = a->parent) {
+        const std::size_t one = env->buffers.allocationSize(1);
+        for (Page* buf : a->pool) {
+            os::discardMemory(buf, one);
+            a->spillPool.push_back(buf);
+        }
+        idle += a->pool.size() * one;
+        a->spilledBytes += a->pool.size() * one;
+        a->pool.clear();
+        for (const auto& [buf, n] : a->runPool) {
+            const std::size_t held = env->buffers.allocationSize(n);
+            os::discardMemory(buf, held);
+            idle += held;
+            a->spilledBytes += held;
+        }
+        a->runPool.clear();
+    }
+    env->dirtyBytes.fetch_sub(idle, std::memory_order_relaxed);
     std::vector<SpillCandidate>& list = spillList;
     list.clear();
     const std::uint32_t now = env->touchClock;

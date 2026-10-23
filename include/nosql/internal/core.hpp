@@ -409,6 +409,19 @@ struct TxnImpl
     /// stale cursor pointer can never dangle into released memory.
     PageTable dirty;
     std::vector<Page*> pool;  ///< recycled single-page buffers
+    /// Recycled overflow-run buffers, with their page counts, for a run of
+    /// the same size class. Counted in dirtyBytes like `pool`, until a spill
+    /// hands both back (spill()).
+    std::vector<std::pair<Page*, unsigned>> runPool;
+    /// A buffer of this transaction's that no page uses any more, kept for
+    /// the next allocation of its size.
+    void recycle(Page* buf, unsigned npages)
+    {
+        if (npages == 1)
+            pool.push_back(buf);
+        else
+            runPool.emplace_back(buf, npages);
+    }
     /// Every buffer this transaction allocated, with its Page count (needed to
     /// free/return it correctly since a page's own header is not trusted once
     /// it is idle). Buffers return to the environment's bounded recycler when
@@ -592,6 +605,7 @@ struct TxnImpl
 
     /// Allocate (or recycle) a dirty buffer of `npages` contiguous pages.
     Page* allocBuffer(PageNo p, std::uint16_t flags, unsigned npages);
+    Page* reuseRun(unsigned npages);  ///< from runPool, or null
     /// Whether a write that may dirty `bytes` more should spill() first.
     bool wantsSpill(std::uint64_t bytes) const noexcept
     {
