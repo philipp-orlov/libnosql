@@ -18,8 +18,10 @@
 #include <map>
 #include <mutex>
 #include <random>
+#include <set>
 
 #include "nosql/nosql.hpp"
+#include "nosql/replication.hpp"
 #include "nosql/internal/os.hpp"
 #include "tests/test_util.hpp"
 
@@ -259,6 +261,9 @@ State contentsOf(const std::filesystem::path& file, std::uint64_t& txnid)
         txnid = txn.id();
         for (auto [key, value] : txn.mainDb().all())
             state[key.string()] = value.string();
+        for (const std::string& name : txn.listDbs())
+            for (auto [key, value] : txn.db(name).all())
+                state[name + "/" + key.string()] = value.string();
     });
     return state;
 }
@@ -351,6 +356,23 @@ void step(Env& env, int round, State& expect)
             if (expect.erase(key))
                 db.erase(key);
         }
+        // A named tree and a prefix-compressed one, their catalog entries and
+        // P_PREFIX leaves under the same cuts.
+        for (const auto& [name, flags] : {std::pair<const char*, DbFlags>{"named", DbFlags::None},
+                                          {"prefixed", DbFlags::PrefixKeys}}) {
+            Db d = txn.db(name, flags | DbFlags::Create);
+            for (int i = 0; i < 25; ++i) {
+                const std::string key = "tenant/0042/orders/" + tst::keyOf(rng() % 400, "");
+                const std::string value = tst::blob(16 + rng() % 200, rng());
+                d.put(key, value);
+                expect[std::string(name) + "/" + key] = value;
+            }
+            for (int i = 0; i < 5; ++i) {
+                const std::string key = "tenant/0042/orders/" + tst::keyOf(rng() % 400, "");
+                if (expect.erase(std::string(name) + "/" + key))
+                    d.erase(key);
+            }
+        }
     });
 }
 
@@ -409,6 +431,61 @@ const Workload kWorkloads[] = {
     {Durability::NoMetaSync, false, "NoMetaSync, spilling", 48u << 10},
 };
 
+/// Watches every file written while a replacement is built: at the rename
+/// that publishes it, nothing written to any file may still be waiting for a
+/// flush, or a power cut after the rename could find the new name on a file
+/// whose bytes never landed.
+class ReplaceWatcher final : public os::WriteRecorder
+{
+public:
+    ReplaceWatcher() { os::writeRecorder.store(this); }
+    ~ReplaceWatcher() override { os::writeRecorder.store(nullptr); }
+    ReplaceWatcher(const ReplaceWatcher&) = delete;
+    ReplaceWatcher& operator=(const ReplaceWatcher&) = delete;
+
+    void written(os::FileHandle fd, std::uint64_t offset, const void*, std::size_t length) override
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        auto& waiting = pending_[fd];
+        for (std::uint64_t s = offset / kSector; s * kSector < offset + length; ++s)
+            waiting.insert(s);
+    }
+    void resized(os::FileHandle fd, std::uint64_t) override
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        sized_.insert(fd);
+    }
+    void flushed(os::FileHandle fd, std::uint64_t offset, std::uint64_t length) override
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        auto& waiting = pending_[fd];
+        if (!length) {
+            waiting.clear();
+            sized_.erase(fd);
+            return;
+        }
+        waiting.erase(waiting.lower_bound(offset / kSector),
+                      waiting.lower_bound((offset + length + kSector - 1) / kSector));
+    }
+    void replacing(const std::filesystem::path&, const std::filesystem::path&) override
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        ++renames_;
+        for (const auto& [fd, waiting] : pending_)
+            unflushed_ += waiting.size();
+        unflushed_ += sized_.size();
+    }
+    unsigned renames() const { return renames_; }
+    std::size_t unflushed() const { return unflushed_; }
+
+private:
+    std::mutex mtx_;
+    std::map<os::FileHandle, std::set<std::uint64_t>> pending_;
+    std::set<os::FileHandle> sized_;
+    unsigned renames_ = 0;
+    std::size_t unflushed_ = 0;
+};
+
 }  // namespace
 
 /// Every durability mode, cut at every point with what was not flushed lost
@@ -442,6 +519,53 @@ TEST(replayWithoutFlushesFindsTornSnapshots)
             unordered.push_back(std::move(op));
     const Replay r = replay(scratch, rec.base, unordered, rec.committed, false);
     CHECK(r.failures > 0);
+}
+
+/// Compaction and a replica's apply build a new file and rename it over the
+/// old: the old stays whole until the rename, and every byte of the new must
+/// be on the device before it, since the rename may land first.
+TEST(replacementsAreFlushedBeforeTheirRename)
+{
+    tst::Scratch scratch("power-replace");
+    const auto store = scratch.file(), ship = scratch.file("ship");
+    const auto replica = scratch.file("replica.db"), bundle = scratch.file("delta.bundle");
+    State expect;
+    Checkpoint primary{};
+    {
+        Env env =
+            Env::configure().pageSize(kPage).sync(Durability::NoMetaSync).shipTo(ship).open(store);
+        for (int round = 0; round < 6; ++round)
+            step(env, round, expect);
+        {
+            Txn rt = env.readTxn();
+            copySnapshot(rt, replica);
+            rt.abort();
+        }
+        const Checkpoint base = checkpointOf(replica);
+        for (int round = 6; round < 12; ++round)
+            step(env, round, expect);
+        env.sync();
+        CHECK(ShipLog(ship).extract(base, bundle) == ShipStatus::Ok);
+        primary = checkpointOf(store);
+    }
+
+    {
+        ReplaceWatcher watch;
+        const Checkpoint at = applyBundle(replica, bundle);
+        CHECK_EQ(watch.renames(), 1u);
+        CHECK_EQ(watch.unflushed(), std::size_t(0));
+        CHECK_EQ(at, primary);
+    }
+    std::uint64_t txnid = 0;
+    CHECK(contentsOf(replica, txnid) == expect);
+
+    {
+        ReplaceWatcher watch;
+        compact(store, scratch.file("compact.db"));
+        CHECK_EQ(watch.renames(), 1u);
+        CHECK_EQ(watch.unflushed(), std::size_t(0));
+    }
+    CHECK(contentsOf(scratch.file("compact.db"), txnid) == expect);
 }
 
 int main()
