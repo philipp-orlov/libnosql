@@ -67,9 +67,10 @@ in the "Terminology" section of `docs/design.md`.
   growth) is different: only that transaction is lost.
 * **`Lazy` and `None` lose everything since the last sync on any crash.** The
   newest meta lives in memory until a sync, so after a process crash as after a
-  power loss the store opens on the last sync. `Lazy` syncs only from a commit
-  (once per `syncInterval`), `Env::sync()` or close; there is no timer thread, so
-  an idle `Lazy` store needs `Env::sync()` from the caller to bound the loss. The
+  power loss the store opens on the last sync. `Lazy` syncs from a commit (once
+  per `syncInterval`), `Env::sync()` or close, and from a thread of its own only
+  with `Options::backgroundSync()`; without it an idle `Lazy` store needs
+  `Env::sync()` from the caller to bound the loss. The
   file may hold up to about twice the data of the last sync while pages that
   snapshot names wait for the next one. A ship log captures every commit,
   durable or not, so after a power loss a replica may hold commits the primary

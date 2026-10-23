@@ -10,6 +10,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -172,6 +173,14 @@ struct EnvImpl
     /// finished (steady clock, nanoseconds).
     std::int64_t syncIntervalNs = 0;
     std::atomic<std::int64_t> lastSyncNs{0};
+    /// Options::backgroundSync(): the thread that syncs an idle Lazy store once
+    /// an interval, and what stops it. It holds a raw pointer, never an owning
+    /// one, so the store's destructor never runs on it; the destructor stops
+    /// and joins it before anything else.
+    std::thread syncThread;
+    std::mutex syncWakeMtx;
+    std::condition_variable syncWake;
+    bool syncStop = false;  // guarded by syncWakeMtx
     /// When a reader last checked the file against the mapping (steady
     /// clock, nanoseconds; see checkFileIntact in api.cpp).
     std::atomic<std::int64_t> lastIntactCheckNs{0};

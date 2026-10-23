@@ -67,6 +67,14 @@ Identity newIdentity() noexcept
 
 EnvImpl::~EnvImpl()
 {
+    if (syncThread.joinable()) {
+        {
+            std::lock_guard<std::mutex> lk(syncWakeMtx);
+            syncStop = true;
+        }
+        syncWake.notify_all();
+        syncThread.join();  // after any sync it is running; the closing one follows
+    }
     // Closing syncs a deferred meta. Nothing can report a failure from here;
     // the store then reopens on its last durable meta, as after a crash.
     if (region && !readOnly && deferredMeta() && !failed.load()) {
@@ -84,6 +92,56 @@ EnvImpl::~EnvImpl()
     if (fd != os::kInvalidFile)
         os::closeFile(fd);
 }
+
+namespace {
+
+std::int64_t steadyNowNs() noexcept
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+/// One background sync, if commits are waiting and none synced lately. Never
+/// throws: a failure poisons the store, which its next transaction reports.
+void syncIfDue(EnvImpl& e) noexcept
+{
+    if (e.failed.load())
+        return;
+    if (steadyNowNs() - e.lastSyncNs.load(std::memory_order_relaxed) < e.syncIntervalNs)
+        return;  // a commit or Env::sync() synced within the interval
+    {
+        std::lock_guard<std::mutex> lk(e.mtx);
+        if (e.meta.txnid <= e.durableTxn)
+            return;  // nothing waiting
+    }
+    try {
+        std::lock_guard<std::mutex> sl(e.syncMtx);
+        syncEnv(e, false);
+    } catch (const Error& err) {
+        if (err.code() != ErrorCode::BadTransaction)
+            e.failed.store(true);
+    } catch (...) {
+        e.failed.store(true);
+    }
+}
+
+/// Options::backgroundSync(): wakes once an interval until the store closes.
+void backgroundSyncLoop(EnvImpl* e)
+{
+    const auto interval = std::chrono::nanoseconds(e->syncIntervalNs);
+    std::unique_lock<std::mutex> lk(e->syncWakeMtx);
+    while (!e->syncStop) {
+        e->syncWake.wait_for(lk, interval);
+        if (e->syncStop)
+            break;
+        lk.unlock();
+        syncIfDue(*e);
+        lk.lock();
+    }
+}
+
+}  // namespace
 
 /// The newest free-list entry a writer may recycle: none a live reader's
 /// snapshot needs, and none the newest durable snapshot needs. Pages retired
@@ -451,6 +509,8 @@ Env Env::Options::open(const std::filesystem::path& path) const
         e->ship = std::make_unique<ShipWriter>(ship_, ps, shipSegment_, shipRetain_);
 #endif
 
+    if (backgroundSync_ && durability_ == Durability::Lazy && !readOnly_ && e->syncIntervalNs > 0)
+        e->syncThread = std::thread(backgroundSyncLoop, e.get());
     return Env(std::move(e));
 }
 
