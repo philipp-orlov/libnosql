@@ -556,6 +556,29 @@ It builds a new catalog, checks the result, synchronizes it and atomically
 publishes it. New identities require a new physical replication base. User values
 are copied verbatim; sidecar archives are neither relocated nor compacted.
 
+`Env::shrink()` gives the space back in place, in three steps each made durable
+before the next. First a write transaction absorbs every free-list entry nothing
+holds back and picks a limit: the lowest page number below which the free pages
+hold every live page above it, with slack for the copied paths' branch pages and
+the commit's free-list chunks; then it walks every tree, the catalog and the free
+tree included, leaf by leaf, copying each path that has a page from the limit up
+(the allocator hands out the lowest free page first) and moving each overflow run
+from there to a run below it, spilling between leaves under `dirtyLimit`. Once
+those old locations are free in every snapshot, a second transaction drops the run
+of free pages that ends the file from the free list and lowers the frontier past
+it, repeated while its own writes free more of the tail. Only then, with that meta
+durable, does a third, under the write slot so no commit allocates there in
+between, truncate the file and the mapping to the frontier; its meta records the
+new size, which a replica's apply follows. A crash at any point recovers on a meta
+that lists no page past the file's end: before the cut is durable the file is
+whole, after it the pages are listed nowhere. Readers check the file against the
+mapping under the same lock, so a truncation is never mistaken for one done
+behind the process. The `power` suite replays power cuts through shrinking
+commits in `Safe`, `Lazy` and `None`, and fails without the syncs between steps.
+A store 80% erased at random shrank from 3,308 pages to 842, 778 of them live.
+On Windows a mapped file cannot be cut: the frontier drops but the file keeps its
+size.
+
 Replication capture uses bounded 64 KiB staging and checked segment indexes.
 Extraction coalesces through a temporary disk index with an explicit dirty-buffer
 budget. Apply validates the bundle and writes a complete temporary replica,

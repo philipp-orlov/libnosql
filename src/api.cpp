@@ -280,13 +280,11 @@ Txn Env::readTxn()
     std::int64_t last = e->lastIntactCheckNs.load(std::memory_order_relaxed);
     if (now - last >= kIntactCheckNs &&
         e->lastIntactCheckNs.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
-        std::uint64_t mapped;
-        {
-            std::lock_guard<std::mutex> lk(e->mtx);
-            mapped = e->region->m.size;
-        }
         try {
-            checkFileIntact(*e, mapped);
+            // Under the lock, with the size: Env::shrink() truncates the file
+            // and the mapping together under it.
+            std::lock_guard<std::mutex> lk(e->mtx);
+            checkFileIntact(*e, e->region->m.size);
         } catch (...) {
             e->lastIntactCheckNs.store(0, std::memory_order_relaxed);  // next reader checks too
             throw;
@@ -966,6 +964,79 @@ bool Db::Range::step()
 Db::Range::Entry Db::Range::current() const
 {
     return {cursorKey(*cur_.impl_), cursorValue(*cur_.impl_)};
+}
+
+// --------------------------------------------------------------- shrink ---
+
+std::uint64_t Env::shrink()
+{
+    EnvImpl* e = &openEnv(impl_);
+    if (e->readOnly)
+        throw Error(ErrorCode::ReadOnly, "store was opened read-only");
+    const std::uint64_t before = os::fileSize(e->fd);
+    const std::size_t ps = e->pageSize;
+    auto treesOf = [](Txn& txn) {
+        std::vector<unsigned> dbis{kMainDbi, kCatalogDbi, kFreeDbi};
+        for (const std::string& name : txn.listDbs())
+            dbis.push_back(txn.db(Slice(name)).handle());
+        return dbis;
+    };
+
+    // Move what lies near the end down into free pages, as low as they go.
+    // The free list grows by what moved, and the writes of this commit take
+    // their pages too: the limit keeps room for every copied path's branch
+    // pages and for the commit's free-list chunks.
+    {
+        Txn txn = writeTxn();
+        TxnImpl* t = txn.impl_.get();
+        const std::vector<unsigned> dbis = treesOf(txn);
+        absorbFreeList(t);
+        std::uint64_t slack = 64 + (std::uint64_t(t->lastPgno) + 1) / freeChunkPages(ps);
+        for (const unsigned dbi : dbis)
+            slack += t->dbs[dbi].tree.branchPages;
+        const PageNo limit = shrinkLimit(t, slack);
+        if (limit <= t->lastPgno)
+            for (const unsigned dbi : dbis)
+                treeRelocate(t, dbi, limit);
+        txn.commit();
+    }
+    // Then cut what is free at the end, once what moved is free in every
+    // snapshot. A round's own writes may free more of the tail: a few rounds.
+    for (int round = 0; round < 4; ++round) {
+        sync(true);
+        Txn txn = writeTxn();
+        TxnImpl* t = txn.impl_.get();
+        absorbFreeList(t);
+        const std::uint64_t cut = cutFreeTail(t);
+        txn.commit();
+        if (!cut)
+            break;
+    }
+    // The cut is durable before the file loses the pages: a store recovered
+    // from an older meta would list them as free. Truncated under the write
+    // slot, so no commit takes a page there in between, and under the lock
+    // that readers check the size under.
+    sync(true);
+    {
+        Txn txn = writeTxn();
+        TxnImpl* t = txn.impl_.get();
+#ifndef _WIN32
+        {
+            std::lock_guard<std::mutex> lk(e->mtx);
+            const std::uint64_t bytes = (std::uint64_t(t->lastPgno) + 1) * ps;
+            if (bytes < e->region->m.size) {
+                os::resizeFile(e->fd, bytes);
+                e->region->m.size = std::size_t(bytes);
+            }
+        }
+#else
+        (void)t;
+#endif
+        txn.commit();  // its meta records the new size, for replicas
+    }
+    sync(true);
+    const std::uint64_t after = os::fileSize(e->fd);
+    return before > after ? before - after : 0;
 }
 
 // -------------------------------------------------------------- compact ---

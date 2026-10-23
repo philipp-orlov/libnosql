@@ -699,6 +699,17 @@ public:
         }
     }
 
+    /// Give the file's free tail back to the filesystem: moves the pages that
+    /// lie near the end of the file, tree pages and overflow runs, down into
+    /// free pages below, then cuts the run of free pages that ends the file
+    /// and truncates it, each step made durable before the next. Returns the
+    /// bytes the file lost. Pages an open read transaction may still see are
+    /// neither moved from nor cut, so call it with none open to get them all;
+    /// it takes the write slot like any writer. On Windows, where a mapped
+    /// file cannot be cut, the store stops using the tail but the file keeps
+    /// its size, and it returns 0.
+    std::uint64_t shrink();
+
     /// Make every commit so far durable now. Under Lazy and None this is the
     /// sync described at Durability: flush the data, write the newest meta,
     /// flush its page. Under NoMetaSync it flushes the pending meta page.

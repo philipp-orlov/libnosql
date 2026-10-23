@@ -1319,6 +1319,66 @@ void txnAbort(TxnImpl* t)
     finishWriter(t);
 }
 
+// ---------------------------------------------------------------- shrink ---
+
+void absorbFreeList(TxnImpl* t)
+{
+    while (reclaimMore(t)) {}
+}
+
+PageNo shrinkLimit(const TxnImpl* t, std::uint64_t slack)
+{
+    // Live pages from T up must fit the free pages below T, with `slack`
+    // over. The free pages from T up count on both sides, so what remains is
+    // T >= lastPgno + 1 + slack - free: the file shrinks to its live pages
+    // and the slack.
+    const std::uint64_t free = t->reclaim.size() - t->reclaimPos;
+    const std::uint64_t end = std::uint64_t(t->lastPgno) + 1 + slack;
+    return end > free + 2 ? PageNo(end - free) : PageNo(2);
+}
+
+std::size_t freeBelow(const TxnImpl* t, PageNo limit)
+{
+    const auto begin = t->reclaim.begin() + std::ptrdiff_t(t->reclaimPos);
+    return std::size_t(std::lower_bound(begin, t->reclaim.end(), limit) - begin);
+}
+
+PageNo allocBelow(TxnImpl* t, unsigned count, PageNo limit)
+{
+    auto& rc = t->reclaim;
+    if (t->noSpend)
+        return kInvalidPage;
+    for (std::size_t i = t->reclaimPos; i + count <= rc.size() && rc[i] + count - 1 < limit; ++i) {
+        if (rc[i] + count - 1 == rc[i + count - 1]) {
+            const PageNo p = rc[i];
+            if (i == t->reclaimPos && count == 1)
+                ++t->reclaimPos;
+            else
+                rc.erase(rc.begin() + std::ptrdiff_t(i), rc.begin() + std::ptrdiff_t(i + count));
+            if (t->env->deferredMeta())
+                t->env->noteBorn(p, count);
+            return p;
+        }
+    }
+    return kInvalidPage;
+}
+
+std::uint64_t cutFreeTail(TxnImpl* t)
+{
+    auto& rc = t->reclaim;
+    std::size_t k = 0;
+    while (k < rc.size() - t->reclaimPos && rc[rc.size() - 1 - k] == t->lastPgno - k &&
+           t->lastPgno - k > 1)
+        ++k;
+    if (!k)
+        return 0;
+    rc.resize(rc.size() - k);
+    t->lastPgno -= k;
+    // Nothing names them now; whatever takes their numbers again is new.
+    t->env->validation.invalidate(t->lastPgno + 1, unsigned(k));
+    return k;
+}
+
 // ----------------------------------------------------------------- spill ---
 
 void TxnImpl::spill()

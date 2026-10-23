@@ -180,6 +180,8 @@ public:
         std::uint64_t page = ~0ull;
         bool keepPage = false;
         for (const auto& [sector, versions] : pending_) {
+            if (sector * kSector >= out.size())
+                break;             // past a truncated end
             std::size_t pick = 0;  // 0 is the durable bytes; i the i-th write since
             switch (lose) {
                 case Lose::All: break;
@@ -333,6 +335,7 @@ struct Workload
     bool pipelined;
     std::string name;
     std::uint64_t dirtyLimit = 0;  // small enough to spill, or none
+    bool shrinks = false;          // Env::shrink() every few rounds
 };
 
 /// Commits that grow, rewrite and shrink the tree, with values from a few
@@ -411,6 +414,13 @@ Recorded record(const tst::Scratch& scratch, const Workload& w)
         for (int round = 4; round < 40; ++round) {
             step(env, round, expect);
             out.committed[env.commitGeneration()] = expect;
+            if (w.shrinks && round % 9 == 8) {
+                // Its commits move pages and cut the file, the contents stay.
+                const std::uint64_t from = env.commitGeneration();
+                (void)env.shrink();
+                for (std::uint64_t g = from + 1; g <= env.commitGeneration(); ++g)
+                    out.committed[g] = expect;
+            }
             if (round % 7 == 6)
                 env.sync();
             recorder.durable(env.stats().durableTxn);
@@ -429,6 +439,10 @@ const Workload kWorkloads[] = {
     // Pages written to the file before their commit: as safe as at commit.
     {Durability::Safe, false, "Safe, spilling", 48u << 10},
     {Durability::NoMetaSync, false, "NoMetaSync, spilling", 48u << 10},
+    // Pages moved down and the file cut short under the same cuts.
+    {Durability::Safe, false, "Safe, shrinking", 0, true},
+    {Durability::Lazy, false, "Lazy, shrinking", 0, true},
+    {Durability::None, false, "None, shrinking", 0, true},
 };
 
 /// Watches every file written while a replacement is built: at the rename

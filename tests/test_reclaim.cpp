@@ -116,6 +116,147 @@ TEST(freeListRunsTakeFewerPagesAndStillReclaim)
         CHECK(runs + 8 < arrays);
 }
 
+namespace {
+
+using Contents = std::vector<std::pair<std::string, std::string>>;
+
+Contents contentsOf(Db db)
+{
+    Contents out;
+    for (auto [k, v] : db.all())
+        out.emplace_back(k.string(), v.string());
+    return out;
+}
+
+/// A store whose live pages are scattered through the file: two trees and
+/// overflow values filled, then four in five entries erased at random.
+void scatter(Env& e)
+{
+    e.write([](Txn& t) {
+        Db main = t.mainDb();
+        Db named = t.db("named", DbFlags::Create);
+        for (int i = 0; i < 30000; ++i) {
+            main.put(tst::keyOf(i), tst::blob(i % 97 == 0 ? 9000 : 120, i));
+            named.put(tst::keyOf(i, "n"), tst::blob(60, i));
+        }
+    });
+    std::mt19937_64 rng(12);
+    e.write([&](Txn& t) {
+        Db main = t.mainDb();
+        Db named = t.db("named");
+        for (int i = 0; i < 30000; ++i) {
+            if (rng() % 5 == 0)
+                continue;
+            main.erase(tst::keyOf(i));
+            named.erase(tst::keyOf(i, "n"));
+        }
+    });
+    e.write([](Txn& t) { t.db("tick", DbFlags::Create).put("t", "1"); });
+}
+
+}  // namespace
+
+/// shrink() moves the live pages down and gives the free tail back: the
+/// file ends up near its live size, holds the same data, passes the
+/// integrity check, reopens, and grows again as it is written.
+TEST(shrinkGivesTheFreeTailBack)
+{
+    for (const Durability mode : {Durability::Safe, Durability::Lazy, Durability::None}) {
+        tst::Scratch s("shrink");
+        Contents main, named;
+        std::uint64_t released = 0, live = 0;
+        {
+            Env e = Env::configure().pageSize(4096).sync(mode).open(s.file());
+            scatter(e);
+            e.sync();
+            const EnvStats st = e.stats();
+            live = st.usedPages - st.freePages;
+            e.read([&](Txn& t) {
+                main = contentsOf(t.mainDb());
+                named = contentsOf(t.db("named"));
+            });
+            const std::uint64_t size = e.stats().fileSize;
+            released = e.shrink();
+            CHECK_EQ(e.stats().fileSize, size - released);
+            std::printf("    mode %d: %llu of %llu pages given back, %llu live\n", int(mode),
+                        (unsigned long long)(released / 4096), (unsigned long long)(size / 4096),
+                        (unsigned long long)live);
+#ifndef _WIN32
+            // Down to about the live pages and the free list's slack.
+            CHECK(e.stats().fileSize / 4096 < live + live / 4 + 256);
+#endif
+            e.read([&](Txn& t) {
+                checkIntegrity(t);
+                CHECK(contentsOf(t.mainDb()) == main);
+                CHECK(contentsOf(t.db("named")) == named);
+            });
+            // It grows again as it is written.
+            e.write([](Txn& t) {
+                for (int i = 0; i < 20000; ++i)
+                    t.mainDb().put(tst::keyOf(i, "more"), tst::blob(200, i));
+            });
+            e.read([](Txn& t) { checkIntegrity(t); });
+        }
+        Env e = Env::configure().pageSize(4096).sync(mode).open(s.file());
+        e.read([&](Txn& t) {
+            checkIntegrity(t);
+            CHECK(contentsOf(t.db("named")) == named);
+            CHECK_EQ(t.mainDb().count(), std::uint64_t(main.size() + 20000));
+        });
+    }
+}
+
+/// A read transaction open across shrink() keeps its snapshot whole: what it
+/// can see is neither moved from nor cut. Once it ends, another shrink()
+/// gets the rest.
+TEST(shrinkLeavesAnOpenSnapshotWhole)
+{
+    tst::Scratch s("shrink-reader");
+    Env e = Env::configure().pageSize(4096).open(s.file());
+    scatter(e);
+    Contents seen;
+    std::uint64_t first = 0;
+    {
+        Txn reader = e.readTxn();
+        seen = contentsOf(reader.mainDb());
+        // Pages it sees are pinned; what was free before it began is not.
+        e.write([](Txn& t) {
+            for (int i = 0; i < 30000; i += 3)
+                t.mainDb().erase(tst::keyOf(i));
+        });
+        first = e.shrink();
+        CHECK(contentsOf(reader.mainDb()) == seen);
+        checkIntegrity(reader);
+    }
+    const std::uint64_t second = e.shrink();
+    std::printf("    with a reader open: %llu bytes, after it: %llu more\n",
+                (unsigned long long)first, (unsigned long long)second);
+#ifndef _WIN32
+    CHECK(second > 0u);
+#endif
+    e.read([](Txn& t) { checkIntegrity(t); });
+}
+
+/// Nothing to give back: a store with no free tail is left as it is.
+TEST(shrinkOfADenseStoreChangesNothing)
+{
+    tst::Scratch s("shrink-dense");
+    Env e = Env::configure().pageSize(4096).open(s.file());
+    e.write([](Txn& t) {
+        for (int i = 0; i < 5000; ++i)
+            t.mainDb().put(tst::keyOf(i), tst::blob(100, i));
+    });
+    Contents before;
+    e.read([&](Txn& t) { before = contentsOf(t.mainDb()); });
+    (void)e.shrink();
+    const std::uint64_t again = e.shrink();
+    CHECK_EQ(again, 0u);
+    e.read([&](Txn& t) {
+        checkIntegrity(t);
+        CHECK(contentsOf(t.mainDb()) == before);
+    });
+}
+
 TEST(steadyStateRewritesDoNotGrowTheFile)
 {
     tst::Scratch s("reclaim");

@@ -2042,4 +2042,81 @@ void treeDrop(TxnImpl* txn, unsigned dbi)
     ++txn->root()->seq;
 }
 
+std::uint64_t treeRelocate(TxnImpl* t, unsigned dbi, PageNo limit)
+{
+    const std::size_t ps = t->pageSize();
+    std::uint64_t moved = 0;
+    CursorImpl c;
+    c.txn = t;
+    c.dbi = dbi;
+    if (!cursorFirst(c))
+        return 0;
+    std::vector<std::byte> resume;
+    // One leaf at a time, from its first entry: its path and its overflow
+    // runs, then on to the next leaf.
+    for (;;) {
+        const Page* leaf = c.pg[c.top];
+        checkNode(leaf, 0, ps);
+        unsigned copies = 0;  // pages of the path a touch copies
+        bool high = false;    // ... of which some lie from `limit` up
+        for (int i = 0; i <= c.top; ++i) {
+            if (!t->isOwnDirty(c.pg[i]->pgno)) {
+                ++copies;
+                high = high || c.pg[i]->pgno >= limit;
+            }
+        }
+        std::uint64_t runBytes = 0;
+        for (unsigned i = 0; i < leaf->nkeys; ++i) {
+            const LeafNode* n = checkedLeafNode(leaf, i, nodeTop(leaf, ps));
+            if ((n->flags & N_BIGDATA) && bigPgno(n) >= limit && !t->isOwnDirty(bigPgno(n)))
+                runBytes += std::uint64_t(ovPages(t->getOverflow(bigPgno(n), n->vsize))) * ps;
+        }
+        if (high || runBytes) {
+            // Copies go below `limit` or not at all: with too few free pages
+            // left there, the rest stays where it is.
+            if (freeBelow(t, limit) < copies)
+                return moved;
+            if (t->wantsSpill(std::uint64_t(copies) * ps + runBytes)) {
+                // Spilling invalidates the path: find the leaf again after.
+                appendLeafKey(leaf, 0, ps, resume);
+                t->spill();
+                if (!cursorSeek(c, Slice(resume.data(), resume.size())))
+                    return moved;
+                resume.clear();
+                if (t->wantsSpill(std::uint64_t(copies) * ps + runBytes))
+                    return moved;  // nothing more could be spilled
+                continue;
+            }
+            for (int i = 0; i <= c.top; ++i)
+                moved += !t->isOwnDirty(c.pg[i]->pgno) && c.pg[i]->pgno >= limit;
+            touchPath(c);
+            Page* own = c.pg[c.top];
+            for (unsigned i = 0; runBytes && i < own->nkeys; ++i) {
+                LeafNode* n = lnode(own, i);
+                const PageNo old = bigPgno(n);
+                if (!(n->flags & N_BIGDATA) || old < limit || t->isOwnDirty(old))
+                    continue;
+                const Page* run = t->getOverflow(old, n->vsize);
+                const unsigned count = ovPages(run);
+                const PageNo np = allocBelow(t, count, limit);
+                if (np == kInvalidPage)
+                    continue;  // no run that long below: it stays
+                Page* d = t->allocBuffer(np, P_OVERFLOW, count);
+                std::memcpy(d, run, std::size_t(count) * ps);
+                d->pgno = np;
+                t->touch(d, count);
+                setBigPgno(n, np);
+                t->freePage(old, count);
+                moved += count;
+            }
+            leaf = c.pg[c.top];
+        }
+        c.idx[c.top] = std::uint16_t(leaf->nkeys - 1);
+        if (!cursorNext(c))
+            break;
+    }
+    ++t->root()->seq;
+    return moved;
+}
+
 }  // namespace nosql::internal

@@ -705,6 +705,25 @@ struct CursorImpl
     }
 };
 
+// Env::shrink(), for a top-level writer.
+
+/// Absorbs every free-list entry no snapshot or pending sync holds back.
+void absorbFreeList(TxnImpl* t);
+/// The lowest page number T such that the free pages already absorbed below
+/// it hold every live page from it up, with `slack` to spare.
+PageNo shrinkLimit(const TxnImpl* t, std::uint64_t slack);
+/// Absorbed free pages below `limit`.
+std::size_t freeBelow(const TxnImpl* t, PageNo limit);
+/// `count` contiguous absorbed free pages all below `limit`, taken from the
+/// reclaim list; kInvalidPage if there are none.
+PageNo allocBelow(TxnImpl* t, unsigned count, PageNo limit);
+/// Drops the absorbed free pages that end the file from the free list and
+/// lowers the allocation frontier past them; returns how many.
+std::uint64_t cutFreeTail(TxnImpl* t);
+/// Moves every page of tree `dbi` from `limit` up, tree and overflow pages,
+/// to free pages below it while there are any; returns pages moved.
+std::uint64_t treeRelocate(TxnImpl* t, unsigned dbi, PageNo limit);
+
 /// Descend to the leaf that would hold `key`. Sets `*exact` when the key is
 /// present. Returns false only for an empty tree.
 bool treeSearch(CursorImpl& c, Slice key, bool* exact);
