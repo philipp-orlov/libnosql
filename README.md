@@ -158,7 +158,7 @@ is built):
 | `pipeline` | pipelined `Safe` commits: visibility only once durable, failure handling |
 | `spill` | transactions many times `dirtyLimit`: same pages as unbounded, nested commit and abort, cursors and arguments across a spill, coldest pages first, trees of mostly branch pages |
 | `corrupt` | pages that pass their checksum but lie about their layout: opening, reading and writing must end in an `Error`, never a stray read or write (fuzzing: `NOSQL_BUILD_FUZZERS`, `fuzz/fuzz_pages.cpp`) |
-| `prefix` | `DbFlags::PrefixKeys`: the same contents as a plain tree in fewer leaves, seeks and scans, nesting, compaction, the format version |
+| `prefix` | `DbFlags::PrefixKeys`: the same contents as a plain tree in fewer leaves and branch pages, seeks and scans, nesting, compaction, the format version |
 | `power` | every write and flush recorded and replayed: at each point, images that keep any subset of the unflushed sectors must open whole on a committed snapshot no older than the last one reported durable, in every durability mode |
 | `mq` | queue semantics: FIFO, leases, redelivery, dead-lettering |
 | `mqsteady` | queues under sustained send/receive: no unbounded growth |
@@ -280,8 +280,8 @@ main tree. `DbFlags::Create` creates on demand; `DbFlags::IntegerKey` compares
 keys as fixed-width little-endian `uint32_t`/`uint64_t` (the width is fixed by the
 first insertion); `DbFlags::ReverseKey` compares back to
 front. `DbFlags::PrefixKeys`, for byte-ordered sub-databases, stores the prefix a
-leaf's keys share once per leaf, so keys like `tenant/0042/orders/...` take fewer
-pages; a key a cursor returns from such a database is assembled in the cursor and
+page's keys share once per page, leaves and branch pages alike, so keys like
+`tenant/0042/orders/...` take fewer pages and levels; a key a cursor returns from such a database is assembled in the cursor and
 is valid until the cursor moves. Creating one raises the store's format version
 from 7 to 8, which older builds refuse to open; a store without one stays at 7.
 
@@ -820,7 +820,7 @@ inserts. It favors bounded long-run storage over skipping that bookkeeping.
 
 Deliberately **not** implemented: multi-process writers, duplicate keys
 (`DUPSORT`), custom comparator callbacks, encryption and value compression
-(keys can share their leaf's prefix with `DbFlags::PrefixKeys`).
+(keys can share their page's prefix with `DbFlags::PrefixKeys`).
 `docs/limitations.md` records every simplification and its reasoning, so none
 of them get mistaken for oversights.
 

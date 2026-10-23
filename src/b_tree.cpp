@@ -205,6 +205,15 @@ unsigned branchSearchWith(const Page* p, Slice key, Cmp cmp, std::size_t ps)
 
 unsigned branchSearch(const Page* p, Slice key, CompareFn cmp, std::size_t ps)
 {
+    if (p->flags & P_PREFIX) {
+        // Byte order only, as on a leaf: below every separator is child 0,
+        // above them all the last child, and otherwise the rest decides.
+        Slice rest;
+        const int side = againstPrefix(leafPrefix(p, ps), key, &rest);
+        if (side)
+            return side < 0 ? 0u : unsigned(p->nkeys) - 1;
+        return branchSearchWith(p, rest, LexCmp{}, ps);
+    }
     if (cmp == &cmpLexicographic)
         return branchSearchWith(p, key, LexCmp{}, ps);
     return branchSearchWith(p, key, FnCmp{cmp}, ps);
@@ -344,7 +353,7 @@ unsigned searchFrom(unsigned lo, unsigned hi, unsigned guess, Before before) noe
 unsigned branchSearchIn(const Page* p, Slice key, CompareFn cmp, const Bounds& b, std::size_t ps)
 {
     const unsigned n = p->nkeys;
-    if (cmp != &cmpLexicographic || !b.known() || n < 8)
+    if (cmp != &cmpLexicographic || !b.known() || n < 8 || (p->flags & P_PREFIX))
         return branchSearch(p, key, cmp, ps);
     const LexCmp lex;
     const std::size_t top = nodeTop(p, ps);
@@ -533,23 +542,73 @@ unsigned chooseSplit(const Entry* e, unsigned n, unsigned newindx, bool leaf, st
     return best;
 }
 
-/// Whether `tr` stores its leaves' shared key prefixes once (PrefixKeys).
+/// Whether `tr` stores its pages' shared key prefixes once (PrefixKeys).
 bool compresses(const Tree& tr) noexcept
 {
     return (tr.flags & std::uint32_t(DbFlags::PrefixKeys)) != 0;
 }
 
-/// Whether `n` sorted entries fit one leaf of a prefix-compressing tree.
-bool fitsPrefixed(const Entry* e, unsigned n, std::size_t usable) noexcept
+/// Whether a write to `p` lays whole pages out afresh rather than editing
+/// nodes in place: in a tree that compresses, and for any P_PREFIX page, whose
+/// nodes hold suffixes only. Pages of a tree that does not compress are laid
+/// out without a prefix, so a damaged file's stray P_PREFIX page goes away.
+bool relaysOut(const Tree& tr, const Page* p) noexcept
 {
-    return leafLayoutBytes(e, n, leafPrefixFor(e, n)) <= usable;
+    return compresses(tr) || (p->flags & P_PREFIX);
 }
 
-/// chooseSplit for a leaf of a prefix-compressing tree, where what an entry
-/// costs depends on the keys it shares a page with. Tries boundaries outwards
-/// from the one chooseSplit would prefer, so it usually checks one or two.
-unsigned chooseSplitPrefixed(const Entry* e, unsigned n, unsigned newindx, std::size_t usable,
-                             Arena& scratch)
+/// The prefix `n` sorted entries of a leaf or branch page take: none where
+/// the tree does not compress.
+std::size_t prefixFor(const Entry* e, unsigned n, bool leaf, bool compress) noexcept
+{
+    if (!compress)
+        return 0;
+    return leaf ? leafPrefixFor(e, n) : branchPrefixFor(e, n);
+}
+
+std::size_t layoutBytes(const Entry* e, unsigned n, bool leaf, bool compress) noexcept
+{
+    const std::size_t plen = prefixFor(e, n, leaf, compress);
+    return leaf ? leafLayoutBytes(e, n, plen) : branchLayoutBytes(e, n, plen);
+}
+
+/// Whether `n` sorted entries fit one page laid out afresh.
+bool fitsLayout(const Entry* e, unsigned n, std::size_t usable, bool leaf, bool compress) noexcept
+{
+    return layoutBytes(e, n, leaf, compress) <= usable;
+}
+
+/// Rewrites `p` as branch `pgno` holding `n` entries whose separators, entry
+/// 0's aside, share `plen` bytes. The entries must not point into `p`.
+void layoutBranch(Page* p, PageNo pgno, const Entry* e, unsigned n, std::size_t plen,
+                  std::size_t ps) noexcept
+{
+    pageInit(p, pgno, std::uint16_t(P_BRANCH | (plen ? P_PREFIX : 0)), ps);
+    if (plen)
+        p->upper = std::uint16_t(writePrefixBlock(p, Slice(e[1].key.data(), plen), ps));
+    for (unsigned i = 0; i < n; ++i) {
+        const Slice key = i ? Slice(e[i].key.data() + plen, e[i].key.size() - plen) : Slice();
+        nodeAddBranch(p, i, key, e[i].child, e[i].count);
+    }
+}
+
+/// Lays `p` out afresh as page `pgno` of `n` entries, with the prefix that
+/// suits them.
+void layoutPage(Page* p, PageNo pgno, const Entry* e, unsigned n, bool leaf, bool compress,
+                std::size_t ps) noexcept
+{
+    const std::size_t plen = prefixFor(e, n, leaf, compress);
+    if (leaf)
+        layoutLeaf(p, pgno, e, n, plen, ps);
+    else
+        layoutBranch(p, pgno, e, n, plen, ps);
+}
+
+/// chooseSplit for pages laid out afresh, where what an entry costs depends
+/// on the keys it shares a page with. Tries boundaries outwards from the one
+/// chooseSplit would prefer, so it usually checks one or two.
+unsigned chooseSplitLaidOut(const Entry* e, unsigned n, unsigned newindx, std::size_t usable,
+                            bool leaf, bool compress, Arena& scratch)
 {
     unsigned want;
     if (newindx == n - 1) {
@@ -560,7 +619,7 @@ unsigned chooseSplitPrefixed(const Entry* e, unsigned n, unsigned newindx, std::
         std::size_t* pre = scratch.allocArray<std::size_t>(std::size_t(n) + 1);
         pre[0] = 0;
         for (unsigned i = 0; i < n; ++i)
-            pre[i + 1] = pre[i] + entryCost(e[i], true);
+            pre[i + 1] = pre[i] + entryCost(e[i], leaf);
         want = 1;
         std::size_t bestDiff = ~std::size_t(0);
         for (unsigned s = 1; s < n; ++s) {
@@ -574,7 +633,8 @@ unsigned chooseSplitPrefixed(const Entry* e, unsigned n, unsigned newindx, std::
     }
     for (unsigned d = 0; d < n; ++d) {
         for (const unsigned s : {want + d, want - d}) {
-            if (s >= 1 && s < n && fitsPrefixed(e, s, usable) && fitsPrefixed(e + s, n - s, usable))
+            if (s >= 1 && s < n && fitsLayout(e, s, usable, leaf, compress) &&
+                fitsLayout(e + s, n - s, usable, leaf, compress))
                 return s;
             if (!d)
                 break;
@@ -598,6 +658,25 @@ void detach(Entry& e, Arena& scratch)
     }
 }
 
+/// Page `p`'s entries, whole keys and all, read from a copy of it in scratch,
+/// with room for `extra` more; `n` is set to how many were read.
+Entry* readEntries(const Page* p, TxnImpl* t, unsigned extra, const Page** copyOut = nullptr)
+{
+    const std::size_t ps = t->pageSize();
+    std::byte* copy = t->scratch().alloc(ps, 64);
+    std::memcpy(copy, p, ps);
+    const Page* src = reinterpret_cast<const Page*>(copy);
+    validateNodes(src, ps);  // every entry is read by its claimed size
+    const unsigned n = src->nkeys;
+    Entry* ents = reinterpret_cast<Entry*>(
+        t->scratch().alloc(std::size_t(n + extra ? n + extra : 1) * sizeof(Entry), alignof(Entry)));
+    for (unsigned i = 0; i < n; ++i)
+        new (&ents[i]) Entry(readEntry(src, i, t));
+    if (copyOut)
+        *copyOut = src;
+    return ents;
+}
+
 void splitPage(CursorImpl& c, int level, unsigned newindx, const Entry& ne);
 
 /// Adds `delta` to the counts of the branch slots on the cursor's path
@@ -608,21 +687,86 @@ void adjustPathCounts(CursorImpl& c, std::int64_t delta) noexcept
         setBranchCount(c.pg[i], c.idx[i], std::uint64_t(std::int64_t(branchCount(c.pg[i], c.idx[i])) + delta));
 }
 
+/// Lays the cursor's page at `level` out afresh with `ne` inserted at `at`
+/// and the prefix that suits the result, when that fits on one page: for a
+/// key without the page's prefix, or a page that only holds one more entry
+/// compressed. False when it needs a split instead.
+bool relayoutPage(CursorImpl& c, int level, unsigned at, const Entry& ne)
+{
+    TxnImpl* t = c.txn;
+    const std::size_t ps = t->pageSize();
+    Arena::Scope rewind(t->scratch());
+    Page* p = c.pg[level];
+    const bool leaf = isLeaf(p);
+    const unsigned n = p->nkeys;
+    Entry* ents = readEntries(p, t, 1);
+    for (unsigned i = n; i > at; --i)
+        ents[i] = ents[i - 1];
+    new (&ents[at]) Entry(ne);
+    detach(ents[at], t->scratch());
+    const bool compress = compresses(c.tree());
+    if (!fitsLayout(ents, n + 1, ps - kPageHdr - kPageChecksumBytes, leaf, compress))
+        return false;
+    layoutPage(p, p->pgno, ents, n + 1, leaf, compress, ps);
+    return true;
+}
+
 /// Insert (key -> child, holding `count` entries) just after the child the
 /// cursor descended through at `level`, splitting that branch page if full.
 void branchInsert(CursorImpl& c, int level, Slice key, PageNo child, std::uint64_t count)
 {
     Page* p = c.pg[level];
     const unsigned at = c.idx[level] + 1;
-    if (pageRoom(p) >= branchNodeSize(key.size()) + 2) {
-        nodeAddBranch(p, at, key, child, count);
+    // A P_PREFIX page stores only what follows its prefix.
+    Slice stored = key;
+    const bool fits = (p->flags & P_PREFIX)
+                          ? againstPrefix(leafPrefix(p, c.txn->pageSize()), key, &stored) == 0 &&
+                                pageRoom(p) >= branchNodeSize(stored.size()) + 2
+                          : pageRoom(p) >= branchNodeSize(key.size()) + 2;
+    if (fits) {
+        nodeAddBranch(p, at, stored, child, count);
         return;
     }
     Entry ne;
     ne.key = key;
     ne.child = child;
     ne.count = count;
+    if (relaysOut(c.tree(), p) && relayoutPage(c, level, at, ne))
+        return;
     splitPage(c, level, at, ne);
+}
+
+/// Whether branch `p`'s separator `i` can become `key`.
+bool separatorFits(const Page* p, unsigned i, Slice key, bool compress, TxnImpl* t)
+{
+    const std::size_t ps = t->pageSize();
+    Slice stored = key;
+    if (!(p->flags & P_PREFIX) || againstPrefix(leafPrefix(p, ps), key, &stored) == 0)
+        return pageRoom(p) + nodeSize(p, i) >= branchNodeSize(stored.size());
+    Arena::Scope rewind(t->scratch());
+    Entry* ents = readEntries(p, t, 0);
+    ents[i].key = key;
+    return fitsLayout(ents, p->nkeys, ps - kPageHdr - kPageChecksumBytes, false, compress);
+}
+
+/// Sets branch `p`'s separator `i` to `key`, which separatorFits() allowed.
+void setSeparator(Page* p, unsigned i, Slice key, bool compress, TxnImpl* t)
+{
+    const std::size_t ps = t->pageSize();
+    Slice stored = key;
+    if (!(p->flags & P_PREFIX) || againstPrefix(leafPrefix(p, ps), key, &stored) == 0) {
+        branchSetKey(p, i, stored);
+        return;
+    }
+    // The key does not start with the page's prefix: a shorter one, so the
+    // page is laid out again.
+    Arena::Scope rewind(t->scratch());
+    std::byte* k = t->scratch().alloc(key.size() ? key.size() : 1);
+    if (key.size())
+        std::memcpy(k, key.data(), key.size());
+    Entry* ents = readEntries(p, t, 0);
+    ents[i].key = Slice(k, key.size());
+    layoutPage(p, p->pgno, ents, p->nkeys, false, compress, ps);
 }
 
 void splitPage(CursorImpl& c, int level, unsigned newindx, const Entry& ne)
@@ -641,20 +785,12 @@ void splitPage(CursorImpl& c, int level, unsigned newindx, const Entry& ne)
 
     // Snapshot the page: the entry list points into `copy`, which outlives
     // every step below, so the originals can be overwritten freely.
-    std::byte* copy = t->scratch().alloc(ps, 64);
-    std::memcpy(copy, mp, ps);
-    const Page* src = reinterpret_cast<const Page*>(copy);
-    validateNodes(src, ps);  // every entry is read by its claimed size
-
-    const unsigned count = unsigned(src->nkeys) + 1;
-    Entry* ents = reinterpret_cast<Entry*>(
-        t->scratch().alloc(std::size_t(count) * sizeof(Entry), alignof(Entry)));
-    for (unsigned i = 0; i < newindx; ++i)
-        new (&ents[i]) Entry(readEntry(src, i, t));
+    const unsigned count = unsigned(mp->nkeys) + 1;
+    Entry* ents = readEntries(mp, t, 1);
+    for (unsigned i = count - 1; i > newindx; --i)
+        ents[i] = ents[i - 1];
     new (&ents[newindx]) Entry(ne);
     detach(ents[newindx], t->scratch());
-    for (unsigned i = newindx; i < src->nkeys; ++i)
-        new (&ents[i + 1]) Entry(readEntry(src, i, t));
 
     // Growing a new root pushes the whole stack one level down.
     if (level == 0) {
@@ -679,10 +815,11 @@ void splitPage(CursorImpl& c, int level, unsigned newindx, const Entry& ne)
         level = 1;
     }
 
-    const bool prefixed = leaf && compresses(tr);
-    const unsigned split = prefixed
-                               ? chooseSplitPrefixed(ents, count, newindx, usable, t->scratch())
-                               : chooseSplit(ents, count, newindx, leaf, usable, t->scratch());
+    const bool laidOut = relaysOut(tr, mp);
+    const bool compress = compresses(tr);
+    const unsigned split =
+        laidOut ? chooseSplitLaidOut(ents, count, newindx, usable, leaf, compress, t->scratch())
+                : chooseSplit(ents, count, newindx, leaf, usable, t->scratch());
 
     const PageNo sn = t->allocPages(1);
     const std::uint16_t kind = std::uint16_t(mp->flags & ~P_PREFIX);
@@ -711,14 +848,13 @@ void splitPage(CursorImpl& c, int level, unsigned newindx, const Entry& ne)
              : ents[split].key;
     branchInsert(c, level - 1, sep, sn, rightCount);
 
-    if (prefixed) {
-        // Each half shares what its own first and last key share.
-        layoutLeaf(mp, mp->pgno, ents, split, leafPrefixFor(ents, split), ps);
-        layoutLeaf(np, sn, ents + split, count - split, leafPrefixFor(ents + split, count - split),
-                   ps);
+    if (laidOut) {
+        // Each half shares what its own keys share.
+        layoutPage(mp, mp->pgno, ents, split, leaf, compress, ps);
+        layoutPage(np, sn, ents + split, count - split, leaf, compress, ps);
         return;
     }
-    pageInit(mp, mp->pgno, mp->flags, ps);
+    pageInit(mp, mp->pgno, kind, ps);
     for (unsigned i = 0; i < count; ++i) {
         Entry e = ents[i];
         // Whichever entry lands in slot 0 of a branch page becomes its
@@ -732,72 +868,51 @@ void splitPage(CursorImpl& c, int level, unsigned newindx, const Entry& ne)
     }
 }
 
-/// Lays the cursor's leaf out afresh with `ne` inserted at `at` and the prefix
-/// that suits the result, when that fits on one page: for a key without the
-/// page's prefix, or a page that only holds one more entry compressed.
-/// False when it needs a split instead.
-bool relayoutLeaf(CursorImpl& c, unsigned at, const Entry& ne)
-{
-    TxnImpl* t = c.txn;
-    const std::size_t ps = t->pageSize();
-    Arena::Scope rewind(t->scratch());
-    Page* p = c.pg[c.top];
-    std::byte* copy = t->scratch().alloc(ps, 64);
-    std::memcpy(copy, p, ps);
-    const Page* src = reinterpret_cast<const Page*>(copy);
-    validateNodes(src, ps);  // every entry is read by its claimed size
-    const unsigned count = unsigned(src->nkeys) + 1;
-    Entry* ents = reinterpret_cast<Entry*>(
-        t->scratch().alloc(std::size_t(count) * sizeof(Entry), alignof(Entry)));
-    for (unsigned i = 0; i < at; ++i)
-        new (&ents[i]) Entry(readEntry(src, i, t));
-    new (&ents[at]) Entry(ne);
-    detach(ents[at], t->scratch());
-    for (unsigned i = at; i < src->nkeys; ++i)
-        new (&ents[i + 1]) Entry(readEntry(src, i, t));
-    const std::size_t plen = leafPrefixFor(ents, count);
-    if (leafLayoutBytes(ents, count, plen) > ps - kPageHdr - kPageChecksumBytes)
-        return false;
-    layoutLeaf(p, p->pgno, ents, count, plen, ps);
-    return true;
-}
-
 // ------------------------------------------------------------- rebalance ---
 
 void rebalance(CursorImpl& c);
 
-/// rebalance() for two sibling leaves of a prefix-compressing tree, where an
-/// entry that moves can change what every key on the page it joins costs:
-/// both are read whole and laid out afresh, merged when one page holds them
-/// all, or else with one entry moved towards the underfull page. Bailing out
-/// is always safe, as there.
-void rebalancePrefixed(CursorImpl& c, Page* left, Page* right, unsigned ridx, bool pIsLeft)
+/// rebalance() for two siblings laid out afresh (relaysOut), where an entry
+/// that moves can change what every key on the page it joins costs: both are
+/// read whole and laid out again, merged when one page holds them all, or
+/// else with one entry moved towards the underfull page. Bailing out is
+/// always safe, as there.
+void rebalanceLaidOut(CursorImpl& c, Page* left, Page* right, unsigned ridx, bool pIsLeft)
 {
     TxnImpl* t = c.txn;
     Tree& tr = c.tree();
     const std::size_t ps = t->pageSize();
     const std::size_t usable = ps - kPageHdr - kPageChecksumBytes;
+    const bool leaf = isLeaf(left);
+    const bool compress = compresses(tr);
     Page* parent = c.pg[c.top - 1];
 
-    // The entries point into copies: both pages are rewritten below.
-    std::byte* copies = t->scratch().alloc(2 * ps, 64);
-    std::memcpy(copies, left, ps);
-    std::memcpy(copies + ps, right, ps);
-    const Page* l = reinterpret_cast<const Page*>(copies);
-    const Page* r = reinterpret_cast<const Page*>(copies + ps);
-    const unsigned nl = l->nkeys, nr = r->nkeys, n = nl + nr;
+    // The entries point into copies: all three pages are rewritten below.
+    const unsigned nl = left->nkeys, nr = right->nkeys, n = nl + nr;
     Entry* ents = reinterpret_cast<Entry*>(
         t->scratch().alloc(std::size_t(n ? n : 1) * sizeof(Entry), alignof(Entry)));
-    for (unsigned i = 0; i < nl; ++i)
-        new (&ents[i]) Entry(readEntry(l, i, t));
-    for (unsigned i = 0; i < nr; ++i)
-        new (&ents[nl + i]) Entry(readEntry(r, i, t));
+    const Entry* l = readEntries(left, t, 0);
+    const Entry* r = readEntries(right, t, 0);
+    std::copy(l, l + nl, ents);
+    std::copy(r, r + nr, ents + nl);
+    if (!leaf && nr) {
+        // Right's -infinity child stops being one: the parent's separator for
+        // right is its lower bound.
+        const Entry sep = readEntry(parent, ridx, t);
+        std::byte* k = t->scratch().alloc(sep.key.size() ? sep.key.size() : 1);
+        if (sep.key.size())
+            std::memcpy(k, sep.key.data(), sep.key.size());
+        ents[nl].key = Slice(k, sep.key.size());
+    }
 
-    if (fitsPrefixed(ents, n, usable)) {
+    if (fitsLayout(ents, n, usable, leaf, compress)) {
         setBranchCount(parent, ridx - 1, branchCount(parent, ridx - 1) + branchCount(parent, ridx));
-        layoutLeaf(left, left->pgno, ents, n, leafPrefixFor(ents, n), ps);
+        layoutPage(left, left->pgno, ents, n, leaf, compress, ps);
         t->freePage(right->pgno);
-        --tr.leafPages;
+        if (leaf)
+            --tr.leafPages;
+        else
+            --tr.branchPages;
         nodeDel(parent, ridx);
         c.pg[c.top] = left;
         c.idx[c.top - 1] = std::uint16_t(ridx - 1);
@@ -808,20 +923,26 @@ void rebalancePrefixed(CursorImpl& c, Page* left, Page* right, unsigned ridx, bo
     }
 
     // Right's first entry moves left, or left's last moves right.
-    if (pIsLeft ? nr <= 1 : nl <= 1)
+    const unsigned donorMin = leaf ? 1u : 2u;
+    if (pIsLeft ? nr <= donorMin : nl <= donorMin)
         return;
     const unsigned split = pIsLeft ? nl + 1 : nl - 1;
-    if (!fitsPrefixed(ents, split, usable) || !fitsPrefixed(ents + split, n - split, usable))
+    if (!fitsLayout(ents, split, usable, leaf, compress) ||
+        !fitsLayout(ents + split, n - split, usable, leaf, compress))
         return;
-    const Slice sep = separatorFor(comparatorFor(tr.flags), ents[split - 1].key, ents[split].key);
-    if (pageRoom(parent) + nodeSize(parent, ridx) < branchNodeSize(sep.size()))
+    const Slice sep =
+        leaf ? separatorFor(comparatorFor(tr.flags), ents[split - 1].key, ents[split].key)
+             : ents[split].key;
+    if (!separatorFits(parent, ridx, sep, compress, t))
         return;
-    layoutLeaf(left, left->pgno, ents, split, leafPrefixFor(ents, split), ps);
-    layoutLeaf(right, right->pgno, ents + split, n - split, leafPrefixFor(ents + split, n - split),
-               ps);
-    setBranchCount(parent, ridx - 1, split);
-    setBranchCount(parent, ridx, n - split);
-    branchSetKey(parent, ridx, sep);
+    std::uint64_t leftCount = 0, rightCount = 0;
+    for (unsigned i = 0; i < n; ++i)
+        (i < split ? leftCount : rightCount) += leaf ? 1 : ents[i].count;
+    layoutPage(left, left->pgno, ents, split, leaf, compress, ps);
+    layoutPage(right, right->pgno, ents + split, n - split, leaf, compress, ps);
+    setBranchCount(parent, ridx - 1, leftCount);
+    setBranchCount(parent, ridx, rightCount);
+    setSeparator(parent, ridx, sep, compress, t);
     t->markDirty(c.dbi);
 }
 
@@ -902,8 +1023,8 @@ void rebalance(CursorImpl& c)
     // they are all reached.
     validateNodes(left, ps);
     validateNodes(right, ps);
-    if (leaf && compresses(tr)) {
-        rebalancePrefixed(c, left, right, ridx, pIsLeft);
+    if (relaysOut(tr, left) || relaysOut(tr, right) || (parent->flags & P_PREFIX)) {
+        rebalanceLaidOut(c, left, right, ridx, pIsLeft);
         return;
     }
 
@@ -1196,12 +1317,17 @@ bool treeSearch(CursorImpl& c, Slice key, bool* exact)
         c.idx[c.top] = std::uint16_t(i);
         if (c.top + 1 >= kMaxDepth)
             throw Error(ErrorCode::Corrupted, "b-tree exceeded maximum depth");
-        // The child's keys lie between the separators either side of it.
+        // The child's keys lie between the separators either side of it. A
+        // P_PREFIX page holds only their suffixes: no bounds below it.
         const std::size_t top = nodeTop(p, ps);
-        if (i > 0)
-            b.low = checkedBranchKey(p, i, top);
-        if (i + 1u < p->nkeys)
-            b.high = checkedBranchKey(p, i + 1, top);
+        if (p->flags & P_PREFIX) {
+            b = Bounds{};
+        } else {
+            if (i > 0)
+                b.low = checkedBranchKey(p, i, top);
+            if (i + 1u < p->nkeys)
+                b.high = checkedBranchKey(p, i + 1, top);
+        }
         c.pg[c.top + 1] = c.txn->getPage(checkedChild(p, i, ps));
         ++c.top;
     }
@@ -1624,7 +1750,7 @@ bool treePut(CursorImpl& c, Slice key, Slice value, PutMode mode, WritableSlice*
         else
             std::memset(payload, 0, ne.paylen);
     } else {
-        if (!compresses(tr) || !relayoutLeaf(c, at, ne))
+        if (!relaysOut(tr, p) || !relayoutPage(c, c.top, at, ne))
             splitPage(c, c.top, at, ne);
         bool found = false;
         treeSearch(c, key, &found);

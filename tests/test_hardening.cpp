@@ -302,9 +302,13 @@ TEST(growthFailureAtCommitIsARefusalNotAFault)
                     Db db = txn.mainDb();
                     for (int i = 0; i < 20; ++i)
                         db.erase(tst::keyOf(round * 20 + i));
+                    // And a page's worth of new keys, so the file has to grow
+                    // whatever room the layout left at its end.
+                    for (int i = 0; i < 12; ++i)
+                        db.put(tst::keyOf(1000000 + round * 20 + i), value);
                     armed = true;  // only the commit below may fail
                 });
-                left -= 20;
+                left = left - 20 + 12;
             } catch (const Error& e) {
                 CHECK(e.code() == ErrorCode::IoError);
                 CHECK(armed);

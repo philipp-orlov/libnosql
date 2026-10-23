@@ -102,9 +102,18 @@ the prefix once and the binary search runs on the rest. Inserting a key that doe
 not start with the prefix, or that only fits compressed, lays the page out afresh
 from its whole entries, or splits it. Splits choose a boundary by compressed size,
 and rebalancing reads both siblings whole and lays them out again, merged or with
-one entry moved. Branch pages are not compressed, and their separators are cut
-from whole keys as everywhere. A cursor assembles a key from such a leaf in its
-own buffer. `compact()` stages each leaf's entries to pack it by compressed size.
+one entry moved. Branch pages compress the same way, `P_BRANCH | P_PREFIX`: slot 0,
+the -infinity child, stores no key, so the prefix is what the separators in slots
+1 and n-1 share, and a key below it goes to child 0 and one above it to the last.
+Separators are still cut from whole keys; one that does not start with its page's
+prefix (an insert, or a rebalance moving a separator) lays the branch out afresh,
+and a rebalance checks the parent can take the new separator before it moves any
+entry. A descent has no interpolation bounds below such a page, whose separators
+are suffixes. A cursor assembles a key from such a leaf in its
+own buffer. `compact()` stages each leaf's entries to pack it by compressed size;
+its branch pages are written plain. Writes to a tree without the flag lay any
+`P_PREFIX` page a damaged file holds out without a prefix, rather than editing a
+suffix as a key.
 Format version 8 adds this; a store is raised to it by the commit that creates its
 first such sub-database and is otherwise written as 7, which older builds read.
 A build with `NOSQL_PREFIX_KEYS_DEFAULT` gives every byte-ordered tree the flag,
