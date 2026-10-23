@@ -567,7 +567,10 @@ hold every live page above it, with slack for the copied paths' branch pages and
 the commit's free-list chunks; then it walks every tree, the catalog and the free
 tree included, leaf by leaf, copying each path that has a page from the limit up
 (the allocator hands out the lowest free page first) and moving each overflow run
-from there to a run below it, spilling between leaves under `dirtyLimit`. Once
+from there to a run below it, spilling between leaves under `dirtyLimit`, and
+within one whose runs alone need more than the budget. What the budget cannot
+take, spilling off, stays where it is: the move is maintenance and never fails a
+`shrink()` for want of memory. Once
 those old locations are free in every snapshot, a second transaction drops the run
 of free pages that ends the file from the free list and lowers the frontier past
 it, repeated while its own writes free more of the tail. Only then, with that meta

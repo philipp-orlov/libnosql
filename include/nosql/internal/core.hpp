@@ -606,6 +606,12 @@ struct TxnImpl
     /// Allocate (or recycle) a dirty buffer of `npages` contiguous pages.
     Page* allocBuffer(PageNo p, std::uint16_t flags, unsigned npages);
     Page* reuseRun(unsigned npages);  ///< from runPool, or null
+    /// Whether `bytes` more of dirty buffers would pass the budget, spill or not.
+    bool overBudget(std::uint64_t bytes) const noexcept
+    {
+        const std::uint64_t limit = env->dirtyLimit;
+        return limit && env->dirtyBytes.load(std::memory_order_relaxed) + bytes > limit;
+    }
     /// Whether a write that may dirty `bytes` more should spill() first.
     bool wantsSpill(std::uint64_t bytes) const noexcept
     {

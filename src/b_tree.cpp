@@ -2052,6 +2052,7 @@ std::uint64_t treeRelocate(TxnImpl* t, unsigned dbi, PageNo limit)
     if (!cursorFirst(c))
         return 0;
     std::vector<std::byte> resume;
+    bool spilled = false;  // for the leaf at hand, since its last pass
     // One leaf at a time, from its first entry: its path and its overflow
     // runs, then on to the next leaf.
     for (;;) {
@@ -2069,28 +2070,37 @@ std::uint64_t treeRelocate(TxnImpl* t, unsigned dbi, PageNo limit)
         for (unsigned i = 0; i < leaf->nkeys; ++i) {
             const LeafNode* n = checkedLeafNode(leaf, i, nodeTop(leaf, ps));
             if ((n->flags & N_BIGDATA) && bigPgno(n) >= limit && !t->isOwnDirty(bigPgno(n)))
-                runBytes += std::uint64_t(ovPages(t->getOverflow(bigPgno(n), n->vsize))) * ps;
+                runBytes += t->env->buffers.allocationSize(
+                    ovPages(t->getOverflow(bigPgno(n), n->vsize)));
         }
         if (high || runBytes) {
             // Copies go below `limit` or not at all: with too few free pages
             // left there, the rest stays where it is.
             if (freeBelow(t, limit) < copies)
                 return moved;
-            if (t->wantsSpill(std::uint64_t(copies) * ps + runBytes)) {
+            const std::uint64_t pathBytes = copies * t->env->buffers.allocationSize(1);
+            const std::uint64_t need = pathBytes + runBytes;
+            if (!spilled && t->wantsSpill(need)) {
                 // Spilling invalidates the path: find the leaf again after.
                 appendLeafKey(leaf, 0, ps, resume);
-                t->spill(std::uint64_t(copies) * ps + runBytes);
+                t->spill(need);
                 if (!cursorSeek(c, Slice(resume.data(), resume.size())))
                     return moved;
                 resume.clear();
-                if (t->wantsSpill(std::uint64_t(copies) * ps + runBytes))
-                    return moved;  // nothing more could be spilled
+                spilled = true;  // once per pass: a leaf may need more than all of it
                 continue;
             }
+            spilled = false;
+            // A move is maintenance: what the budget cannot take, even after a
+            // spill, stays where it is. A leaf's runs move while they fit.
+            if (t->overBudget(pathBytes))
+                return moved;
             for (int i = 0; i <= c.top; ++i)
                 moved += !t->isOwnDirty(c.pg[i]->pgno) && c.pg[i]->pgno >= limit;
             touchPath(c);
             Page* own = c.pg[c.top];
+            std::uint64_t wanted = 0;  // the run the budget stopped at
+            unsigned runs = 0;         // moved in this pass over the leaf
             for (unsigned i = 0; runBytes && i < own->nkeys; ++i) {
                 LeafNode* n = lnode(own, i);
                 const PageNo old = bigPgno(n);
@@ -2098,6 +2108,10 @@ std::uint64_t treeRelocate(TxnImpl* t, unsigned dbi, PageNo limit)
                     continue;
                 const Page* run = t->getOverflow(old, n->vsize);
                 const unsigned count = ovPages(run);
+                if (t->overBudget(t->env->buffers.allocationSize(count))) {
+                    wanted = t->env->buffers.allocationSize(count);
+                    break;
+                }
                 const PageNo np = allocBelow(t, count, limit);
                 if (np == kInvalidPage)
                     continue;  // no run that long below: it stays
@@ -2108,9 +2122,24 @@ std::uint64_t treeRelocate(TxnImpl* t, unsigned dbi, PageNo limit)
                 setBigPgno(n, np);
                 t->freePage(old, count);
                 moved += count;
+                ++runs;
             }
             leaf = c.pg[c.top];
+            if (wanted && runs && t->env->spill) {
+                // The runs just moved can go out: the rest of this leaf's
+                // after a spill, from the leaf found again, with room for
+                // its path too, which the spill may take and the next pass
+                // reads back. Each pass moves one at least, so this ends.
+                appendLeafKey(leaf, 0, ps, resume);
+                t->spill(wanted + std::uint64_t(c.top + 1) * t->env->buffers.allocationSize(1));
+                if (!cursorSeek(c, Slice(resume.data(), resume.size())))
+                    return moved;
+                resume.clear();
+                spilled = true;
+                continue;
+            }
         }
+        spilled = false;
         c.idx[c.top] = std::uint16_t(leaf->nkeys - 1);
         if (!cursorNext(c))
             break;
