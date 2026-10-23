@@ -273,6 +273,8 @@ bool isNetworkFilesystemType(unsigned long) noexcept
 void replaceFile(const std::filesystem::path& source, const std::filesystem::path& target, bool replace)
 {
     observeIo(IoEvent::Replace);
+    if (WriteRecorder* r = writeRecorder.load(std::memory_order_relaxed))
+        r->replacing(source, target);
     // POSIX rename semantics where the volume has them (NTFS, Windows 10 1709
     // on): the target may still be open, as a replica's store is while a bundle
     // is applied to it, which MoveFileEx refuses with ERROR_ACCESS_DENIED. The
@@ -573,6 +575,8 @@ bool isNetworkFilesystem(FileHandle fd)
 void replaceFile(const std::filesystem::path& source, const std::filesystem::path& target, bool replace)
 {
     observeIo(IoEvent::Replace);
+    if (WriteRecorder* r = writeRecorder.load(std::memory_order_relaxed))
+        r->replacing(source, target);
     if (replace) {
         std::filesystem::rename(source, target);
     } else {

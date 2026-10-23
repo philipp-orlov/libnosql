@@ -36,6 +36,9 @@ public:
     /// [offset, offset + length) is on the device, the whole file when length
     /// is 0, its size included.
     virtual void flushed(FileHandle, std::uint64_t offset, std::uint64_t length) = 0;
+    /// `source` is about to replace `target` by a rename: everything that
+    /// should be in it must be on the device by now.
+    virtual void replacing(const std::filesystem::path&, const std::filesystem::path&) {}
 };
 inline std::atomic<WriteRecorder*> writeRecorder{nullptr};
 

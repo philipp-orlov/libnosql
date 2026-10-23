@@ -630,6 +630,11 @@ whole-file flush the model must equal the real file, so a write the recorder
 missed fails the test rather than weakening it. Removing the data barrier before
 a `Safe` meta write, or before the meta write of a `Lazy` sync, fails most images;
 replaying a correct record with its flushes taken out must fail some, and does.
+The workloads write the main tree, a named tree and a `PrefixKeys` tree. A
+replacement built beside a file and renamed over it (compaction, a replica's
+apply) is checked at its rename: nothing written to any file may still wait for a
+flush there, since the rename may reach the device first, and leaving out the
+flush in `AtomicFile::publish` fails that check.
 It models a device that honours flushes; one that acknowledges a flush it has not
 performed is outside what any ordering can survive.
 
