@@ -90,7 +90,7 @@ an empty 64 KiB page therefore has `upper == 65528`, without a sentinel.
 Large values use a contiguous overflow run with one checksum at the run's end.
 The resulting value can still be returned as one borrowed `Slice`.
 
-A sub-database created with `DbFlags::PrefixKeys` (byte order only) may hold
+A sub-database created with `DbFlags::PrefixKeys` (byte or reverse order) may hold
 `P_PREFIX` leaves (`internal/key_prefix.hpp`). Such a leaf stores the bytes all its
 keys start with once, in a block at the top of the node area just under the
 checksum: the prefix, then its length as a u16, padded to four bytes. Its nodes
@@ -116,7 +116,13 @@ its branch pages are written plain. Writes to a tree without the flag lay any
 suffix as a key.
 Format version 8 adds this; a store is raised to it by the commit that creates its
 first such sub-database and is otherwise written as 7, which older builds read.
-A build with `NOSQL_PREFIX_KEYS_DEFAULT` gives every byte-ordered tree the flag,
+A tree in reverse order compares keys from their last byte, so the same
+argument holds for suffixes: its pages are `P_SUFFIX`, whose block holds the bytes
+every key ends with and whose nodes hold what comes before them, and a key is
+placed against the suffix from its end, then searched by the rest in reverse
+order. Each page's flag says which end it shares, so readers need no tree flags;
+`verify` checks each page shares at the end its tree's order calls for.
+A build with `NOSQL_PREFIX_KEYS_DEFAULT` gives every byte- or reverse-ordered tree the flag,
 main tree included, and the whole suite passes that way.
 
 Persisted integers are explicitly little-endian. User values are opaque.

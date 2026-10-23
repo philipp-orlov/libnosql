@@ -27,7 +27,7 @@ TEST(resealedGarbageIsAnErrorNotACrash)
     tst::Scratch scratch("corrupt");
     const auto file = scratch.file();
     const auto cut = scratch.file("cut.db");
-    const std::size_t pages = tst::corrupt::buildStore(file);
+    const std::size_t pages = tst::corrupt::buildStore(file, true);
     const std::string image = tst::corrupt::readAll(file);
     std::mt19937_64 rng(1);
     unsigned errors = 0, survived = 0;

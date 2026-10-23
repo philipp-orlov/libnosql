@@ -26,9 +26,11 @@ namespace tst::corrupt {
 inline constexpr std::size_t kPage = 4096;
 
 /// Branch and leaf pages of several trees, byte-ordered, reversed, integer
-/// and prefix-compressed, plus overflow runs.
+/// and prefix-compressed, plus overflow runs; with `suffixes`, a reversed
+/// tree that shares suffixes as well. Without, it is the store the replayed
+/// fuzzer findings were found in, page for page.
 /// Returns how many pages it uses; the file has room past them.
-inline std::size_t buildStore(const std::filesystem::path& file)
+inline std::size_t buildStore(const std::filesystem::path& file, bool suffixes = false)
 {
     using namespace nosql;
     Env env = Env::configure().pageSize(kPage).sync(Durability::None).open(file);
@@ -48,6 +50,13 @@ inline std::size_t buildStore(const std::filesystem::path& file)
         for (std::uint64_t i = 0; i < 1200; ++i)
             prefixed.put("tenant/0042/orders/" + keyOf(i, ""), blob(24, i));
     });
+    if (suffixes)
+        env.write([](Txn& txn) {
+            Db suffixed =
+                txn.db("suffixed", DbFlags::Create | DbFlags::ReverseKey | DbFlags::PrefixKeys);
+            for (std::uint64_t i = 0; i < 1200; ++i)
+                suffixed.put(keyOf(i, "") + ".shard-0007.eu-central.example.org", blob(24, i));
+        });
     return std::size_t(env.stats().usedPages);
 }
 
@@ -106,10 +115,16 @@ void mutatePage(std::string& bytes, std::size_t page, Rng& rng)
             case 1: p->nkeys = any16(); break;
             case 2: (rng() & 1 ? p->lower : p->upper) = any16(); break;
             case 3: {
-                static const std::uint16_t kinds[] = {
-                    P_LEAF, P_BRANCH, P_OVERFLOW, P_META, P_LEAF | P_PREFIX, P_BRANCH | P_PREFIX,
-                    0xffff};
-                p->flags = kinds[rng() % 7];
+                static const std::uint16_t kinds[] = {P_LEAF,
+                                                      P_BRANCH,
+                                                      P_OVERFLOW,
+                                                      P_META,
+                                                      P_LEAF | P_PREFIX,
+                                                      P_BRANCH | P_PREFIX,
+                                                      P_LEAF | P_SUFFIX,
+                                                      P_BRANCH | P_SUFFIX,
+                                                      0xffff};
+                p->flags = kinds[rng() % (sizeof kinds / sizeof *kinds)];
                 break;
             }
             case 4:
@@ -127,7 +142,7 @@ void mutatePage(std::string& bytes, std::size_t page, Rng& rng)
                     writeLittle(
                         x, std::uint32_t(rng() % 3 ? rng() % (bytes.size() / kPage + 4) : rng()));
                 break;
-            case 7:  // the prefix length of a P_PREFIX leaf
+            case 7:  // the length of a page's shared prefix or suffix
                 writeLittle(base + kPage - kPageChecksumBytes - 2, any16());
                 break;
             default:  // an overflow run's length
