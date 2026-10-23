@@ -357,6 +357,32 @@ TEST(aTreeOfMostlyBranchPagesSpillsWhatItCan)
     std::printf("    (%s)\n", refused ? "refused at the budget" : "committed");
 }
 
+/// A transaction that frees much more than the budget holds commits: its
+/// free-list entries go past the budget rather than fail the commit, since
+/// nothing the caller could batch differently makes them.
+TEST(aCommitsFreeListMayGoPastTheBudget)
+{
+    tst::Scratch scratch("spill-freelist");
+    Env env = Env::configure().pageSize(4096).sync(Durability::None).dirtyLimit(64u << 10).open(
+        scratch.file());
+    // Overflow values: each erase frees three pages for a few bytes written.
+    for (int round = 0; round < 40; ++round)
+        env.write([&](Txn& txn) {
+            for (int i = 0; i < 100; ++i)
+                txn.mainDb().put(tst::keyOf(round * 100 + i), tst::blob(9000, std::uint64_t(i)));
+        });
+    env.write([&](Txn& txn) {
+        Db db = txn.mainDb();
+        for (int i = 0; i < 4000; i += 2)
+            CHECK(db.erase(tst::keyOf(i)));
+    });
+    env.read([&](Txn& txn) {
+        CHECK_EQ(txn.mainDb().count(), 2000u);
+        checkIntegrity(txn);
+    });
+    CHECK_EQ(env.stats().dirtyBytes, 0u);
+}
+
 /// With spilling off the budget is a hard limit, as before.
 TEST(spillingOffFailsAtTheBudget)
 {
