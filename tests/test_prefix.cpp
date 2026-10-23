@@ -393,7 +393,8 @@ TEST(compactionKeepsPrefixKeys)
 }
 
 /// A store stays at the format older builds read until it holds a PrefixKeys
-/// sub-database; then it is raised, for good.
+/// sub-database; then it is raised, for good, and only a compacted copy
+/// without one goes back.
 TEST(theFormatVersionRisesOnlyWithPrefixKeys)
 {
     if (NOSQL_PREFIX_KEYS_DEFAULT)  // every store starts compressed
@@ -424,8 +425,28 @@ TEST(theFormatVersionRisesOnlyWithPrefixKeys)
         env.write([](Txn& txn) { txn.dropDb("p"); });
     }
     CHECK_EQ(versionOf(file, 4096), internal::kFormatVersion);
-    Env env = Env::configure().open(file);
-    env.read([](Txn& txn) { checkIntegrity(txn); });
+    {
+        Env env = Env::configure().open(file);
+        env.read([](Txn& txn) { checkIntegrity(txn); });
+    }
+    // Only compaction lowers it again: the copy holds no compressed page.
+    const auto copy = scratch.file("lowered.db");
+    compact(file, copy);
+    CHECK_EQ(versionOf(copy, 4096), internal::kOldestFormatVersion);
+    // A copy of a store that still has such a tree keeps 8.
+    {
+        Env env = Env::configure().open(file);
+        env.write(
+            [](Txn& txn) { txn.db("q", DbFlags::Create | DbFlags::PrefixKeys).put("k", "v"); });
+    }
+    const auto kept = scratch.file("kept.db");
+    compact(file, kept);
+    CHECK_EQ(versionOf(kept, 4096), internal::kFormatVersion);
+    Env env = Env::configure().open(copy);
+    env.read([](Txn& txn) {
+        checkIntegrity(txn);
+        CHECK(txn.db("plain").get("k").has_value());
+    });
 }
 
 /// Byte and reverse order compress, integers do not, and the flag belongs to
