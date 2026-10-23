@@ -14,6 +14,11 @@ set(NOSQL_TEST_LIST Basic:basic Env:env Cursor:cursor Named:named Nested:nested
 if(NOSQL_ENABLE_TSAN)
     list(REMOVE_ITEM NOSQL_TEST_LIST Memory:memory AllocBudget:alloc_budget)
 endif()
+# Windows: the hardening suite tests POSIX file modes, symlinks and
+# close-on-exec, and the allocation budget reads glibc's heap statistics.
+if(WIN32)
+    list(REMOVE_ITEM NOSQL_TEST_LIST Hardening:hardening AllocBudget:alloc_budget)
+endif()
 if(NOSQL_WITH_MQ)
     list(APPEND NOSQL_TEST_LIST Mq:mq MqSteady:mq_steady)
 endif()

@@ -2,7 +2,8 @@
 # address+undefined sanitizer build and a thread sanitizer build, and the
 # Release and thread sanitizer builds again with every store's commits pipelined
 # (NOSQL_PIPELINE_COMMITS_DEFAULT), since that path is opt-in, and a Release
-# build with every byte-ordered tree prefix-compressed (NOSQL_PREFIX_KEYS_DEFAULT).
+# build with every byte-ordered tree prefix-compressed (NOSQL_PREFIX_KEYS_DEFAULT),
+# and an MSVC build on Windows.
 name: ci
 
 on:
@@ -95,6 +96,17 @@ jobs:
         run: cmake --build build
       - name: Test
         run: ctest --test-dir build --output-on-failure -j4
+
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+      - name: Build
+        run: cmake --build build --config Release --parallel
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure -j4
 
   tsan-pipelined:
     runs-on: ubuntu-24.04
