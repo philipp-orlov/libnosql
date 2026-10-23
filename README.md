@@ -83,8 +83,13 @@ acknowledgement-count assertion in an earlier sanitizer run; the test counted a 
 before its ack, and a consumer delayed past its lease counted one that another had
 settled. It now counts only acks that settle. See [docs/design.md](docs/design.md).
 CI runs the suite in Release, under ASan/UBSan, and under Clang's ThreadSanitizer
-(`.github/workflows/ci.yml`). Windows and big-endian runtime validation remain
-separate gates.
+(`.github/workflows/ci.yml`), and on Windows with MSVC, where the `hardening`
+(POSIX file modes, symlinks, close-on-exec) and `allocbudget` (glibc heap
+statistics) suites do not apply. Big-endian runtime validation remains a separate
+gate. A MinGW build, run under Wine, passes all but four suites: three crash as a
+thread that used cursors exits, in the per-thread cursor pool's destructor under
+MinGW's thread-local runtime, and one trips over libstdc++'s `copy_file`. MSVC is
+the Windows compiler to use.
 Consume it from another project with `find_package(nosql)` and link
 `nosql::nosql`, or just `add_subdirectory`.
 
