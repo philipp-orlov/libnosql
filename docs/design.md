@@ -537,5 +537,13 @@ revision. The installed consumer is not a CTest entry. None of this establishes
 runtime correctness on any particular board or its vendor kernel.
 
 Run examples in a disposable directory because several create databases/archives in
-their working directory. Windows, big-endian runtime, TSan, exhaustive fault
-schedules and physical power-loss testing remain separate validation gates.
+their working directory. Windows, big-endian runtime, exhaustive fault schedules and
+physical power-loss testing remain separate validation gates.
+
+Continuous integration (`.github/workflows/ci.yml`) runs the suite on every push and
+pull request three ways: Release, ASan/UBSan, and ThreadSanitizer. The thread
+sanitizer build (`-DNOSQL_ENABLE_TSAN=ON`) uses Clang, because GCC 13's runtime does
+not intercept `pthread_mutex_clocklock` and misreports every timed writer's unlock,
+and it leaves out the two suites that count allocations (`memory`, `alloc_budget`):
+the sanitizer replaces the allocator, and its slowdown moves when containers reach
+their high-water marks.

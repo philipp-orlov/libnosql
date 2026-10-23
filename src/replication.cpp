@@ -186,7 +186,6 @@ void copySnapshot(Txn& txn, const std::filesystem::path& dst)
 
     const Meta& m = t->meta;
     const std::size_t ps = t->env->pageSize;
-    const std::byte* base = t->region->m.base;
     // Two meta pages always exist even before the first commit allocates
     // anything above them.
     const std::uint64_t pages = std::max<std::uint64_t>(m.lastPgno + 1, 2);
@@ -198,10 +197,17 @@ void copySnapshot(Txn& txn, const std::filesystem::path& dst)
         // still matches, and fileSize is one of the fields it covers.
         os::resizeFile(file, m.fileSize);
 
+        // Read through the file rather than out of the mapping. A writer may
+        // be rewriting a meta slot, or reusing a page this snapshot does not
+        // name, while this runs: the copy replaces the one and never reaches
+        // the other, but reading either out of shared memory as it is written
+        // is a data race all the same.
         constexpr std::uint64_t kChunk = 4u << 20;
+        std::vector<std::byte> chunk(std::size_t(std::min(kChunk, pages * ps)));
         for (std::uint64_t off = 0, end = pages * ps; off < end;) {
             const std::uint64_t n = std::min(kChunk, end - off);
-            os::writeAt(file, off, base + off, std::size_t(n));
+            os::readAt(t->env->fd, off, chunk.data(), std::size_t(n));
+            os::writeAt(file, off, chunk.data(), std::size_t(n));
             off += n;
         }
         // Both slots get this snapshot's meta. The other slot may hold a
