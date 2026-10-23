@@ -168,7 +168,10 @@ TEST(maxDeliveriesDeadLettersThePoisonMessage)
 TEST(expiredMessagesAreNeverDelivered)
 {
     tst::Scratch s("mq");
-    Env e = Env::configure().open(s.file());
+    // The TTL has to cover the fresh message's own commit. Under Safe that is
+    // two device flushes, which on a slow disk outlast 20 ms and expire it
+    // too; this tests expiry, not durability, so its commits flush nothing.
+    Env e = Env::configure().sync(Durability::None).open(s.file());
     MessageQueue q = MessageQueue::open(e, "orders", MessageQueue::Options().messageTtl(20ms));
 
     q.send("stale-1");
@@ -185,7 +188,9 @@ TEST(expiredMessagesAreNeverDelivered)
 TEST(anAbandonedLeaseComesBackAfterItExpires)
 {
     tst::Scratch s("mq");
-    Env e = Env::configure().open(s.file());
+    // As above: the 30 ms lease has to outlast the receive's own commit, so
+    // that commit flushes nothing.
+    Env e = Env::configure().sync(Durability::None).open(s.file());
     MessageQueue q = MessageQueue::open(e, "orders", fastLease(30ms));
 
     q.send("work");
