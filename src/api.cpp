@@ -460,13 +460,18 @@ Db Txn::db(Slice name, DbFlags flags)
     const std::uint32_t order = persist & ~std::uint32_t(DbFlags::PrefixKeys);
     if (order == (std::uint32_t(DbFlags::IntegerKey) | std::uint32_t(DbFlags::ReverseKey)))
         throw Error(ErrorCode::InvalidArgument, "conflicting key order flags");
-    // A shared prefix bounds a page's keys only in byte order.
-    if ((flags & DbFlags::PrefixKeys) && order)
-        throw Error(ErrorCode::InvalidArgument, "PrefixKeys needs byte-ordered keys");
+    // A shared prefix bounds a page's keys in byte order, a shared suffix in
+    // reverse order; integers share nothing worth storing once.
+    if ((flags & DbFlags::PrefixKeys) && (order & std::uint32_t(DbFlags::IntegerKey)))
+        throw Error(ErrorCode::InvalidArgument, "PrefixKeys needs byte- or reverse-ordered keys");
+    // The order must match; PrefixKeys only when asked for, since a tree may
+    // compress without it (NOSQL_PREFIX_KEYS_DEFAULT).
+    const std::uint32_t compared =
+        (flags & DbFlags::PrefixKeys) ? 0xffffu : 0xffffu & ~std::uint32_t(DbFlags::PrefixKeys);
     for (unsigned index = kCatalogDbi + 1; index < t->dbs.size(); ++index) {
         const auto& slot = t->dbs[index];
         if (slot.loaded && slot.name == name.view()) {
-            if (persist && (slot.tree.flags & 0xffffu) != persist)
+            if (persist && (slot.tree.flags & compared) != persist)
                 throw Error(ErrorCode::Incompatible, "database ordering differs");
             return nosql::Db(env_, impl_, index);
         }
@@ -515,13 +520,14 @@ Db Txn::db(Slice name, DbFlags flags)
             throw Error(ErrorCode::ReadOnly, "cannot create a sub-database in a read transaction");
         if (t->namedDbs >= e->maxDbs)
             throw Error(ErrorCode::TooManyDbs, "maximum number of live databases reached");
-        tr = emptyTree(
-            persist |
-            (NOSQL_PREFIX_KEYS_DEFAULT && !order ? std::uint32_t(DbFlags::PrefixKeys) : 0u));
+        tr = emptyTree(persist |
+                       (NOSQL_PREFIX_KEYS_DEFAULT && !(order & std::uint32_t(DbFlags::IntegerKey))
+                            ? std::uint32_t(DbFlags::PrefixKeys)
+                            : 0u));
         created = true;
         if (tr.flags & std::uint32_t(DbFlags::PrefixKeys))
             t->prefixFormat = true;
-    } else if (persist && (tr.flags & 0xffffu) != persist) {
+    } else if (persist && (tr.flags & compared) != persist) {
         throw Error(ErrorCode::Incompatible,
                     "sub-database '" + name.string() + "' was created with different key flags");
     }
@@ -844,7 +850,7 @@ bool Cursor::next(Slice& key, Slice& value)
             }
             const LeafNode* n = lnode(p, i);
             const auto* body = reinterpret_cast<const std::byte*>(n) + sizeof(LeafNode);
-            key = (p->flags & P_PREFIX) ? leafKeyAssembled(*c, p, i) : Slice(body, n->ksize);
+            key = (p->flags & P_SHARED) ? leafKeyAssembled(*c, p, i) : Slice(body, n->ksize);
             value = (n->flags & N_BIGDATA) ? leafValueOverflow(c->txn, p, i)
                                            : Slice(body + n->ksize, n->vsize);
             return true;

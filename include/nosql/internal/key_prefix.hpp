@@ -8,13 +8,18 @@
 // then its length as a little-endian u16, the block padded at its low end to
 // a multiple of four. Its nodes hold only what follows the prefix. The block
 // sits above every node, so deleting a node, which compacts the node area
-// upwards from `upper`, never moves it. Only byte-ordered trees compress:
-// there the shared prefix of a sorted page is the shared prefix of its first
-// and last key, and a key compares with the page by its prefix first.
+// upwards from `upper`, never moves it. In byte order the shared prefix of a
+// sorted page is the shared prefix of its first and last key, and a key
+// compares with the page by its prefix first.
 //
-// A P_PREFIX branch page does the same for its separators, slots 1 and up:
-// slot 0 is the -infinity child, whose key is empty and never compared, so
-// its node stores nothing and the prefix is what slots 1 and n-1 share.
+// A tree in reverse order (ReverseKey) compares keys from their last byte, so
+// its pages share suffixes instead: a P_SUFFIX page's block holds the bytes
+// every key ends with, and its nodes what comes before them. Everything else
+// is the same, mirrored.
+//
+// A branch page does the same for its separators, slots 1 and up: slot 0 is
+// the -infinity child, whose key is empty and never compared, so its node
+// stores nothing and the shared bytes are what slots 1 and n-1 share.
 
 #pragma once
 
@@ -40,11 +45,11 @@ inline constexpr std::size_t prefixBlock(std::size_t plen) noexcept
     return align4(plen + 2);
 }
 
-/// The prefix the keys of leaf or branch `p` share; empty unless it is
-/// P_PREFIX.
-inline Slice leafPrefix(const Page* p, std::size_t ps) noexcept
+/// The bytes the keys of leaf or branch `p` share, a prefix or a suffix;
+/// empty unless it is P_PREFIX or P_SUFFIX.
+inline Slice pageShared(const Page* p, std::size_t ps) noexcept
 {
-    if (!(p->flags & P_PREFIX))
+    if (!(p->flags & P_SHARED))
         return Slice();
     const auto* end = reinterpret_cast<const std::byte*>(p) + ps - kPageChecksumBytes - 2;
     const std::size_t n = readLittle<std::uint16_t>(end);
@@ -66,14 +71,55 @@ inline int againstPrefix(Slice prefix, Slice key, Slice* rest) noexcept
     return 0;
 }
 
-/// Appends leaf `i`'s whole key, prefix included, to `out`.
+/// againstPrefix for a suffix all of a reverse-ordered page's keys share:
+/// compared from the last byte, and `rest` is what comes before it.
+inline int againstSuffix(Slice suffix, Slice key, Slice* rest) noexcept
+{
+    const std::size_t n = std::min(suffix.size(), key.size());
+    const std::byte* s = suffix.data() + suffix.size();
+    const std::byte* k = key.data() + key.size();
+    for (std::size_t i = 1; i <= n; ++i) {
+        const std::byte a = s[-std::ptrdiff_t(i)], b = k[-std::ptrdiff_t(i)];
+        if (a != b)
+            return a > b ? -1 : 1;
+    }
+    if (key.size() < suffix.size())
+        return -1;
+    *rest = Slice(key.data(), key.size() - suffix.size());
+    return 0;
+}
+
+/// Where `key` falls against the bytes page `p`'s keys share (`shared`, its
+/// pageShared()): below all of them, above all, or carrying them, `rest` then
+/// being the part of it the page stores.
+inline int againstShared(const Page* p, Slice shared, Slice key, Slice* rest) noexcept
+{
+    return (p->flags & P_SUFFIX) ? againstSuffix(shared, key, rest)
+                                 : againstPrefix(shared, key, rest);
+}
+
+/// Whether `key` can be stored on page `p` as it stands, `stored` then being
+/// the part that goes in a node: all of it on a plain page, the part besides
+/// the page's shared bytes on one with a block.
+inline bool stripShared(const Page* p, Slice key, Slice* stored, std::size_t ps) noexcept
+{
+    *stored = key;
+    return !(p->flags & P_SHARED) || againstShared(p, pageShared(p, ps), key, stored) == 0;
+}
+
+/// Appends leaf `i`'s whole key, the page's shared bytes included, to `out`.
 template <class Bytes>
 void appendLeafKey(const Page* p, unsigned i, std::size_t ps, Bytes& out)
 {
-    const Slice prefix = leafPrefix(p, ps);
-    const Slice suffix = nodeKey(p, i);
-    out.insert(out.end(), prefix.data(), prefix.data() + prefix.size());
-    out.insert(out.end(), suffix.data(), suffix.data() + suffix.size());
+    const Slice shared = pageShared(p, ps);
+    const Slice stored = nodeKey(p, i);
+    if (p->flags & P_SUFFIX) {
+        out.insert(out.end(), stored.data(), stored.data() + stored.size());
+        out.insert(out.end(), shared.data(), shared.data() + shared.size());
+    } else {
+        out.insert(out.end(), shared.data(), shared.data() + shared.size());
+        out.insert(out.end(), stored.data(), stored.data() + stored.size());
+    }
 }
 
 inline std::size_t commonPrefix(Slice a, Slice b) noexcept
@@ -83,6 +129,33 @@ inline std::size_t commonPrefix(Slice a, Slice b) noexcept
     while (i < n && a.data()[i] == b.data()[i])
         ++i;
     return i;
+}
+
+inline std::size_t commonSuffix(Slice a, Slice b) noexcept
+{
+    const std::size_t n = std::min(a.size(), b.size());
+    std::size_t i = 0;
+    while (i < n && a.data()[a.size() - 1 - i] == b.data()[b.size() - 1 - i])
+        ++i;
+    return i;
+}
+
+/// What keys `a` and `b` share: a prefix, or with `suffix` a suffix.
+inline std::size_t commonShared(Slice a, Slice b, bool suffix) noexcept
+{
+    return suffix ? commonSuffix(a, b) : commonPrefix(a, b);
+}
+
+/// The `n` shared bytes of `key`: its first, or with `suffix` its last.
+inline Slice sharedOf(Slice key, std::size_t n, bool suffix) noexcept
+{
+    return Slice(suffix ? key.data() + key.size() - n : key.data(), n);
+}
+
+/// What a page stores of `key` besides its `n` shared bytes.
+inline Slice storedOf(Slice key, std::size_t n, bool suffix) noexcept
+{
+    return Slice(suffix ? key.data() : key.data() + n, key.size() - n);
 }
 
 // The layout helpers take any entry type with the leaf fields of b_tree.cpp's
@@ -101,14 +174,16 @@ std::size_t leafLayoutBytes(const E* e, unsigned n, std::size_t plen) noexcept
     return total;
 }
 
-/// The prefix `n` sorted entries are best laid out with: what their first and
-/// last key share, when that saves room; 0 otherwise.
+/// How many shared bytes `n` sorted entries are best laid out with: what
+/// their first and last key share, as a prefix or with `suffix` a suffix,
+/// when that saves room; 0 otherwise.
 template <class E>
-std::size_t leafPrefixFor(const E* e, unsigned n) noexcept
+std::size_t leafPrefixFor(const E* e, unsigned n, bool suffix = false) noexcept
 {
     if (n < 2)
         return 0;
-    const std::size_t plen = std::min<std::size_t>(commonPrefix(e[0].key, e[n - 1].key), 0xffff);
+    const std::size_t plen =
+        std::min<std::size_t>(commonShared(e[0].key, e[n - 1].key, suffix), 0xffff);
     if (!plen || leafLayoutBytes(e, n, plen) >= leafLayoutBytes(e, n, 0))
         return 0;
     return plen;
@@ -131,17 +206,18 @@ inline std::size_t writePrefixBlock(Page* p, Slice prefix, std::size_t ps) noexc
 }
 
 /// Rewrites `p` as leaf `pgno` holding `n` sorted entries whose keys share
-/// `plen` bytes. The entries must not point into `p`.
+/// `plen` bytes, as a prefix or with `suffix` a suffix. The entries must not
+/// point into `p`.
 template <class E>
-void layoutLeaf(Page* p, PageNo pgno, const E* e, unsigned n, std::size_t plen,
-                std::size_t ps) noexcept
+void layoutLeaf(Page* p, PageNo pgno, const E* e, unsigned n, std::size_t plen, std::size_t ps,
+                bool suffix = false) noexcept
 {
     p->pgno = pgno;
-    p->flags = std::uint16_t(P_LEAF | (plen ? P_PREFIX : 0));
+    p->flags = std::uint16_t(P_LEAF | (plen ? (suffix ? P_SUFFIX : P_PREFIX) : 0));
     p->nkeys = 0;
     p->lower = std::uint16_t(kPageHdr);
     auto* base = reinterpret_cast<std::byte*>(p);
-    std::size_t upper = writePrefixBlock(p, Slice(n ? e[0].key.data() : nullptr, plen), ps);
+    std::size_t upper = writePrefixBlock(p, plen ? sharedOf(e[0].key, plen, suffix) : Slice(), ps);
     for (unsigned i = 0; i < n; ++i) {
         const bool big = (e[i].flags & N_BIGDATA) != 0;
         const std::size_t ksize = e[i].key.size() - plen;
@@ -154,7 +230,7 @@ void layoutLeaf(Page* p, PageNo pgno, const E* e, unsigned n, std::size_t plen,
         node->vsize = e[i].vsize;
         auto* body = reinterpret_cast<std::byte*>(node) + sizeof(LeafNode);
         if (ksize)
-            std::memcpy(body, e[i].key.data() + plen, ksize);
+            std::memcpy(body, storedOf(e[i].key, plen, suffix).data(), ksize);
         if (e[i].pay)
             std::memcpy(body + ksize, e[i].pay, e[i].paylen);
         else
@@ -177,14 +253,15 @@ std::size_t branchLayoutBytes(const E* e, unsigned n, std::size_t plen) noexcept
     return total;
 }
 
-/// The prefix `n` sorted branch entries are best laid out with: what the
-/// separators of entries 1 and n-1 share, when that saves room; 0 otherwise.
+/// leafPrefixFor for `n` sorted branch entries: what the separators of
+/// entries 1 and n-1 share.
 template <class E>
-std::size_t branchPrefixFor(const E* e, unsigned n) noexcept
+std::size_t branchPrefixFor(const E* e, unsigned n, bool suffix = false) noexcept
 {
     if (n < 2)
         return 0;
-    const std::size_t plen = std::min<std::size_t>(commonPrefix(e[1].key, e[n - 1].key), 0xffff);
+    const std::size_t plen =
+        std::min<std::size_t>(commonShared(e[1].key, e[n - 1].key, suffix), 0xffff);
     if (!plen || branchLayoutBytes(e, n, plen) >= branchLayoutBytes(e, n, 0))
         return 0;
     return plen;
@@ -202,7 +279,7 @@ std::size_t branchPrefixFor(const E* e, unsigned n) noexcept
 inline std::size_t nodeTop(const Page* p, std::size_t ps) noexcept
 {
     std::size_t top = ps - kPageChecksumBytes;
-    if (p->flags & P_PREFIX)
+    if (p->flags & P_SHARED)
         top -=
             prefixBlock(readLittle<std::uint16_t>(reinterpret_cast<const std::byte*>(p) + top - 2));
     return top;
@@ -214,7 +291,8 @@ inline void validateHeader(const Page* p, std::size_t ps)
     const auto bad = [](const char* what) { throw Error(ErrorCode::Corrupted, what); };
     const std::uint16_t flags = p->flags;
     std::size_t top = ps - kPageChecksumBytes;
-    if (flags == (P_LEAF | P_PREFIX) || flags == (P_BRANCH | P_PREFIX)) {
+    if (flags == (P_LEAF | P_PREFIX) || flags == (P_BRANCH | P_PREFIX) ||
+        flags == (P_LEAF | P_SUFFIX) || flags == (P_BRANCH | P_SUFFIX)) {
         const std::size_t plen =
             readLittle<std::uint16_t>(reinterpret_cast<const std::byte*>(p) + top - 2);
         if (!plen || prefixBlock(plen) > top - kPageHdr)

@@ -34,7 +34,9 @@ struct Base
         std::filesystem::create_directories(dir);
         file = dir / "base.db";
         cut = dir / "cut.db";
-        pages = tst::corrupt::buildStore(file);
+        // FUZZ_SUFFIXES=1 adds a tree sharing suffixes; findings then replay
+        // against buildStore(file, true).
+        pages = tst::corrupt::buildStore(file, std::getenv("FUZZ_SUFFIXES") != nullptr);
         image = tst::corrupt::readAll(file);
     }
     ~Base() { std::filesystem::remove_all(dir); }

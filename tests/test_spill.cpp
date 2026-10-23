@@ -238,6 +238,10 @@ TEST(argumentsReadFromTheTransactionSurviveTheSpillTheyTrigger)
 /// nothing), still sends open cursors back to re-anchor.
 TEST(aSpillWithoutAWriteStillReanchorsCursors)
 {
+    // The deep tree below needs separators that stay long; a build where
+    // every tree that can share key bytes does has none.
+    if (NOSQL_PREFIX_KEYS_DEFAULT)
+        return;
     tst::Scratch scratch("spill-quiet");
     Env env = spilling().open(scratch.file());
     State expect;

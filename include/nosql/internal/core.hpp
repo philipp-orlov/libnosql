@@ -725,12 +725,12 @@ bool cursorPrev(CursorImpl& c);
 void cursorRevalidate(CursorImpl& c);
 
 Slice cursorKey(CursorImpl& c);
-/// Leaf `p`'s key `i` whole: in place, or on a P_PREFIX leaf assembled in the
-/// cursor, where it lasts until the cursor reads another.
+/// Leaf `p`'s key `i` whole: in place, or on a leaf with shared bytes
+/// assembled in the cursor, where it lasts until the cursor reads another.
 Slice leafKeyAssembled(CursorImpl& c, const Page* p, unsigned i);
 inline Slice leafKeyAt(CursorImpl& c, const Page* p, unsigned i)
 {
-    if (p->flags & P_PREFIX)
+    if (p->flags & P_SHARED)
         return leafKeyAssembled(c, p, i);
     return checkedLeafKey(p, i, c.txn->pageSize() - kPageChecksumBytes);
 }
@@ -752,7 +752,7 @@ NOSQL_ALWAYS_INLINE void leafEntryAt(CursorImpl& c, const Page* p, unsigned i, S
 {
     const LeafNode* n = checkedLeafNode(p, i, nodeTop(p, c.txn->pageSize()));
     const auto* body = reinterpret_cast<const std::byte*>(n) + sizeof(LeafNode);
-    key = (p->flags & P_PREFIX) ? leafKeyAssembled(c, p, i) : Slice(body, n->ksize);
+    key = (p->flags & P_SHARED) ? leafKeyAssembled(c, p, i) : Slice(body, n->ksize);
     value =
         (n->flags & N_BIGDATA) ? leafValueOverflow(c.txn, p, i) : Slice(body + n->ksize, n->vsize);
 }

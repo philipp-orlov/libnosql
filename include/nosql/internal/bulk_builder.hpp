@@ -205,6 +205,9 @@ private:
         std::uint32_t paylen;
     };
 
+    /// A tree in reverse order shares suffixes rather than prefixes.
+    bool suffix() const noexcept { return (tree_.flags & std::uint32_t(DbFlags::ReverseKey)) != 0; }
+
     static std::size_t nodeBytes(const Staged& s, std::size_t plen) noexcept
     {
         return 2 + leafNodeSize(s.key.size() - plen, s.vsize, (s.flags & N_BIGDATA) != 0);
@@ -220,8 +223,9 @@ private:
         // share what it has in common with the first. Sizes at that prefix are
         // recomputed only when it shrinks, which it does at most once per byte.
         const std::size_t plen =
-            staged_.empty() ? key.size()
-                            : std::min(stagedPrefix_, commonPrefix(Slice(staged_[0].key), key));
+            staged_.empty()
+                ? key.size()
+                : std::min(stagedPrefix_, commonShared(Slice(staged_[0].key), key, suffix()));
         if (plen != stagedPrefix_) {
             stagedAt_ = 0;
             for (const Staged& e : staged_)
@@ -265,8 +269,8 @@ private:
                              reinterpret_cast<const std::byte*>(s.pay.data()),
                              std::uint32_t(s.pay.size())});
         const unsigned n = unsigned(views.size());
-        layoutLeaf(leaf_.page(), 0, views.data(), n, leafPrefixFor(views.data(), n),
-                   file_.pageSize());
+        layoutLeaf(leaf_.page(), 0, views.data(), n, leafPrefixFor(views.data(), n, suffix()),
+                   file_.pageSize(), suffix());
         staged_.clear();
         stagedPrefix_ = 0;
         stagedWhole_ = 0;

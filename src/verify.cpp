@@ -47,12 +47,18 @@ struct Checker
 
     void checkPageHeader(const Page* p, const Tree& tr)
     {
-        const bool prefixed = p->flags == (P_LEAF | P_PREFIX) || p->flags == (P_BRANCH | P_PREFIX);
-        if (p->flags != P_BRANCH && p->flags != P_LEAF && !prefixed)
+        const std::uint16_t kind = std::uint16_t(p->flags & ~P_SHARED);
+        const std::uint16_t shared = std::uint16_t(p->flags & P_SHARED);
+        const bool prefixed = shared != 0;
+        if ((kind != P_BRANCH && kind != P_LEAF) || shared == P_SHARED)
             bad("invalid tree page flags", p->pgno);
         if (prefixed && !(tr.flags & std::uint32_t(DbFlags::PrefixKeys)))
             bad("prefix-compressed page in a tree that does not compress", p->pgno);
-        // Nodes end below the checksum, and on a P_PREFIX page below its prefix.
+        // A tree in reverse order shares suffixes, any other prefixes.
+        const bool reverse = (tr.flags & std::uint32_t(DbFlags::ReverseKey)) != 0;
+        if (prefixed && (shared == P_SUFFIX) != reverse)
+            bad("page shares key bytes at the wrong end for its tree's order", p->pgno);
+        // Nodes end below the checksum, and on a page with shared bytes below them.
         std::size_t top = ps - kPageChecksumBytes;
         std::size_t plen = 0;
         if (prefixed) {
@@ -88,7 +94,9 @@ struct Checker
     {
         if (isBranch(p) && i == 0)
             return std::string();
-        return leafPrefix(p, ps).string() + nodeKey(p, i).string();
+        if (p->flags & P_SUFFIX)
+            return nodeKey(p, i).string() + pageShared(p, ps).string();
+        return pageShared(p, ps).string() + nodeKey(p, i).string();
     }
 
     struct Span
@@ -134,7 +142,7 @@ struct Checker
             for (unsigned i = 0; i < p->nkeys; ++i) {
                 const LeafNode* n = lnode(p, i);
                 if ((n->flags & ~(N_BIGDATA | N_SUBDB)) != 0 ||
-                    n->ksize + leafPrefix(p, ps).size() == 0)
+                    n->ksize + pageShared(p, ps).size() == 0)
                     bad("invalid leaf flags or empty key", pgno);
                 if (n->flags & N_SUBDB) {
                     if (!catalog || (n->flags & N_BIGDATA) || n->vsize != sizeof(Tree))

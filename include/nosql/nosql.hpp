@@ -33,9 +33,9 @@
 #define NOSQL_PIPELINE_COMMITS_DEFAULT 0
 #endif
 
-/// A build can give every new byte-ordered tree, the main one included,
-/// DbFlags::PrefixKeys (CMake option NOSQL_PREFIX_KEYS_DEFAULT), which is how
-/// the whole test suite runs on compressed leaves.
+/// A build can give every new byte- or reverse-ordered tree, the main one
+/// included, DbFlags::PrefixKeys (CMake option NOSQL_PREFIX_KEYS_DEFAULT),
+/// which is how the whole test suite runs on compressed pages.
 #ifndef NOSQL_PREFIX_KEYS_DEFAULT
 #define NOSQL_PREFIX_KEYS_DEFAULT 0
 #endif
@@ -63,10 +63,12 @@ enum class DbFlags : std::uint32_t
     Create = 1u << 0,      ///< Create the sub-database if it does not exist
     IntegerKey = 1u << 1,  ///< fixed-width little-endian uint32_t or uint64_t keys
     ReverseKey = 1u << 2,  ///< compare keys back-to-front (good for suffixes)
-    /// Store the prefix a leaf's keys share once per leaf, so keys with long
-    /// common prefixes take fewer pages. Byte-ordered sub-databases only, set
-    /// when the sub-database is created. A key a cursor returns from such a
-    /// database is assembled in the cursor and valid until it moves.
+    /// Store the bytes a page's keys share once per page, leaves and branch
+    /// pages alike, so keys with long common parts take fewer pages: their
+    /// prefix in byte order, their suffix with ReverseKey. Not with
+    /// IntegerKey; set when the sub-database is created, and a reopen need
+    /// not repeat it. A key a cursor returns from such a database is
+    /// assembled in the cursor and valid until it moves.
     PrefixKeys = 1u << 3,
 };
 constexpr DbFlags operator|(DbFlags a, DbFlags b) noexcept

@@ -66,8 +66,12 @@ enum PageFlags : std::uint16_t
     P_LEAF = 1u << 1,
     P_OVERFLOW = 1u << 2,
     P_META = 1u << 3,
-    P_PREFIX = 1u << 4,  ///< leaf storing its keys' shared prefix once (key_prefix.hpp)
+    P_PREFIX = 1u << 4,  ///< page storing its keys' shared prefix once (key_prefix.hpp)
+    P_SUFFIX = 1u << 5,  ///< page storing its keys' shared suffix once, in reverse order
 };
+
+/// Either: the page has a block of bytes its keys share.
+inline constexpr std::uint16_t P_SHARED = P_PREFIX | P_SUFFIX;
 
 /// 16-byte slotted-page header. `lower` is the end of the uint16 slot array,
 /// `upper` the start of the packed node data; free space is what lies between.

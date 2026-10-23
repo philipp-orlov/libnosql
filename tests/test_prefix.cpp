@@ -180,6 +180,92 @@ TEST(branchPagesStoreTheirSeparatorsPrefixOnce)
     }
 }
 
+/// In reverse order a page's keys share a suffix: host names, file names,
+/// anything compared from the end. The same work on a plain reversed tree
+/// and a compressing one gives the same contents in the same order, seeks
+/// and walks both ways included, in fewer pages, and survives compaction.
+TEST(reverseOrderSharesSuffixes)
+{
+    tst::Scratch scratch("suffix");
+    Env env = Env::configure().pageSize(4096).sync(Durability::None).open(scratch.file());
+    static const char* const domains[] = {".eu-central.shard-0007.example.org",
+                                          ".us-east.shard-0012.example.org", ".example.net"};
+    auto key = [](std::uint64_t n) {
+        return "host-" + tst::keyOf(n / 3, "") + (n % 4 == 0 ? "-mgmt" : "") + domains[n % 3];
+    };
+    const DbFlags reverse = DbFlags::Create | DbFlags::ReverseKey;
+    State expect;
+    std::mt19937_64 rng(6);
+    for (int commit = 0; commit < 40; ++commit)
+        env.write([&](Txn& txn) {
+            Db a = txn.db("plain", reverse);
+            Db b = txn.db("suffixed", reverse | DbFlags::PrefixKeys);
+            for (int i = 0; i < 400; ++i) {
+                const std::string k = key(rng() % 9000);
+                if (rng() % 10 < 3) {
+                    const bool had = expect.erase(k) == 1;
+                    CHECK_EQ(a.erase(k), had);
+                    CHECK_EQ(b.erase(k), had);
+                } else {
+                    const std::string v = tst::blob(rng() % 40 == 0 ? 6000 : rng() % 60, rng());
+                    a.put(k, v);
+                    b.put(k, v);
+                    expect[k] = v;
+                }
+            }
+        });
+    auto walk = [](Db db) {
+        std::vector<std::pair<std::string, std::string>> out;
+        for (auto [k, v] : db.all())
+            out.emplace_back(k.string(), v.string());
+        return out;
+    };
+    env.read([&](Txn& txn) {
+        checkIntegrity(txn);
+        Db a = txn.db("plain"), b = txn.db("suffixed");
+        CHECK(walk(a) == walk(b));
+        CHECK_EQ(b.count(), std::uint64_t(expect.size()));
+        if (!NOSQL_PREFIX_KEYS_DEFAULT) {  // else both compress
+            CHECK(b.stats().leafPages * 10 < a.stats().leafPages * 7);
+            CHECK(b.stats().branchPages < a.stats().branchPages);
+        }
+        for (int i = 0; i < 2000; ++i) {
+            const std::string probe = key(rng() % 9500) + (i % 2 ? "" : "x");
+            Cursor ca = a.cursor(), cb = b.cursor();
+            const bool fa = ca.seek(Slice(probe)), fb = cb.seek(Slice(probe));
+            CHECK_EQ(fa, fb);
+            if (fa && fb) {
+                CHECK(ca.key().string() == cb.key().string());
+                const bool back = ca.prev();
+                CHECK_EQ(back, cb.prev());
+                if (back)
+                    CHECK(ca.key().string() == cb.key().string());
+            }
+            CHECK(a.get(probe).has_value() == b.get(probe).has_value());
+        }
+        std::vector<std::string> back;
+        Cursor c = b.cursor();
+        for (bool ok = c.last(); ok; ok = c.prev())
+            back.push_back(c.key().string());
+        const auto forward = walk(b);
+        CHECK_EQ(back.size(), forward.size());
+        for (std::size_t i = 0; i < back.size(); ++i)
+            CHECK(back[i] == forward[forward.size() - 1 - i].first);
+    });
+    const auto copy = scratch.file("compact.db");
+    env.close();
+    compact(scratch.file(), copy);
+    Env compacted = Env::configure().readOnly().open(copy);
+    compacted.read([&](Txn& txn) {
+        checkIntegrity(txn);
+        CHECK(walk(txn.db("suffixed")) == walk(txn.db("plain")));
+        if (!NOSQL_PREFIX_KEYS_DEFAULT)
+            CHECK(txn.db("suffixed").stats().leafPages * 10 <
+                  txn.db("plain").stats().leafPages * 7);
+    });
+    CHECK_EQ(versionOf(copy, 4096), internal::kFormatVersion);
+}
+
 /// Seeks, ranges, prefix scans, counts, ranks and backward walks see the keys
 /// whole, wherever a page boundary and its prefix fall.
 TEST(prefixKeysReadLikeAnyOther)
@@ -342,14 +428,15 @@ TEST(theFormatVersionRisesOnlyWithPrefixKeys)
     env.read([](Txn& txn) { checkIntegrity(txn); });
 }
 
-/// Only byte order compresses, and the flag belongs to the sub-database.
+/// Byte and reverse order compress, integers do not, and the flag belongs to
+/// the sub-database.
 TEST(prefixKeysNeedsByteOrderAndAMatchingTree)
 {
     tst::Scratch scratch("prefix-flags");
     Env env = Env::configure().open(scratch.file());
     env.write([](Txn& txn) {
-        CHECK_THROWS(txn.db("r", DbFlags::Create | DbFlags::PrefixKeys | DbFlags::ReverseKey),
-                     ErrorCode::InvalidArgument);
+        CHECK(txn.db("r", DbFlags::Create | DbFlags::PrefixKeys | DbFlags::ReverseKey).flags() &
+              DbFlags::PrefixKeys);
         CHECK_THROWS(txn.db("i", DbFlags::Create | DbFlags::PrefixKeys | DbFlags::IntegerKey),
                      ErrorCode::InvalidArgument);
         txn.db("plain", DbFlags::Create).put("k", "v");
