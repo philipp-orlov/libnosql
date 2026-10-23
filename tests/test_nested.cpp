@@ -1,6 +1,8 @@
 // Copyright (c) 2026 Philipp Orlov
 // SPDX-License-Identifier: Apache-2.0
 
+#include <vector>
+
 #include "nosql/nosql.hpp"
 #include "tests/test_util.hpp"
 
@@ -197,6 +199,39 @@ TEST(grandchildCommitThenParentAbortKeepsRootPages)
 }
 
 // Three levels committing upwards still free each level's own copies.
+/// A child that replaces or erases an overflow value its parent wrote frees
+/// the parent's whole run, however many levels down it is, not just the
+/// run's first page.
+TEST(childFreesAWholeOverflowRunOfAnAncestor)
+{
+    for (int depth = 1; depth <= 3; ++depth) {
+        for (int change = 0; change < 3; ++change) {
+            tst::Scratch s("nested-overflow");
+            Env e = Env::configure().pageSize(4096).open(s.file());
+            e.write([&](Txn& t) {
+                t.mainDb().put("a", std::string(10000, 'x'));
+                std::vector<Txn> chain;
+                chain.push_back(t.nested());
+                while (int(chain.size()) < depth)
+                    chain.push_back(chain.back().nested());
+                Db d = chain.back().mainDb();
+                if (change == 0)
+                    d.put("a", std::string(20000, 'y'));
+                else if (change == 1)
+                    d.erase("a");
+                else
+                    d.put("a", std::string(200, 'y'));
+                while (!chain.empty()) {
+                    chain.back().commit();
+                    chain.pop_back();
+                }
+                checkIntegrity(t);
+            });
+            e.read([&](Txn& t) { checkIntegrity(t); });
+        }
+    }
+}
+
 TEST(deepNestedCommitsReleaseCopiedPages)
 {
     tst::Scratch s("nested");

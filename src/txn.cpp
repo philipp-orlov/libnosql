@@ -944,11 +944,19 @@ void commitNested(TxnImpl* t)
     // to an older ancestor is still reachable from that ancestor -- the parent
     // may yet abort -- so it stays retired until the parent commits into the
     // level that owns it.
-    for (PageNo pgno : t->retiredLocal) {
+    const std::vector<PageNo>& retired = t->retiredLocal;
+    for (std::size_t i = 0; i < retired.size(); ++i) {
+        const PageNo pgno = retired[i];
         if (Page* buf = p->dirty.find(pgno)) {
+            // An overflow run is retired page by page but held under its first
+            // page: the whole run is free, and the rest of it follows here.
+            const unsigned n = isOverflow(buf) ? ovPages(buf) : 1u;
             p->pool.push_back(buf);
             p->dirty.erase(pgno);
-            p->loose.push_back(pgno);
+            for (unsigned k = 0; k < n; ++k)
+                p->loose.push_back(pgno + k);
+            while (i + 1 < retired.size() && retired[i + 1] > pgno && retired[i + 1] < pgno + n)
+                ++i;
         } else {
             p->retiredLocal.push_back(pgno);
         }
