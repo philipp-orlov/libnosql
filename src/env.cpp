@@ -13,6 +13,7 @@
 #include "nosql/internal/ship_log.hpp"
 #endif
 #include "nosql/internal/core.hpp"
+#include "nosql/internal/free_list.hpp"
 
 namespace nosql::internal {
 
@@ -407,8 +408,12 @@ std::uint64_t countFreeTreePages(EnvImpl& e)
     c.txn = &t;
     c.dbi = kFreeDbi;
     std::uint64_t pages = 0;
-    for (bool ok = cursorFirst(c); ok; ok = cursorNext(c))
-        pages += cursorValue(c).size() / sizeof(PageNo);
+    for (bool ok = cursorFirst(c); ok; ok = cursorNext(c)) {
+        std::size_t n = 0;
+        if (!forEachFreePage(cursorValue(c), freeChunkLimit(e.pageSize), n, [](PageNo) {}))
+            throw Error(ErrorCode::Corrupted, "invalid free-list value");
+        pages += n;
+    }
     t.releaseResources();
     t.env = nullptr;
     return pages;

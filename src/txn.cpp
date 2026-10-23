@@ -18,6 +18,7 @@
 #endif
 #include "nosql/internal/io_observer.hpp"
 #include "nosql/internal/core.hpp"
+#include "nosql/internal/free_list.hpp"
 
 namespace nosql::internal {
 
@@ -295,14 +296,13 @@ bool reclaimMore(TxnImpl* t)
         }
     }
     const Slice v = cursorValue(c);
-    const std::size_t n = v.size() / sizeof(PageNo);
-    if (v.size() % sizeof(PageNo) != 0)
-        throw Error(ErrorCode::Corrupted, "invalid free-list value length");
+    std::size_t n = 0;
     const std::size_t joined = t->reclaim.size();
+    if (!forEachFreePage(v, freeChunkLimit(t->pageSize()), n, [](PageNo) {}))
+        throw Error(ErrorCode::Corrupted, "invalid free-list value");
     t->reclaim.resize(joined + n);
-    for (std::size_t index = 0; index < n; ++index)
-        t->reclaim[joined + index] =
-            freePageNumber(t, readLittle<PageNo>(v.data() + index * sizeof(PageNo)));
+    std::size_t index = joined;
+    forEachFreePage(v, n, n, [&](PageNo p) { t->reclaim[index++] = freePageNumber(t, p); });
     // Keep the unspent part fully ordered, not just the new tail: allocating a
     // multi-page overflow run scans it for a contiguous stretch.
     std::sort(t->reclaim.begin() + std::ptrdiff_t(joined), t->reclaim.end());
@@ -457,6 +457,23 @@ void flushNamedTrees(TxnImpl* t)
     }
 }
 
+/// Records sorted, distinct `pages` under free-list key `key`: as runs where
+/// `runs` allows them (the store is at format 8) and they take less room
+/// (free_list.hpp), else as an array.
+void putFreeChunk(CursorImpl& c, Slice key, const PageNo* pages, std::size_t n, bool runs)
+{
+    const std::size_t packed = runs ? freeRunsBytes(pages, n) : 0;
+    WritableSlice w;
+    if (packed) {
+        treePut(c, key, Slice(nullptr, packed), PutMode::Upsert, &w);
+        writeFreeRuns(w.data(), packed, pages, n);
+        return;
+    }
+    treePut(c, key, Slice(nullptr, n * sizeof(PageNo)), PutMode::Upsert, &w);
+    for (std::size_t index = 0; index < n; ++index)
+        writeLittle(w.data() + index * sizeof(PageNo), pages[index]);
+}
+
 /// Fold this transaction's retired pages into the GC tree and drop the
 /// entries it consumed. Reclamation is switched off for the duration so the
 /// procedure cannot feed on its own output.
@@ -529,6 +546,8 @@ void updateFreelist(TxnImpl* t)
     std::vector<PageNo>& acc = t->gcAcc;
     freed.clear();
     const std::size_t chunkPages = freeChunkPages(t->pageSize());
+    // Runs only where every build that opens the store reads them.
+    const bool runs = t->meta.version >= kFormatVersion || t->prefixFormat;
     std::size_t written = 0;  ///< chunks currently recorded under our id
     constexpr int kMaxRounds = 8;
     // At most this many of our retired pages go inline, leaving room in the
@@ -602,11 +621,8 @@ void updateFreelist(TxnImpl* t)
         for (std::size_t i = 0; i < exemptChunks; ++i) {
             const std::size_t first = i * chunkPages;
             const std::size_t n = std::min(chunkPages, exempt.size() - first);
-            WritableSlice w;
-            treePut(c, freeKey(t->txnid, exemptChunk(t->exemptEpoch, i)).slice(),
-                    Slice(nullptr, n * sizeof(PageNo)), PutMode::Upsert, &w);
-            for (std::size_t index = 0; index < n; ++index)
-                writeLittle(w.data() + index * sizeof(PageNo), exempt[first + index]);
+            putFreeChunk(c, freeKey(t->txnid, exemptChunk(t->exemptEpoch, i)).slice(),
+                         exempt.data() + first, n, runs);
         }
         for (std::size_t i = exemptChunks; i < writtenExempt; ++i)
             treeDel(c, freeKey(t->txnid, exemptChunk(t->exemptEpoch, i)).slice());
@@ -615,11 +631,8 @@ void updateFreelist(TxnImpl* t)
         for (std::size_t i = 0; i < keptOld; ++i) {
             const std::size_t first = i * chunkPages;
             const std::size_t n = std::min(chunkPages, remainder.size() - first);
-            WritableSlice w;
-            treePut(c, freeKey(t->oldest, remainderChunk(t->txnid, i)).slice(),
-                    Slice(nullptr, n * sizeof(PageNo)), PutMode::Upsert, &w);
-            for (std::size_t index = 0; index < n; ++index)
-                writeLittle(w.data() + index * sizeof(PageNo), remainder[first + index]);
+            putFreeChunk(c, freeKey(t->oldest, remainderChunk(t->txnid, i)).slice(),
+                         remainder.data() + first, n, runs);
         }
         for (std::size_t i = keptOld; i < writtenOld; ++i)
             treeDel(c, freeKey(t->oldest, remainderChunk(t->txnid, i)).slice());
@@ -629,11 +642,7 @@ void updateFreelist(TxnImpl* t)
         for (std::size_t i = 0; i < chunks; ++i) {
             const std::size_t first = i * chunkPages;
             const std::size_t n = std::min(chunkPages, record.size() - first);
-            WritableSlice w;
-            treePut(c, freeKey(t->txnid, i).slice(), Slice(nullptr, n * sizeof(PageNo)),
-                    PutMode::Upsert, &w);
-            for (std::size_t index = 0; index < n; ++index)
-                writeLittle(w.data() + index * sizeof(PageNo), record[first + index]);
+            putFreeChunk(c, freeKey(t->txnid, i).slice(), record.data() + first, n, runs);
         }
         // A previous round may have needed more chunks than this one.
         for (std::size_t i = chunks; i < written; ++i)

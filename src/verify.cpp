@@ -10,6 +10,7 @@
 #include <string>
 
 #include "nosql/internal/core.hpp"
+#include "nosql/internal/free_list.hpp"
 #include "nosql/internal/key_prefix.hpp"
 
 namespace nosql {
@@ -278,15 +279,11 @@ void checkIntegrity(Txn& t)
         const TxnImpl::GcKey key(freeKeyTxn(k), freeKeyChunk(k));
         if (std::find(impl->consumed.begin(), impl->consumed.end(), key) != impl->consumed.end())
             continue;
-        const Slice v = cursorValue(fc);
-        if (v.size() % sizeof(PageNo) != 0)
-            throw Error(ErrorCode::Corrupted, "invalid free-list value length");
-        listed += v.size() / sizeof(PageNo);
-        for (std::size_t i = 0; i < v.size() / sizeof(PageNo); ++i) {
-            PageNo page = 0;
-            page = readLittle<PageNo>(v.data() + i * sizeof page);
-            c.claim(page);
-        }
+        std::size_t n = 0;
+        if (!forEachFreePage(cursorValue(fc), freeChunkLimit(impl->pageSize()), n,
+                             [&](PageNo page) { c.claim(page); }))
+            throw Error(ErrorCode::Corrupted, "invalid free-list value");
+        listed += n;
     }
     if (impl->readOnly) {
         if (std::uint64_t(impl->meta.deferredCount) + impl->meta.inlineCount > impl->meta.deferredPages.size())

@@ -166,11 +166,11 @@ void checkWarmTransactions(Durability mode, bool cachedChecksums)
         t.db(kIndex, DbFlags::Create);
     });
     Workload work{env};
-    // Safe needs longer to warm: the free list's commit scratch reaches its
-    // high-water mark late in this workload, and it does so later once separator
-    // keys are shorter. The high-water mark is reached once, after which the
-    // measured window allocates nothing.
-    const int warm = mode == Durability::Safe ? 2000 : 1000;
+    // The free list's commit scratch reaches its high-water mark late in this
+    // workload, later still once separator keys are shorter or free-list
+    // chunks hold runs (a store at format 8). The mark is reached once, after
+    // which the measured window allocates nothing.
+    const int warm = 2000;
     const int measured = mode == Durability::Safe ? 50 : 1000;
     const auto write = [&](int i) {
         work.write();
@@ -244,7 +244,7 @@ TEST(warmOptimisticTransactionsDoNotAllocate)
             if (mode == Durability::Lazy && seq % 1000 == 0)
                 env.sync();
         };
-        for (int i = 0; i < 1000; ++i)
+        for (int i = 0; i < 2000; ++i)  // as above: the free list's scratch warms late
             write();
         const std::size_t before = heapCalls.load();
         for (int i = 0; i < 1000; ++i)
