@@ -29,8 +29,13 @@ namespace nosql {
 /// for point operations: a read, or a write, conflicts with any later commit
 /// that wrote the same (sub-database, key). Range scans are not tracked, so a
 /// phantom insert into a scanned range is not detected; use Env::writeTxn for
-/// transactions that depend on a range. A plain Env::writeTxn commit names no
-/// keys, so it conflicts with every optimistic transaction that began before it.
+/// transactions that depend on a range.
+///
+/// Plain Env::writeTxn transactions that begin while any optimistic one exists
+/// record the keys they write, and conflict only on those. One that began
+/// before any existed, or that cleared or dropped a sub-database, names no
+/// keys, and conflicts with every optimistic transaction that began before it
+/// committed.
 ///
 /// A transaction's buffers are recycled per thread, so a steady stream of
 /// small transactions allocates nothing once warm (values returned by get()

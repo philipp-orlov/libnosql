@@ -157,9 +157,10 @@ strike against it; libsql adds one on top), the storage-engine-level gaps are re
   one store commit, and one pair of device flushes under `Safe`, for the group.
   Application work overlaps across threads, and fsync-bound commits share their
   flushes. Pages are still written by one writer at a time, and two threads
-  whose commits strictly alternate gain nothing. Range scans are not validated,
-  and plain `writeTxn` commits name no keys, so they conflict with every
-  optimistic transaction that began before them.
+  whose commits strictly alternate gain nothing. Range scans are not validated.
+  A plain `writeTxn` records its keys while optimistic transactions exist; one
+  that began before any did, or that clears or drops a sub-database, names no
+  keys and conflicts with every optimistic transaction that began before it.
 * **Copy-on-write write amplification.** Every commit rewrites the full
   root-to-leaf path for every key touched, plus free-list maintenance (see
   "Reclamation and Memory" in `docs/design.md`). Engines with a buffer pool + WAL

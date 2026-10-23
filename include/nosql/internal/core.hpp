@@ -192,9 +192,9 @@ struct EnvImpl
     /// Keys written by recent commits, for validating optimistic transactions;
     /// see occ_log.hpp. Touched only under writeMtx.
     OccLog occLog;
-    /// Keys the commit about to publish wrote, set by an optimistic commit while
-    /// it holds writeMtx. Null for a plain write, which occLog records as unknown.
-    const std::vector<std::uint64_t>* occNext = nullptr;
+    /// Optimistic transactions alive now. While any are, write transactions
+    /// record the keys they write, so a commit conflicts only on those.
+    std::atomic<unsigned> occActive{0};
     /// Group commit: optimistic commits queue here, and whichever committer
     /// finds no leader running becomes one and applies a batch of them in a
     /// single write transaction. Guarded by occMtx.
@@ -389,6 +389,15 @@ struct TxnImpl
     /// Set for the final free-list write, which must describe a set that can no
     /// longer change under it.
     bool noSpend = false;
+
+    /// Keys this write transaction wrote, for validating optimistic ones
+    /// (occ_log.hpp). Kept only while optimistic transactions exist, which
+    /// beginWriter samples; without that, or after a clear or a drop, the
+    /// commit is recorded as having written keys nobody can name.
+    bool occTrack = false;
+    bool occUnknown = false;
+    std::vector<std::uint64_t> occWritten;
+    static constexpr std::size_t kOccTrackLimit = 1u << 20;
 
     /// Bumped by every structural mutation; cursors use it to detect that they
     /// must re-anchor before touching a page pointer again.

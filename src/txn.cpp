@@ -62,6 +62,7 @@ void TxnImpl::releaseResources()
     carryNext.clear();
     reclaim.clear();
     consumed.clear();
+    occWritten.clear();
     std::size_t remaining = kRetainedScratchBytes;
     if (dirty.retainedBytes() > remaining)
         dirty.release();
@@ -91,6 +92,7 @@ void TxnImpl::releaseResources()
     trim(reclaim);
     trim(consumed);
     trim(carryNext);
+    trim(occWritten);
     region.reset();
     seen.clear();
     parent = nullptr;
@@ -123,6 +125,8 @@ void TxnImpl::reset()
     inlinePages.clear();
     noAbsorb = false;
     noSpend = false;
+    occTrack = false;
+    occUnknown = false;
     seq = 1;
 }
 
@@ -743,8 +747,7 @@ void publish(EnvImpl& e, TxnImpl* t, const Meta& m)
     e.carryOver.swap(t->carryNext);
     e.freeTreePages = std::uint64_t(std::int64_t(e.freeTreePages) + t->freeTreeDelta);
     e.commitGen.store(m.txnid, std::memory_order_release);
-    e.occLog.record(m.txnid, e.occNext);
-    e.occNext = nullptr;
+    e.occLog.record(m.txnid, t->occTrack && !t->occUnknown ? &t->occWritten : nullptr);
     // Every snapshot still validated against, a reader's or an optimistic
     // commit's, is at or after the oldest one held, so entries at or before it
     // can no longer conflict with anything.
@@ -867,6 +870,12 @@ void commitNested(TxnImpl* t)
     }
     p->loose.insert(p->loose.end(), t->loose.begin(), t->loose.end());
     p->pending.insert(p->pending.end(), t->pending.begin(), t->pending.end());
+    // The child's writes become the parent's; an aborted child's never do.
+    if (p->occTrack) {
+        p->occUnknown = p->occUnknown || t->occUnknown;
+        if (!p->occUnknown)
+            p->occWritten.insert(p->occWritten.end(), t->occWritten.begin(), t->occWritten.end());
+    }
 
     p->lastPgno = t->lastPgno;
     p->namedDbs = t->namedDbs;
@@ -964,6 +973,12 @@ void txnCommit(TxnImpl* t)
     // usable and only this transaction is lost. Everything after that point
     // poisons the handle (see Env::writeTxn).
     bool untouched = true;
+    if (t->occTrack && !t->occUnknown) {
+        // Sorted now, so publish() can hand it to the log under the lock as is.
+        std::sort(t->occWritten.begin(), t->occWritten.end());
+        t->occWritten.erase(std::unique(t->occWritten.begin(), t->occWritten.end()),
+                            t->occWritten.end());
+    }
     try {
         flushNamedTrees(t);
         updateFreelist(t);

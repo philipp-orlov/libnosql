@@ -176,9 +176,16 @@ becomes the leader: it takes up to 256 queued commits (about 8 MiB of buffered
 bytes), takes the writer slot, validates each against `occLog` (the keys each
 commit since its snapshot wrote) and against the keys already accepted into the
 group, replays the accepted ones into one write transaction, and commits it
-once. `publish()` records the group's written keys under its transaction id; a
-plain write transaction is recorded as writing unknown keys. Members whose
-writes fail to apply are dropped and the group retried without them.
+once. Members whose writes fail to apply are dropped and the group retried
+without them.
+
+`publish()` records each commit's written keys under its transaction id. A write
+transaction collects them (`TxnImpl::occWritten`, filled by the public write
+calls) when `EnvImpl::occActive` says an optimistic transaction exists as it
+begins; the leader's own writer always does. A nested transaction's keys join
+its parent's when it commits. A writer that began with no optimistic
+transaction about, cleared or dropped a sub-database, or wrote more than about
+a million keys is recorded as writing unknown keys.
 
 Waiters yield a few hundred times before sleeping on their own condition, and
 the leader wakes only its group and the next leader: without device flushes a
