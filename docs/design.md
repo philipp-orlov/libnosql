@@ -263,6 +263,39 @@ commit path on its own mutex and holds neither the metadata mutex nor the
 writer slot across the I/O, so readers and the writer carry on during it.
 `EnvStats::durableTxn` reports the newest commit known to be on stable storage.
 
+### Pipelined commits: `Safe` with `pipelineCommits()`
+
+`Env::Options::pipelineCommits()` keeps `Safe`'s promises (a commit returns
+only once it is durable, and readers see only durable commits) while letting a
+commit's meta page reach the device with the next commit's data, as under
+`NoMetaSync`. Two metas are published separately: `EnvImpl::writerMeta`, the
+newest commit, which the next writer builds on, and `EnvImpl::meta`, the newest
+durable commit, which readers take.
+
+A pipelined commit flushes its data together with the previous commit's
+waiting meta page (one barrier, `landPipelined` then publishing that commit to
+readers and waking its committer), writes its own meta with no barrier,
+publishes it to writers, and hands back the writer slot. Its committer then
+waits in `awaitDurable` for a later commit's data flush to carry the meta, for
+at most about two data flushes, and only when a successor is in sight (a writer
+holding or waiting for the slot, a queued optimistic commit, or the last meta
+having been carried, which marks a stream); otherwise it flushes the meta
+itself. A lone writer so pays nothing extra. Reclamation is pinned at the
+newest durable commit, which lags by at most one, exactly as under
+`NoMetaSync`, so a power cut that loses the waiting meta falls back to a whole
+snapshot. A failed flush, by the carrier or by the commit itself, poisons the
+environment and fails every commit still waiting. The group-commit leader
+hands the lead on before waiting, or the next group could never carry its meta.
+
+Off by default. Measured on a 4-core VM whose flushes take about 85 µs (data)
+and 50 µs (meta), the saved meta flush is a small part of a commit and the
+effect is within ±25%: up a little for plain writers and two-thread optimistic
+streams, down about 13% for eight-thread optimistic groups, which form smaller
+when the commit cycle is one flush rather than two. With each device flush
+modelled at 1 ms, plain writers at two and eight threads gain 1.7×, two-thread
+optimistic streams 1.55× and eight-thread groups 16%; one thread gains nothing,
+having no successor to carry its meta.
+
 ### The meta page's own durability
 
 The meta record is written only after the data barrier has returned, so a meta

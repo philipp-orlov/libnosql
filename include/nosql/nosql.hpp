@@ -26,6 +26,13 @@
 #include "nosql/error.hpp"
 #include "nosql/slice.hpp"
 
+/// The default of Env::Options::pipelineCommits(). A build can turn it on for
+/// every store (CMake option NOSQL_PIPELINE_COMMITS_DEFAULT), which is how the
+/// whole test suite runs pipelined.
+#ifndef NOSQL_PIPELINE_COMMITS_DEFAULT
+#define NOSQL_PIPELINE_COMMITS_DEFAULT 0
+#endif
+
 namespace nosql {
 
 namespace internal {
@@ -359,8 +366,12 @@ public:
 
 private:
     friend class Env;
+    friend class OptimisticTxn;  // commits a group without waiting for its flush
     friend void checkIntegrity(Txn&);
     friend void copySnapshot(Txn&, const std::filesystem::path&);
+    /// commit(), except that a pipelined commit's wait for durability is left
+    /// to the caller: its id goes to `*awaitLater` (zero when there is none).
+    void commit(std::uint64_t* awaitLater);
     Txn(std::shared_ptr<internal::EnvImpl> e, std::shared_ptr<internal::TxnImpl> t) noexcept
         : env_(std::move(e)), impl_(std::move(t))
     {}
@@ -461,6 +472,19 @@ public:
             durability_ = d;
             return *this;
         }
+        /// Under Durability::Safe, let a commit's meta page reach the device
+        /// with the next commit's data instead of with a flush of its own. A
+        /// commit still returns only once it is durable, and readers still see
+        /// only durable commits; what changes is that the writer slot is handed
+        /// on before the meta is flushed, so the next writer builds on the
+        /// commit meanwhile, and a stream of commits costs one device flush
+        /// each instead of two. A commit that no other writer follows soon
+        /// flushes its own meta. Ignored under the other durability modes.
+        Options& pipelineCommits(bool on = true)
+        {
+            pipelineCommits_ = on;
+            return *this;
+        }
         /// Under Durability::Lazy, the first commit at least this long after
         /// the last sync runs the next one. Only commits (and Env::sync())
         /// sync: there is no timer thread, so a store that stops committing
@@ -546,6 +570,7 @@ public:
         bool preallocate_ = true;
         bool allowNetworkFilesystem_ = false;
         Durability durability_ = Durability::Safe;
+        bool pipelineCommits_ = NOSQL_PIPELINE_COMMITS_DEFAULT;
         std::chrono::milliseconds syncInterval_{1000};
         bool cacheReadChecksums_ = false;
         std::chrono::milliseconds revalidateAfter_{60000};

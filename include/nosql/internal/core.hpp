@@ -134,7 +134,12 @@ struct EnvImpl
     /// these, so they are held until every transaction that could have seen
     /// one has finished.
     std::vector<std::shared_ptr<MappedRegion>> staleRegions;
-    Meta meta{};  ///< newest committed snapshot
+    /// Newest snapshot readers may take: the newest commit, or under
+    /// pipelined commits the newest durable one.
+    Meta meta{};
+    /// Newest commit, which the next writer builds on. Ahead of `meta` only
+    /// while a pipelined commit's meta waits for its flush. Guarded by `mtx`.
+    Meta writerMeta{};
 
     /// Newest meta known to be on stable storage (guarded by `mtx`) and the
     /// slot holding it (guarded by `syncMtx`). The next meta page written goes
@@ -142,10 +147,23 @@ struct EnvImpl
     /// reclamation never recycles a page this snapshot still names.
     TxnId durableTxn = 0;
     unsigned durableSlot = 0;
-    /// NoMetaSync only: a meta written into the mapping but not flushed. The
-    /// next data flush carries it to the device. Guarded by `syncMtx`.
+    /// NoMetaSync and pipelined Safe: a meta written into the mapping but not
+    /// flushed. The next data flush carries it to the device; a pipelined one
+    /// is published to readers then (`unflushedMeta`). Guarded by `syncMtx`.
     TxnId unflushedTxn = 0;
     unsigned unflushedSlot = 0;
+    Meta unflushedMeta{};
+    /// Safe with Options::pipelineCommits(): see writeMeta() in txn.cpp.
+    bool pipelined = false;
+    /// Writers holding or waiting for the writer slot, and how long the last
+    /// data flush took: what a pipelined commit judges whether to wait for a
+    /// successor to carry its meta by.
+    std::atomic<unsigned> writersPending{0};
+    std::atomic<std::int64_t> dataFlushNs{0};
+    /// Whether the last pipelined meta reached the device with a later commit's
+    /// data rather than by its own flush: whether commits are arriving as a
+    /// stream, so that the next is worth waiting for even before it shows.
+    std::atomic<bool> lastMetaCarried{false};
     /// Serializes every meta-page write and flush: commits that flush and
     /// Env::sync(). Taken before `mtx`, never while holding it, and never
     /// held across anything but the sync itself.
@@ -224,6 +242,7 @@ struct EnvImpl
     /// single write transaction. Guarded by occMtx.
     std::mutex occMtx;
     std::vector<OccPending*> occQueue;
+    std::atomic<unsigned> occWaiting{0};  ///< occQueue.size(), readable without occMtx
     bool occLeader = false;
     /// The transaction holding back every other optimistic commit, after losing
     /// too many conflicts (see OptimisticTxn); null when there is none. Commits
@@ -309,6 +328,14 @@ struct EnvImpl
 
 /// Make the newest commit durable (see Env::sync). Caller holds `syncMtx`.
 void syncEnv(EnvImpl& e, bool force);
+
+/// Commits a top-level or nested transaction. A pipelined top-level commit
+/// returns once its meta is written, not flushed; it then waits for that here,
+/// or, with `awaitLater`, leaves the id to wait on there (zero for none).
+void txnCommit(TxnImpl* t, TxnId* awaitLater = nullptr);
+/// Returns once commit `id` is durable: carried to the device by a later
+/// commit's data flush when one follows soon, or flushed here.
+void awaitDurable(EnvImpl& e, TxnId id);
 
 /// The environment behind a public handle, or ErrorCode::InvalidArgument once
 /// it has been closed.

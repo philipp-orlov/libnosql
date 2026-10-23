@@ -46,6 +46,9 @@ struct OptimisticTxn::Impl
     std::vector<std::uint64_t> touched;  // every key read or written, and scanned dbs
     std::vector<std::uint64_t> written;  // every key written, and its db's occDbKey
     std::vector<std::uint32_t> scanOps;  // scratch for scan(): buffered ops in range
+    /// The group this thread led, while it waits for the group's commit to be
+    /// durable after handing the lead on. Kept for its capacity.
+    std::vector<internal::OccPending*> ledGroup;
     bool scanning = false;
     /// Latest op per key hash, built once a transaction has kIndexAfter writes;
     /// below that a backward scan is faster.
@@ -292,6 +295,7 @@ void takeBatch(EnvImpl& e)
     }
     e.occBatch.assign(e.occQueue.begin(), e.occQueue.begin() + std::ptrdiff_t(n));
     e.occQueue.erase(e.occQueue.begin(), e.occQueue.begin() + std::ptrdiff_t(n));
+    e.occWaiting.store(unsigned(e.occQueue.size()), std::memory_order_relaxed);
 }
 
 }  // namespace
@@ -313,6 +317,17 @@ OptimisticTxn::OptimisticTxn(Env& env, unsigned attempt)
             e.occExclusive = impl_.get();
             impl_->exclusive = true;
             e.occTurn.wait(lk, [&] { return e.occQueue.empty() && !e.occLeader; });
+        }
+        if (impl_->exclusive && e.pipelined) {
+            // A drained group may still wait for its meta to land under
+            // pipelined commits; the snapshot must include it, or that commit
+            // could still win this transaction's keys.
+            TxnId newest;
+            {
+                std::lock_guard<std::mutex> lk(e.mtx);
+                newest = e.writerMeta.txnid;
+            }
+            internal::awaitDurable(e, newest);
         }
         impl_->snapshot = env.readTxn();
         impl_->snapshotId = impl_->snapshot.id();
@@ -479,9 +494,11 @@ void OptimisticTxn::abort()
     finish();
 }
 
-void OptimisticTxn::applyBatch(EnvImpl& e) noexcept
+std::uint64_t OptimisticTxn::applyBatch(EnvImpl& e) noexcept
 {
     std::vector<internal::OccPending*>& batch = e.occBatch;
+    if (batch.empty())
+        return 0;
     Env env(batch.front()->txn->env);
     // Validate the transactions that have lost most often first, keeping
     // arrival order otherwise. Without this the leader's own thread, which
@@ -506,7 +523,7 @@ void OptimisticTxn::applyBatch(EnvImpl& e) noexcept
             bool wrote = false;
             for (internal::OccPending* p : batch) {
                 if (p->conflict || p->error)
-                    continue;
+                    continue;  // refused in an earlier round
                 const Impl& t = *p->txn;
                 if (e.occLog.conflicts(t.snapshotId, t.touched) ||
                     internal::occIntersects(e.occBatchWritten, t.touched)) {
@@ -525,12 +542,14 @@ void OptimisticTxn::applyBatch(EnvImpl& e) noexcept
                 wrote = true;
             }
             if (!wrote)
-                return;  // nothing to publish; the writer aborts
+                return 0;  // nothing to publish; the writer aborts
             // The writer recorded the keys it replayed, which is what the log
             // keeps for this group (an optimistic transaction is alive, this
-            // one, so it was tracking).
-            w.commit();
-            return;
+            // one, so it was tracking). A pipelined commit returns before its
+            // meta is flushed; the leader waits for that after handing on.
+            std::uint64_t pending = 0;
+            w.commit(&pending);
+            return pending;
         } catch (const RetryWithout&) {
         } catch (...) {
             // The writer slot or the commit failed: nothing in the group was
@@ -539,7 +558,7 @@ void OptimisticTxn::applyBatch(EnvImpl& e) noexcept
             for (internal::OccPending* p : batch)
                 if (!p->conflict && !p->error)
                     p->error = err;
-            return;
+            return 0;
         }
     }
 }
@@ -558,15 +577,20 @@ void OptimisticTxn::commit()
         // While another transaction has the turn, its commit goes alone.
         e.occTurn.wait(lk, [&] { return e.occExclusive == nullptr || e.occExclusive == &t; });
         e.occQueue.push_back(&me);
+        e.occWaiting.store(unsigned(e.occQueue.size()), std::memory_order_relaxed);
+        // Lead only when there is work queued: under pipelined commits this
+        // commit may already sit in a group whose leader has handed the lead on
+        // and waits for the group's meta to land; that leader wakes it.
+        const auto mustWait = [&] { return e.occLeader || e.occQueue.empty(); };
         while (!me.done.load(std::memory_order_relaxed)) {
-            if (e.occLeader) {
+            if (mustWait()) {
                 // Without device flushes a group takes microseconds, about what
                 // sleeping and waking costs, so look a few times before sleeping.
                 lk.unlock();
                 for (unsigned i = 0; i < kSpins && !me.done.load(std::memory_order_acquire); ++i)
                     std::this_thread::yield();
                 lk.lock();
-                if (!me.done.load(std::memory_order_relaxed) && e.occLeader)
+                if (!me.done.load(std::memory_order_relaxed) && mustWait())
                     me.cv.wait(lk);
                 continue;
             }
@@ -575,21 +599,39 @@ void OptimisticTxn::commit()
             e.occLeader = true;
             takeBatch(e);
             lk.unlock();
-            applyBatch(e);
+            const std::uint64_t pending = applyBatch(e);
             lk.lock();
-            // Notified under the lock, and before `done`: a member may return
-            // and destroy its condition as soon as it can see `done`.
-            for (internal::OccPending* p : e.occBatch) {
-                if (p != &me)
-                    p->cv.notify_one();
-                p->done.store(true, std::memory_order_release);  // last touch of *p
-            }
-            e.occBatch.clear();
+            // Hand the lead on first: under pipelined commits the next group's
+            // data flush is what carries this group's meta to the device.
+            std::vector<internal::OccPending*>& group = t.ledGroup;
+            group.swap(e.occBatch);
             e.occLeader = false;
             if (!e.occQueue.empty())
                 e.occQueue.front()->cv.notify_one();  // the next leader
             else if (e.occExclusive)
                 e.occTurn.notify_all();  // the queue it waits on has drained
+            if (pending) {
+                lk.unlock();
+                std::exception_ptr lost;
+                try {
+                    internal::awaitDurable(e, pending);
+                } catch (...) {
+                    lost = std::current_exception();
+                }
+                lk.lock();
+                if (lost)
+                    for (internal::OccPending* p : group)
+                        if (!p->conflict && !p->error)
+                            p->error = lost;
+            }
+            // Notified under the lock, and before `done`: a member may return
+            // and destroy its condition as soon as it can see `done`.
+            for (internal::OccPending* p : group) {
+                if (p != &me)
+                    p->cv.notify_one();
+                p->done.store(true, std::memory_order_release);  // last touch of *p
+            }
+            group.clear();
         }
     }
     const bool conflict = me.conflict;

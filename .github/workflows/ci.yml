@@ -1,5 +1,7 @@
 # Builds and tests on every push and pull request: a Release build, an
-# address+undefined sanitizer build, and a thread sanitizer build.
+# address+undefined sanitizer build and a thread sanitizer build, and the
+# Release and thread sanitizer builds again with every store's commits pipelined
+# (NOSQL_PIPELINE_COMMITS_DEFAULT), since that path is opt-in.
 name: ci
 
 on:
@@ -59,6 +61,41 @@ jobs:
         run: cmake --build build
       - name: Test
         # The allocation-counting suites are not built here; see tests/CMakeLists.txt.
+        env:
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+        run: ctest --test-dir build --output-on-failure -j4
+
+  release-pipelined:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DNOSQL_PIPELINE_COMMITS_DEFAULT=ON
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -j4
+
+  tsan-pipelined:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build clang-18 libclang-rt-18-dev
+      - name: Fit the address space to the thread sanitizer
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_CXX_COMPILER=clang++-18 -DNOSQL_ENABLE_TSAN=ON
+          -DNOSQL_PIPELINE_COMMITS_DEFAULT=ON
+      - name: Build
+        run: cmake --build build
+      - name: Test
         env:
           TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
         run: ctest --test-dir build --output-on-failure -j4

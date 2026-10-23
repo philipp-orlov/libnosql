@@ -156,8 +156,11 @@ strike against it; libsql adds one on top), the storage-engine-level gaps are re
   and applied in a group with the other optimistic commits waiting at the time:
   one store commit, and one pair of device flushes under `Safe`, for the group.
   Application work overlaps across threads, and fsync-bound commits share their
-  flushes. Pages are still written by one writer at a time, and two threads
-  whose commits strictly alternate gain nothing. A scan is validated as a read
+  flushes. Pages are still written by one writer at a time. Two threads whose
+  commits strictly alternate share no flushes by grouping;
+  `Env::Options::pipelineCommits()` lets each commit's meta ride on the next
+  commit's data flush instead, which on slow flushes is worth up to about 1.7×
+  (see "Pipelined commits" in `docs/design.md`). A scan is validated as a read
   of its whole sub-database, so any later write there, in range or not, makes
   it conflict.
   A plain `writeTxn` records its keys while optimistic transactions exist; one

@@ -10,6 +10,8 @@ option(NOSQL_BUILD_TOOLS "Build the nosql command line tool" ON)
 option(NOSQL_BUILD_BENCHMARKS "Build the benchmarks (see benchmarks/)" OFF)
 option(NOSQL_ENABLE_ASAN "Build with address+undefined sanitizers" OFF)
 option(NOSQL_ENABLE_TSAN "Build with the thread sanitizer" OFF)
+option(NOSQL_PIPELINE_COMMITS_DEFAULT
+       "Make Env::Options::pipelineCommits() default to on (the suite runs this way in CI)" OFF)
 # Subsystems layered on the key-value store. A consumer that uses only the KV
 # layer (libsql does) switches off what it does not use: less code to build,
 # patch and audit, and no parsers of segment or archive files from disk.
@@ -71,6 +73,9 @@ target_link_libraries(nosql PUBLIC Threads::Threads)
 if(NOSQL_ENABLE_ASAN AND NOT MSVC)
     target_compile_options(nosql PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer -g)
     target_link_options(nosql PUBLIC -fsanitize=address,undefined)
+endif()
+if(NOSQL_PIPELINE_COMMITS_DEFAULT)
+    target_compile_definitions(nosql PUBLIC NOSQL_PIPELINE_COMMITS_DEFAULT=1)
 endif()
 if(NOSQL_ENABLE_TSAN AND NOT MSVC)
     if(NOSQL_ENABLE_ASAN)

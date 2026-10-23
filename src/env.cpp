@@ -93,7 +93,7 @@ EnvImpl::~EnvImpl()
 /// snapshot a crash falls back to intact.
 TxnId EnvImpl::oldestSnapshot() const
 {
-    const TxnId durable = std::min<TxnId>(durableTxn, meta.txnid);
+    const TxnId durable = std::min<TxnId>(durableTxn, writerMeta.txnid);
     if (readers.empty())
         return durable;
     return std::min<TxnId>(readers.front().first, durable);
@@ -250,6 +250,7 @@ void formatStore(EnvImpl& e)
     os::flushRange(e.fd, e.region->m, 0, 2 * e.pageSize);
     os::syncFile(e.fd, true);
     e.meta = m;
+    e.writerMeta = m;
     e.durableTxn = 0;
     e.durableSlot = 0;
 }
@@ -316,6 +317,7 @@ void loadMeta(EnvImpl& e)
     if (!best)
         throw Error(ErrorCode::Corrupted, "no usable meta page in " + e.path.string());
     e.meta = *best;
+    e.writerMeta = *best;
     e.durableTxn = best->txnid;
     e.durableSlot = bestSlot;
     if (std::uint64_t(e.meta.deferredCount) + e.meta.inlineCount > e.meta.deferredPages.size())
@@ -367,6 +369,7 @@ Env Env::Options::open(const std::filesystem::path& path) const
     e->maxDbs = maxDbs_;
     e->readOnly = readOnly_;
     e->dura = durability_;
+    e->pipelined = pipelineCommits_ && durability_ == Durability::Safe;
     e->syncIntervalNs = std::chrono::nanoseconds(syncInterval_).count();
     e->lastSyncNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now().time_since_epoch())

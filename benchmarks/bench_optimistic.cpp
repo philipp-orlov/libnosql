@@ -8,7 +8,7 @@
 // holding the writer slot. Under optimistic() only the commit does, so the work
 // of different threads overlaps and a conflict costs a retry.
 //
-// usage: bench_optimistic [txns-per-thread] [keys] [work-us] [none|safe]
+// usage: bench_optimistic [txns-per-thread] [keys] [work-us] [none|safe] [pipelined]
 
 #include <atomic>
 #include <chrono>
@@ -48,12 +48,12 @@ struct Result
     std::uint64_t usedPages = 0;  // pages in use at the end, free list included
 };
 
-Result run(const std::filesystem::path& file, Durability dura, bool optimisticMode,
+Result run(const std::filesystem::path& file, Durability dura, bool pipelined, bool optimisticMode,
            unsigned threads, unsigned txnsPerThread, unsigned keys, unsigned workUs)
 {
     std::filesystem::remove(file);
     std::filesystem::remove(file.string() + ".lck");
-    Env e = Env::configure().sync(dura).open(file);
+    Env e = Env::configure().sync(dura).pipelineCommits(pipelined).open(file);
     e.write([&](Txn& t) {
         for (unsigned i = 0; i < keys; ++i)
             t.mainDb().put(keyOf(i), "0");
@@ -109,16 +109,17 @@ int main(int argc, char** argv)
     const unsigned workUs = argc > 3 ? unsigned(std::atoi(argv[3])) : 50;
     const Durability dura =
         (argc > 4 && std::string(argv[4]) == "safe") ? Durability::Safe : Durability::None;
+    const bool pipelined = argc > 5 && std::string(argv[5]) == "pipelined";
     const std::filesystem::path file =
         std::filesystem::temp_directory_path() / "nosql-bench-optimistic.db";
 
-    std::printf("txns/thread=%u keys=%u work=%uus durability=%s\n", txnsPerThread, keys, workUs,
-                dura == Durability::Safe ? "safe" : "none");
+    std::printf("txns/thread=%u keys=%u work=%uus durability=%s%s\n", txnsPerThread, keys, workUs,
+                dura == Durability::Safe ? "safe" : "none", pipelined ? " pipelined" : "");
     std::printf("%8s %12s %14s %14s %10s %12s %10s\n", "threads", "mode", "txn/s", "elapsed (s)",
                 "retries", "txns/commit", "pages");
     for (unsigned threads : {1u, 2u, 4u, 8u}) {
         for (bool opt : {false, true}) {
-            const Result r = run(file, dura, opt, threads, txnsPerThread, keys, workUs);
+            const Result r = run(file, dura, pipelined, opt, threads, txnsPerThread, keys, workUs);
             const double total = double(threads) * txnsPerThread;
             std::printf("%8u %12s %14.0f %14.3f %10llu %12.1f %10llu\n", threads,
                         opt ? "optimistic" : "writeTxn", total / r.seconds, r.seconds,
