@@ -166,7 +166,8 @@ namespace {
 void chargeDirty(const EnvImpl* env, std::uint64_t bytes)
 {
     const auto current = env->dirtyBytes.load(std::memory_order_relaxed);
-    if (env->dirtyLimit && (bytes > env->dirtyLimit || current > env->dirtyLimit - bytes))
+    if (env->dirtyLimit && !env->commitOverBudget &&
+        (bytes > env->dirtyLimit || current > env->dirtyLimit - bytes))
         throw Error(ErrorCode::OutOfMemory,
                     "dirty page budget exceeded; reduce the batch or raise dirtyLimit");
 }
@@ -1201,8 +1202,10 @@ void txnCommit(TxnImpl* t, TxnId* awaitLater)
                             t->occWritten.end());
     }
     try {
+        e->commitOverBudget = e->spill;
         flushNamedTrees(t);
         updateFreelist(t);
+        e->commitOverBudget = false;
         {
             std::lock_guard<std::mutex> lk(e->mtx);
             e->growLocked((t->lastPgno + 1) * std::uint64_t(e->pageSize));
@@ -1216,6 +1219,7 @@ void txnCommit(TxnImpl* t, TxnId* awaitLater)
         if (e->ship)
             e->ship->capture(e->writerMeta, t->flushRuns, t->region->m.base);
     } catch (...) {
+        e->commitOverBudget = false;
         if (!untouched)
             e->failed.store(true);
         finishWriter(t);

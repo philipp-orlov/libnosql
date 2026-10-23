@@ -143,6 +143,11 @@ struct EnvImpl
     /// Nothing else clears it: a new transaction has nothing to spill until
     /// it makes such a page, and that clears it.
     bool spillExhausted = false;
+    /// A commit is writing its catalog and free-list entries. Those are no
+    /// batch the caller can reduce, and spilling cannot run under them, so
+    /// with spilling on they may take the budget past dirtyLimit: a
+    /// transaction whose writes fit is not lost at commit.
+    bool commitOverBudget = false;
 
     std::shared_ptr<MappedRegion> region;  ///< current mapping
     /// Mappings replaced by a growth (only where the mapping cannot grow in
