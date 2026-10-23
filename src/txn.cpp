@@ -135,6 +135,7 @@ void TxnImpl::reset()
     occTrack = false;
     occUnknown = false;
     occLastDbi = ~0u;
+    prefixFormat = false;
     seq = 1;
 }
 
@@ -891,7 +892,9 @@ TxnId writeMeta(TxnImpl* t)
     EnvImpl* e = t->env;
     Meta m = t->meta;
     std::memcpy(m.magic, kMagic, sizeof m.magic);
-    m.version = kFormatVersion;
+    // A store's version only rises: to 8 when it first holds P_PREFIX leaves.
+    m.version =
+        std::max<std::uint32_t>(m.version, t->prefixFormat ? kFormatVersion : kOldestFormatVersion);
     m.pageSize = std::uint32_t(e->pageSize);
     m.txnid = t->txnid;
     m.lastPgno = t->lastPgno;
@@ -1041,6 +1044,7 @@ void commitNested(TxnImpl* t)
     }
     p->loose.insert(p->loose.end(), t->loose.begin(), t->loose.end());
     p->pending.insert(p->pending.end(), t->pending.begin(), t->pending.end());
+    p->prefixFormat = p->prefixFormat || t->prefixFormat;
     // The child's writes become the parent's; an aborted child's never do.
     if (p->occTrack) {
         p->occUnknown = p->occUnknown || t->occUnknown;

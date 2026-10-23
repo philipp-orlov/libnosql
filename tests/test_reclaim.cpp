@@ -60,7 +60,9 @@ TEST(deleteEverythingThenRefillReusesPages)
         for (int i = 0; i < 8000; ++i)
             d.put(tst::keyOf(i), tst::blob(50, i));
     });
-    CHECK(e.stats().usedPages < full * 2);
+    // The refill lands in front of "tick", so its splits are balanced rather
+    // than append-dense; compressed leaves make `full` smaller, not that.
+    CHECK(e.stats().usedPages < full * (NOSQL_PREFIX_KEYS_DEFAULT ? 3 : 2));
     e.read([&](Txn& t) { checkIntegrity(t); });
 }
 

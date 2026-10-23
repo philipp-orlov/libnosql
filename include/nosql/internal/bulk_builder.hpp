@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "nosql/internal/core.hpp"
+#include "nosql/internal/key_prefix.hpp"
 
 namespace nosql::internal {
 
@@ -129,6 +130,10 @@ public:
             tree_.flags |= std::uint32_t(key.size()) << 16;
         }
         const bool big = leafNodeSize(key.size(), value.size(), false) > maxNodeSize(file_.pageSize());
+        if (tree_.flags & std::uint32_t(DbFlags::PrefixKeys)) {
+            stage(key, value, flags, big);
+            return;
+        }
         const auto bytes = leafNodeSize(key.size(), value.size(), big);
         if (pageRoom(leaf_.page()) < bytes + 2)
             flushLeaf();  // previous_ is still the flushed leaf's last key
@@ -153,6 +158,8 @@ public:
 
     Tree finish()
     {
+        if (!staged_.empty())
+            layoutStaged();
         if (leaf_.page()->nkeys)
             flushLeaf();
         for (std::size_t level = 0; level < levels_.size(); ++level) {
@@ -181,6 +188,91 @@ public:
     }
 
 private:
+    /// A PrefixKeys tree's leaf entry, held until its leaf is full: what an
+    /// entry costs depends on the prefix of the keys it ends up with.
+    struct Staged
+    {
+        std::string key, pay;
+        std::uint32_t vsize = 0;
+        std::uint16_t flags = 0;
+    };
+    struct View
+    {
+        Slice key;
+        std::uint32_t vsize;
+        std::uint16_t flags;
+        const std::byte* pay;
+        std::uint32_t paylen;
+    };
+
+    static std::size_t nodeBytes(const Staged& s, std::size_t plen) noexcept
+    {
+        return 2 + leafNodeSize(s.key.size() - plen, s.vsize, (s.flags & N_BIGDATA) != 0);
+    }
+
+    void stage(Slice key, Slice value, std::uint16_t flags, bool big)
+    {
+        Staged s;
+        s.key = key.string();
+        s.vsize = std::uint32_t(value.size());
+        s.flags = std::uint16_t(flags | (big ? N_BIGDATA : 0));
+        // The leaf's keys so far share stagedPrefix_ bytes; with this one they
+        // share what it has in common with the first. Sizes at that prefix are
+        // recomputed only when it shrinks, which it does at most once per byte.
+        const std::size_t plen =
+            staged_.empty() ? key.size()
+                            : std::min(stagedPrefix_, commonPrefix(Slice(staged_[0].key), key));
+        if (plen != stagedPrefix_) {
+            stagedAt_ = 0;
+            for (const Staged& e : staged_)
+                stagedAt_ += nodeBytes(e, plen);
+        }
+        const std::size_t usable = file_.pageSize() - kPageHdr - kPageChecksumBytes;
+        const std::size_t whole = stagedWhole_ + nodeBytes(s, 0);
+        const std::size_t shared = stagedAt_ + nodeBytes(s, plen) + prefixBlock(plen);
+        if (!staged_.empty() && std::min(whole, shared) > usable) {
+            layoutStaged();
+            flushLeaf();  // previous_ is still the flushed leaf's last key
+            stage(key, value, flags, big);
+            return;
+        }
+        if (big) {
+            unsigned count = 0;
+            const PageNo first = file_.writeOverflow(value, count);
+            tree_.overflowPages += count;
+            Little<PageNo> encoded(first);
+            s.pay.assign(reinterpret_cast<const char*>(&encoded), sizeof encoded);
+        } else {
+            s.pay = value.string();
+        }
+        if (staged_.empty())
+            leaf_.minimum = key.string();
+        previous_ = key.string();
+        stagedPrefix_ = plen;
+        stagedWhole_ = whole;
+        stagedAt_ += nodeBytes(s, plen);
+        staged_.push_back(std::move(s));
+        ++tree_.entries;
+    }
+
+    /// Lays the staged entries out in the leaf buffer, ready for flushLeaf().
+    void layoutStaged()
+    {
+        std::vector<View> views;
+        views.reserve(staged_.size());
+        for (const Staged& s : staged_)
+            views.push_back({Slice(s.key), s.vsize, s.flags,
+                             reinterpret_cast<const std::byte*>(s.pay.data()),
+                             std::uint32_t(s.pay.size())});
+        const unsigned n = unsigned(views.size());
+        layoutLeaf(leaf_.page(), 0, views.data(), n, leafPrefixFor(views.data(), n),
+                   file_.pageSize());
+        staged_.clear();
+        stagedPrefix_ = 0;
+        stagedWhole_ = 0;
+        stagedAt_ = 0;
+    }
+
     void child(std::size_t level, const std::string& minimum, PageNo number, std::uint64_t entries)
     {
         if (level >= kMaxDepth - 1)
@@ -237,6 +329,10 @@ private:
     std::vector<Buffer> levels_;
     std::string previous_;
     std::string lastOfPrevious_;  ///< last key of the leaf flushed before this one
+    std::vector<Staged> staged_;
+    std::size_t stagedPrefix_ = 0;  ///< bytes the staged keys share
+    std::size_t stagedWhole_ = 0;   ///< their leaf bytes stored whole
+    std::size_t stagedAt_ = 0;      ///< their leaf bytes at stagedPrefix_, block excluded
 };
 
 }  // namespace nosql::internal

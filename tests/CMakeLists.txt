@@ -7,7 +7,7 @@ set(NOSQL_TEST_LIST Basic:basic Env:env Cursor:cursor Named:named Nested:nested
     Overflow:overflow Reclaim:reclaim Steady:steady Memory:memory
     Mvcc:mvcc Torture:torture Format:format Checksum:checksum Hardening:hardening
     AllocBudget:alloc_budget Optimistic:optimistic Separators:separators Pipeline:pipeline
-    Power:power Spill:spill)
+    Power:power Spill:spill Prefix:prefix)
 # The thread sanitizer brings its own allocator, and slows the store enough to
 # move when its containers reach their high-water marks: the suites that count
 # allocations measure neither concurrency nor anything true of a normal build.

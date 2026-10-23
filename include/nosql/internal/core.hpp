@@ -475,6 +475,10 @@ struct TxnImpl
     unsigned occLastDbi = ~0u;  // sub-database whose occDbKey was recorded last
     static constexpr std::size_t kOccTrackLimit = 1u << 20;
 
+    /// It created a PrefixKeys sub-database: the commit raises the store to the
+    /// format version that reads P_PREFIX leaves.
+    bool prefixFormat = false;
+
     /// Bumped by every structural mutation; cursors use it to detect that they
     /// must re-anchor before touching a page pointer again.
     std::uint64_t seq = 1;
@@ -605,6 +609,8 @@ struct CursorImpl
     std::vector<std::byte> anchorSpare;
     /// Cursor::erase's copy of the key it erases, kept for its capacity.
     std::vector<std::byte> erasedKey;
+    /// The key last read from a P_PREFIX leaf, assembled whole (leafKeyAt).
+    std::vector<std::byte> keyBuf;
     /// Set for cursors handed to callers, so the transaction -- and the store
     /// under it -- outlive them.
     std::shared_ptr<TxnImpl> keepalive;
@@ -654,6 +660,9 @@ bool cursorPrev(CursorImpl& c);
 void cursorRevalidate(CursorImpl& c);
 
 Slice cursorKey(CursorImpl& c);
+/// Leaf `p`'s key `i` whole: in place, or on a P_PREFIX leaf assembled in the
+/// cursor, where it lasts until the cursor reads another.
+Slice leafKeyAt(CursorImpl& c, const Page* p, unsigned i);
 Slice cursorValue(CursorImpl& c);
 /// The value of leaf node `i`; out of line only for overflow values.
 Slice leafValueOverflow(TxnImpl* t, const Page* p, unsigned i);

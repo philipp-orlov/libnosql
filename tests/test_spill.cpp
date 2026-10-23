@@ -243,10 +243,11 @@ TEST(aSpillWithoutAWriteStillReanchorsCursors)
     State expect;
     env.write([&](Txn& txn) {
         // A deep tree: its writes claim more headroom than the main tree's.
-        Db deep = txn.db("deep", DbFlags::Create);
-        // Long keys with one long prefix: branch separators stay long too.
+        // Long keys in reverse order with one long suffix: separators stay
+        // long, and no build compresses its leaves.
+        Db deep = txn.db("deep", DbFlags::Create | DbFlags::ReverseKey);
         for (int i = 0; i < 300; ++i)
-            deep.put(std::string(900, 'a') + tst::keyOf(std::uint64_t(i)), "v");
+            deep.put(tst::keyOf(std::uint64_t(i)) + std::string(900, 'a'), "v");
         Db db = txn.mainDb();
         for (int i = 0; i < 2000; ++i) {
             const std::string key = tst::keyOf(std::uint64_t(i) * 10);

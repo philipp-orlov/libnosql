@@ -450,9 +450,14 @@ Db Txn::db(Slice name, DbFlags flags)
     EnvImpl* e = t->env;
     unsigned dbi = 0;
     const std::uint32_t persist = std::uint32_t(flags) & (std::uint32_t(DbFlags::IntegerKey) |
-                                                          std::uint32_t(DbFlags::ReverseKey));
-    if (persist == (std::uint32_t(DbFlags::IntegerKey) | std::uint32_t(DbFlags::ReverseKey)))
+                                                          std::uint32_t(DbFlags::ReverseKey) |
+                                                          std::uint32_t(DbFlags::PrefixKeys));
+    const std::uint32_t order = persist & ~std::uint32_t(DbFlags::PrefixKeys);
+    if (order == (std::uint32_t(DbFlags::IntegerKey) | std::uint32_t(DbFlags::ReverseKey)))
         throw Error(ErrorCode::InvalidArgument, "conflicting key order flags");
+    // A shared prefix bounds a page's keys only in byte order.
+    if ((flags & DbFlags::PrefixKeys) && order)
+        throw Error(ErrorCode::InvalidArgument, "PrefixKeys needs byte-ordered keys");
     for (unsigned index = kCatalogDbi + 1; index < t->dbs.size(); ++index) {
         const auto& slot = t->dbs[index];
         if (slot.loaded && slot.name == name.view()) {
@@ -505,11 +510,15 @@ Db Txn::db(Slice name, DbFlags flags)
             throw Error(ErrorCode::ReadOnly, "cannot create a sub-database in a read transaction");
         if (t->namedDbs >= e->maxDbs)
             throw Error(ErrorCode::TooManyDbs, "maximum number of live databases reached");
-        tr = emptyTree(persist);
+        tr = emptyTree(
+            persist |
+            (NOSQL_PREFIX_KEYS_DEFAULT && !order ? std::uint32_t(DbFlags::PrefixKeys) : 0u));
         created = true;
+        if (tr.flags & std::uint32_t(DbFlags::PrefixKeys))
+            t->prefixFormat = true;
     } else if (persist && (tr.flags & 0xffffu) != persist) {
         throw Error(ErrorCode::Incompatible,
-                    "sub-database '" + name.string() + "' was created with different key ordering");
+                    "sub-database '" + name.string() + "' was created with different key flags");
     }
 
     dbi = unsigned(t->dbs.size());
@@ -799,7 +808,7 @@ bool landed(CursorImpl& c, bool ok, Slice& key, Slice& value)
 {
     if (!ok)
         return false;
-    key = nodeKey(c.pg[c.top], c.idx[c.top]);
+    key = leafKeyAt(c, c.pg[c.top], c.idx[c.top]);
     value = leafValue(c.txn, c.pg[c.top], c.idx[c.top]);
     return true;
 }
@@ -824,7 +833,7 @@ bool Cursor::next(Slice& key, Slice& value)
         const unsigned i = c->idx[c->top] + 1u;
         if (i < p->nkeys) {
             c->idx[c->top] = std::uint16_t(i);
-            key = nodeKey(p, i);
+            key = leafKeyAt(*c, p, i);
             value = leafValue(c->txn, p, i);
             return true;
         }
@@ -912,10 +921,10 @@ bool Cursor::erase()
 namespace {
 
 /// Window test, honouring the sub-database's own key ordering.
-bool inside(const CursorImpl& c, const std::optional<std::string>& hi,
+bool inside(CursorImpl& c, const std::optional<std::string>& hi,
             const std::optional<std::string>& pfx)
 {
-    const Slice k = nodeKey(c.pg[c.top], c.idx[c.top]);
+    const Slice k = leafKeyAt(c, c.pg[c.top], c.idx[c.top]);
     if (pfx && !k.startsWith(Slice(*pfx)))
         return false;
     if (hi && c.cmp()(k, Slice(*hi)) >= 0)
@@ -952,7 +961,9 @@ void compact(const std::filesystem::path& src, const std::filesystem::path& dst)
     AtomicFile output(dst);
     BulkFile destination(output.fd(), st.pageSize);
     Txn rt = s.readTxn();
+    bool prefixed = false;  // the copy holds P_PREFIX leaves: format version 8
     auto copyTree = [&](nosql::Db from) {
+        prefixed = prefixed || (from.flags() & DbFlags::PrefixKeys);
         BulkTree builder(destination, std::uint32_t(from.flags()));
         auto cur = from.cursor();
         for (bool ok = cur.first(); ok; ok = cur.next()) {
@@ -977,6 +988,7 @@ void compact(const std::filesystem::path& src, const std::filesystem::path& dst)
         ++meta.namedDbs;
     }
     meta.catalogTree = catalog.finish();
+    meta.version = prefixed ? kFormatVersion : kOldestFormatVersion;
     destination.finish(meta);
     rt.abort();
     output.close();

@@ -10,6 +10,7 @@
 #include <string>
 
 #include "nosql/internal/core.hpp"
+#include "nosql/internal/key_prefix.hpp"
 
 namespace nosql {
 
@@ -44,22 +45,34 @@ struct Checker
         }
     }
 
-    void checkPageHeader(const Page* p)
+    void checkPageHeader(const Page* p, const Tree& tr)
     {
-        if (p->flags != P_BRANCH && p->flags != P_LEAF)
+        const bool prefixed = p->flags == (P_LEAF | P_PREFIX);
+        if (p->flags != P_BRANCH && p->flags != P_LEAF && !prefixed)
             bad("invalid tree page flags", p->pgno);
-        if (p->lower < kPageHdr || pageUpper(p) > ps || p->lower > pageUpper(p))
+        if (prefixed && !(tr.flags & std::uint32_t(DbFlags::PrefixKeys)))
+            bad("prefix-compressed leaf in a tree that does not compress", p->pgno);
+        // Nodes end below the checksum, and on a P_PREFIX leaf below its prefix.
+        std::size_t top = ps - kPageChecksumBytes;
+        std::size_t plen = 0;
+        if (prefixed) {
+            plen = readLittle<std::uint16_t>(reinterpret_cast<const std::byte*>(p) + top - 2);
+            if (plen == 0 || prefixBlock(plen) > top - pageUpper(p))
+                bad("key prefix block out of range", p->pgno);
+            top -= prefixBlock(plen);
+        }
+        if (p->lower < kPageHdr || pageUpper(p) > top || p->lower > pageUpper(p))
             bad("slot/data boundaries out of range", p->pgno);
         if (std::size_t(p->lower) != kPageHdr + std::size_t(p->nkeys) * 2)
             bad("slot count disagrees with the low-water mark", p->pgno);
         std::vector<std::pair<std::size_t, std::size_t>> spans;
         for (unsigned i = 0; i < p->nkeys; ++i) {
             const std::uint16_t off = slots(p)[i];
-            if (off < pageUpper(p) || off > ps || ps - off < sizeof(LeafNode) || off % 4 != 0)
+            if (off < pageUpper(p) || off > top || top - off < sizeof(LeafNode) || off % 4 != 0)
                 bad("node offset out of range", p->pgno);
-            if (off + nodeSize(p, i) > ps)
+            if (off + nodeSize(p, i) > top)
                 bad("node runs past the end of the page", p->pgno);
-            if (nodeKey(p, i).size() > maxKeySize(ps))
+            if (plen + nodeKey(p, i).size() > maxKeySize(ps))
                 bad("key exceeds page limit", p->pgno);
             spans.emplace_back(off, off + nodeSize(p, i));
         }
@@ -84,7 +97,7 @@ struct Checker
         const Page* p = t->getPage(pgno, true);
         if (p->pgno != pgno)
             bad("page header carries the wrong page number", pgno);
-        checkPageHeader(p);
+        checkPageHeader(p, tr);
 
         // Branch slot 0 is the -infinity child and must carry no key at all;
         // every other slot has to be strictly greater than the one before it.
@@ -100,14 +113,18 @@ struct Checker
             if (depth != tr.depth)
                 bad("leaf depth differs from tree descriptor", pgno);
             ++leafPages;
+            // Within a P_PREFIX leaf the suffixes order as the keys do: they
+            // all follow the same prefix, in byte order.
             if (p->nkeys) {
-                span.lo = nodeKey(p, 0).string();
-                span.hi = nodeKey(p, p->nkeys - 1).string();
+                const std::string prefix = leafPrefix(p, ps).string();
+                span.lo = prefix + nodeKey(p, 0).string();
+                span.hi = prefix + nodeKey(p, p->nkeys - 1).string();
             }
             span.entries = p->nkeys;
             for (unsigned i = 0; i < p->nkeys; ++i) {
                 const LeafNode* n = lnode(p, i);
-                if ((n->flags & ~(N_BIGDATA | N_SUBDB)) != 0 || n->ksize == 0)
+                if ((n->flags & ~(N_BIGDATA | N_SUBDB)) != 0 ||
+                    n->ksize + leafPrefix(p, ps).size() == 0)
                     bad("invalid leaf flags or empty key", pgno);
                 if (n->flags & N_SUBDB) {
                     if (!catalog || (n->flags & N_BIGDATA) || n->vsize != sizeof(Tree))
