@@ -45,8 +45,9 @@ TEST(resealedGarbageIsAnErrorNotACrash)
 }
 
 /// What fuzz/fuzz_pages.cpp found, each fixed: a leaf flag read before its
-/// node was checked (treeListSubdbs), and an unaligned `upper` that a writer
-/// then added a misaligned node below.
+/// node was checked (treeListSubdbs), an unaligned `upper` that a writer then
+/// added a misaligned node below, and a cycle of child pointers a cursor's
+/// descent followed past the depth its path holds.
 TEST(fuzzerFindingsStayFixed)
 {
     static const std::string kFound[] = {
@@ -55,6 +56,7 @@ TEST(fuzzerFindingsStayFixed)
         std::string("\x0e\x0e\x0e\x00\x2f", 5),
         std::string("\x0e\x0e\x0e\x00\xcd\x0e\x0e", 7),
         std::string("\x0e\x0e\x0e\x1f\x1f\x00\x1f\x00\x0e\x00\x7a", 11),
+        std::string("\xfb\xfe\xfb\xfe\x42\x56\xfe\xfe\x50\xfe\x03\x42\x56\xfe\xfe\x50\xfe\x03\x3d\x00", 20),
     };
     tst::Scratch scratch("corrupt-found");
     const auto file = scratch.file();
