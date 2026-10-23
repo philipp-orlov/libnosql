@@ -459,6 +459,26 @@ between ARM64 and x86-64 unchanged. There is no third-party checksum implementat
 Page/run, meta, blob, bundle, segment and index checks use full 64-bit digests;
 tar header checks retain the additive checksum required by tar.
 
+A checksum proves a page holds the bytes that were written, not that their
+writer told the truth: a buggy build, or anyone who re-seals a page they edited,
+produces pages that pass it and lie about their layout. Every branch or leaf read
+from the file has its header checked with the checksum (`validateHeader`: page
+type, slot array, a 4-aligned `upper`, the prefix block), and a reader checks each
+node it reaches before following it (`checkNode` in the searches, descents,
+ranks and cursor reads), so no slot, key or value it follows leaves the page. That
+costs a few comparisons per node visited and measured nothing on point lookups.
+Where a writer copies a page to change it, and where the read cache checks a page
+once for many reads, every node is checked (`validateNodes`). A tree pointer that
+lands on an overflow run, an overflow pointer that lands on a tree page, a value
+longer than its run, and a free-list entry naming a page outside the store are all
+`Corrupted`; dropping a cyclic tree stops at the depth limit. The `corrupt` suite
+re-seals a thousand lying pages of a store holding every kind of page and requires
+that opening, reading and writing each ends in an `Error`; under ASan with
+undefined behaviour made fatal it is a fixed-seed fuzzer, and `fuzz/fuzz_pages.cpp`
+(`NOSQL_BUILD_FUZZERS`, clang) is the open-ended libFuzzer one. Its findings, a
+catalog flag read before its node was checked and a misaligned `upper` a writer
+then placed nodes under, are fixed and replayed by the suite.
+
 Every committed-page access validates by default. Dirty private pages are sealed
 only before publication. Overflow bounds are checked before hashing a run.
 `checkIntegrity` walks all roots and named trees, checks bounds, node overlap,
@@ -602,7 +622,7 @@ replaying a correct record with its flushes taken out must fail some, and does.
 It models a device that honours flushes; one that acknowledges a flush it has not
 performed is outside what any ordering can survive.
 
-The suite is 27 CTest binaries in a full build (21 core, `mq` and `mqsteady`,
+The suite is 28 CTest binaries in a full build (22 core, `mq` and `mqsteady`,
 `replication`, `replicationtorture` and `fault`, and `tar`); the optional-layer
 tests are registered only when their subsystem is built, and `hardening` covers the
 file-safety and failure-poisoning behavior of "Opening a Store" and "Failure".

@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cstring>
 
+#include "nosql/error.hpp"
 #include "nosql/internal/format.hpp"
 
 namespace nosql::internal {
@@ -141,6 +142,101 @@ void layoutLeaf(Page* p, PageNo pgno, const E* e, unsigned n, std::size_t plen,
     p->nkeys = std::uint16_t(n);
     p->lower = std::uint16_t(kPageHdr + 2 * std::size_t(n));
     p->upper = std::uint16_t(upper);
+}
+
+// A checksum proves a page holds the bytes that were written, not that their
+// writer told the truth. Pages read from the file are checked in three steps,
+// each where it is cheapest: their header on every checked read
+// (validateHeader), each node as a reader reaches it (checkNode), and every
+// node at once where a writer copies the page to change it or the read cache
+// checks it once for many reads (validateNodes).
+
+/// End of the node area of slotted page `p`: under its checksum, and under
+/// the prefix block of a P_PREFIX leaf. Only for a page whose header passed.
+inline std::size_t nodeTop(const Page* p, std::size_t ps) noexcept
+{
+    std::size_t top = ps - kPageChecksumBytes;
+    if (p->flags & P_PREFIX)
+        top -=
+            prefixBlock(readLittle<std::uint16_t>(reinterpret_cast<const std::byte*>(p) + top - 2));
+    return top;
+}
+
+/// A branch or leaf page's type, slot array and prefix block lie inside it.
+inline void validateHeader(const Page* p, std::size_t ps)
+{
+    const auto bad = [](const char* what) { throw Error(ErrorCode::Corrupted, what); };
+    const std::uint16_t flags = p->flags;
+    std::size_t top = ps - kPageChecksumBytes;
+    if (flags == (P_LEAF | P_PREFIX)) {
+        const std::size_t plen =
+            readLittle<std::uint16_t>(reinterpret_cast<const std::byte*>(p) + top - 2);
+        if (!plen || prefixBlock(plen) > top - kPageHdr)
+            bad("leaf key prefix out of range");
+        top -= prefixBlock(plen);
+    } else if (flags != P_LEAF && flags != P_BRANCH) {
+        bad("page is neither a branch nor a leaf");
+    }
+    // A writer adds nodes downwards from `upper`, so it stays 4-aligned too.
+    if (p->lower != kPageHdr + 2 * std::size_t(p->nkeys) || p->lower > p->upper || p->upper > top ||
+        (p->upper & 3))
+        bad("page slot and node bounds out of range");
+}
+
+/// Whether node `i` of a page whose header passed lies inside the node area
+/// ending at `top`. Reads the node's header only once its offset is known to
+/// leave room for one.
+inline bool nodeFits(const Page* p, unsigned i, std::size_t top) noexcept
+{
+    const auto* base = reinterpret_cast<const std::byte*>(p);
+    const std::size_t off = slots(p)[i];
+    const bool leaf = isLeaf(p);
+    const std::size_t header = leaf ? sizeof(LeafNode) : sizeof(BranchNode);
+    if (off < p->upper || (off & 3) || off + header > top)
+        return false;
+    if (!leaf)
+        return header + std::size_t(readLittle<std::uint16_t>(base + off + 6)) <= top - off;
+    const std::size_t ksize = readLittle<std::uint16_t>(base + off + 2);
+    const std::size_t payload = (readLittle<std::uint16_t>(base + off) & N_BIGDATA)
+                                    ? sizeof(PageNo)
+                                    : std::size_t(readLittle<std::uint32_t>(base + off + 4));
+    return header + ksize + payload <= top - off;
+}
+
+/// Node `i` of a page read from the file lies inside it; `i` < nkeys.
+inline void checkNode(const Page* p, unsigned i, std::size_t ps)
+{
+    if (!nodeFits(p, i, nodeTop(p, ps)))
+        throw Error(ErrorCode::Corrupted, "node out of range");
+}
+
+/// Node `i`'s key, checked to lie inside the node area ending at `top`.
+inline Slice checkedKey(const Page* p, unsigned i, std::size_t top)
+{
+    if (!nodeFits(p, i, top))
+        throw Error(ErrorCode::Corrupted, "node out of range");
+    return nodeKey(p, i);
+}
+
+/// Branch `p`'s child `i` and the entries under it, the node checked first.
+inline PageNo checkedChild(const Page* p, unsigned i, std::size_t ps)
+{
+    checkNode(p, i, ps);
+    return branchChild(p, i);
+}
+inline std::uint64_t checkedCount(const Page* p, unsigned i, std::size_t ps)
+{
+    checkNode(p, i, ps);
+    return branchCount(p, i);
+}
+
+/// Every node of a page whose header passed lies inside it.
+inline void validateNodes(const Page* p, std::size_t ps)
+{
+    const std::size_t top = nodeTop(p, ps);
+    for (unsigned i = 0; i < p->nkeys; ++i)
+        if (!nodeFits(p, i, top))
+            throw Error(ErrorCode::Corrupted, "node out of range");
 }
 
 }  // namespace nosql::internal

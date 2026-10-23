@@ -17,6 +17,7 @@
 #include "nosql/internal/arena.hpp"
 #include "nosql/internal/buffer_pool.hpp"
 #include "nosql/internal/format.hpp"
+#include "nosql/internal/key_prefix.hpp"
 #include "nosql/internal/occ_log.hpp"
 #include "nosql/internal/os.hpp"
 #include "nosql/internal/page_table.hpp"
@@ -506,7 +507,17 @@ struct TxnImpl
     }
     std::size_t pageSize() const noexcept { return env->pageSize; }
 
-    Page* getPage(PageNo p, bool forceValidation = false) const
+    /// What a getPage() caller follows the page number to: a branch or leaf,
+    /// or the first page of an overflow run. A page of the other kind is
+    /// damage, however good its checksum.
+    enum class PageKind
+    {
+        Tree,
+        Overflow,
+        Either
+    };
+
+    Page* getPage(PageNo p, bool forceValidation = false, PageKind kind = PageKind::Tree) const
     {
         if (Page* d = dirty.find(p))
             return d;
@@ -515,21 +526,43 @@ struct TxnImpl
                 return d;
         // One comparison guards every descent against a garbage child pointer
         // turning into a wild read; it costs far less than the lookup above.
-        if (p > lastPgno)
+        if (p > lastPgno || p < 2)
             throw Error(ErrorCode::Corrupted, "page number out of range");
         Page* page = env->mapPage(*region, p);
+        // The kind every time, the cached check or not: a page checked as one
+        // kind may be reached as the other through a damaged pointer.
+        const bool overflow = isOverflow(page);
+        if ((kind == PageKind::Tree && overflow) || (kind == PageKind::Overflow && !overflow))
+            throw Error(ErrorCode::Corrupted, "page is not of the kind that points to it");
         // Readers may trust a check this process already made since the page
         // was last written; writers always re-verify what they are about to
         // copy forward, so damage can never be sealed under a fresh checksum.
         if (!forceValidation && readOnly && env->validation.enabled()) {
             if (env->validation.isValidated(p))
                 return page;
-            validatePage(page, pageSize(), lastPgno - p + 1);
+            // Checked once for many reads: every node, not just the header.
+            validateFetched(page, p);
+            if (!overflow)
+                validateNodes(page, pageSize());
             env->validation.markValidated(p);
             return page;
         }
-        validatePage(page, pageSize(), lastPgno - p + 1);
+        validateFetched(page, p);
         return page;
+    }
+    /// The first page of the overflow run holding `vsize` value bytes.
+    Page* getOverflow(PageNo p, std::uint64_t vsize, bool forceValidation = false) const
+    {
+        Page* run = getPage(p, forceValidation, PageKind::Overflow);
+        if (vsize > std::uint64_t(ovPages(run)) * pageSize() - kPageHdr - kPageChecksumBytes)
+            throw Error(ErrorCode::Corrupted, "large value is longer than its overflow run");
+        return run;
+    }
+    void validateFetched(const Page* page, PageNo p) const
+    {
+        validatePage(page, pageSize(), lastPgno - p + 1);
+        if (!isOverflow(page))
+            validateHeader(page, pageSize());
     }
     bool isOwnDirty(PageNo p) const noexcept { return dirty.find(p) != nullptr; }
 
@@ -668,6 +701,7 @@ Slice cursorValue(CursorImpl& c);
 Slice leafValueOverflow(TxnImpl* t, const Page* p, unsigned i);
 inline Slice leafValue(TxnImpl* t, const Page* p, unsigned i)
 {
+    checkNode(p, i, t->pageSize());
     const LeafNode* n = lnode(p, i);
     if (!(n->flags & N_BIGDATA))
         return Slice(reinterpret_cast<const std::byte*>(n) + sizeof(LeafNode) + n->ksize, n->vsize);
