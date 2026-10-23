@@ -44,6 +44,8 @@ struct Result
 {
     double seconds = 0;
     std::uint64_t retries = 0;
+    std::uint64_t commits = 0;    // store commits; fewer than transactions when grouped
+    std::uint64_t usedPages = 0;  // pages in use at the end, free list included
 };
 
 Result run(const std::filesystem::path& file, Durability dura, bool optimisticMode,
@@ -83,12 +85,15 @@ Result run(const std::filesystem::path& file, Durability dura, bool optimisticMo
     };
 
     std::vector<std::thread> workers;
+    const std::uint64_t gen0 = e.commitGeneration();
     const auto t0 = Clock::now();
     for (unsigned i = 0; i < threads; ++i)
         workers.emplace_back(body, 1000 + i);
     for (auto& w : workers)
         w.join();
     Result r;
+    r.commits = e.commitGeneration() - gen0;
+    r.usedPages = e.stats().usedPages;
     r.seconds = std::chrono::duration<double>(Clock::now() - t0).count();
     if (optimisticMode)
         r.retries = attempts.load() - std::uint64_t(threads) * txnsPerThread;
@@ -109,13 +114,17 @@ int main(int argc, char** argv)
 
     std::printf("txns/thread=%u keys=%u work=%uus durability=%s\n", txnsPerThread, keys, workUs,
                 dura == Durability::Safe ? "safe" : "none");
-    std::printf("%8s %12s %14s %14s %10s\n", "threads", "mode", "txn/s", "elapsed (s)", "retries");
+    std::printf("%8s %12s %14s %14s %10s %12s %10s\n", "threads", "mode", "txn/s", "elapsed (s)",
+                "retries", "txns/commit", "pages");
     for (unsigned threads : {1u, 2u, 4u, 8u}) {
         for (bool opt : {false, true}) {
             const Result r = run(file, dura, opt, threads, txnsPerThread, keys, workUs);
             const double total = double(threads) * txnsPerThread;
-            std::printf("%8u %12s %14.0f %14.3f %10llu\n", threads, opt ? "optimistic" : "writeTxn",
-                        total / r.seconds, r.seconds, static_cast<unsigned long long>(r.retries));
+            std::printf("%8u %12s %14.0f %14.3f %10llu %12.1f %10llu\n", threads,
+                        opt ? "optimistic" : "writeTxn", total / r.seconds, r.seconds,
+                        static_cast<unsigned long long>(r.retries),
+                        r.commits ? total / double(r.commits) : 0.0,
+                        static_cast<unsigned long long>(r.usedPages));
         }
     }
     std::filesystem::remove(file);

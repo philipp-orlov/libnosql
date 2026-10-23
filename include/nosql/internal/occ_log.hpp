@@ -22,9 +22,27 @@ inline std::uint64_t occKey(std::string_view db, std::string_view key) noexcept
     return h ^ (std::hash<std::string_view>{}(key) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2));
 }
 
-/// The keys each recent top-level commit wrote, for backward validation of
-/// optimistic transactions. Only touched by the writer, which holds the writer
-/// slot both when it appends (publish) and when it validates.
+/// True if two sorted, unique hash lists share an element.
+inline bool occIntersects(const std::vector<std::uint64_t>& a,
+                          const std::vector<std::uint64_t>& b) noexcept
+{
+    auto i = a.begin();
+    auto j = b.begin();
+    while (i != a.end() && j != b.end()) {
+        if (*i == *j)
+            return true;
+        if (*i < *j)
+            ++i;
+        else
+            ++j;
+    }
+    return false;
+}
+
+/// The keys each recent top-level commit wrote (not those it only read), for
+/// backward validation of optimistic transactions. Only touched by the writer,
+/// which holds the writer slot both when it appends (publish) and when it
+/// validates.
 ///
 /// A ring buffer rather than a deque: each slot keeps its key vector's capacity,
 /// so a steady stream of commits allocates nothing once the log has warmed up.
@@ -55,7 +73,7 @@ public:
             const Entry& e = ring_[(head_ + i) % ring_.size()];
             if (e.txnid <= snapshot)
                 break;  // entries are in ascending txnid order
-            if (e.unknown || intersects(e.keys, keys))
+            if (e.unknown || occIntersects(e.keys, keys))
                 return true;
         }
         return false;
@@ -88,22 +106,6 @@ private:
             next[i] = std::move(ring_[(head_ + i) % ring_.size()]);
         ring_ = std::move(next);
         head_ = 0;
-    }
-
-    static bool intersects(const std::vector<std::uint64_t>& a,
-                           const std::vector<std::uint64_t>& b) noexcept
-    {
-        auto i = a.begin();
-        auto j = b.begin();
-        while (i != a.end() && j != b.end()) {
-            if (*i == *j)
-                return true;
-            if (*i < *j)
-                ++i;
-            else
-                ++j;
-        }
-        return false;
     }
 
     std::vector<Entry> ring_;

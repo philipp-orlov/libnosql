@@ -44,6 +44,9 @@ inline Slice shortestSeparator(Slice left, Slice right) noexcept
     return Slice(right.data(), std::min(right.size(), d + 1));
 }
 
+/// An optimistic commit waiting in EnvImpl::occQueue; defined in optimistic.cpp.
+struct OccPending;
+
 #ifdef NOSQL_NO_REPLICATION
 /// Stand-in when change shipping is compiled out: never instantiated (shipTo
 /// is refused), present so the commit path needs no conditionals.
@@ -192,6 +195,21 @@ struct EnvImpl
     /// Keys the commit about to publish wrote, set by an optimistic commit while
     /// it holds writeMtx. Null for a plain write, which occLog records as unknown.
     const std::vector<std::uint64_t>* occNext = nullptr;
+    /// Group commit: optimistic commits queue here, and whichever committer
+    /// finds no leader running becomes one and applies a batch of them in a
+    /// single write transaction. Guarded by occMtx.
+    std::mutex occMtx;
+    std::vector<OccPending*> occQueue;
+    bool occLeader = false;
+    /// The transaction holding back every other optimistic commit, after losing
+    /// too many conflicts (see OptimisticTxn); null when there is none. Commits
+    /// and would-be exclusive transactions wait on occTurn. Guarded by occMtx.
+    const void* occExclusive = nullptr;
+    std::condition_variable occTurn;
+    /// The leader's scratch, kept for its capacity. Only the leader touches it.
+    std::vector<OccPending*> occBatch;
+    std::vector<std::uint64_t> occBatchWritten;
+    std::vector<std::uint64_t> occMergeScratch;
 
     /// Page buffers recycled across transactions. Carries its own lock: it is
     /// touched from transaction teardown, which can run after writeMtx has
@@ -210,6 +228,12 @@ struct EnvImpl
     std::vector<std::pair<TxnId, unsigned>> readers;
     void readerAcquire(TxnId id);           // caller holds mtx
     void readerRelease(TxnId id) noexcept;  // caller holds mtx
+    /// Snapshots that optimistic commits still validate against after giving
+    /// back their reader slot: they hold back trimming of occLog, not page
+    /// reclamation. The same histogram as `readers`.
+    std::vector<std::pair<TxnId, unsigned>> occPins;
+    void occPinAcquire(TxnId id);           // caller holds mtx
+    void occPinRelease(TxnId id) noexcept;  // caller holds mtx
     unsigned readerCount() const noexcept
     {  // caller holds mtx
         unsigned n = 0;
