@@ -1385,9 +1385,12 @@ std::uint64_t cutFreeTail(TxnImpl* t)
 
 // ----------------------------------------------------------------- spill ---
 
-void TxnImpl::spill()
+void TxnImpl::spill(std::uint64_t room)
 {
-    const std::uint64_t target = env->dirtyLimit / 2;
+    // Half the budget, or less where the write to come needs more: a value
+    // near the budget's size still finds room once enough has gone out.
+    const std::uint64_t limit = env->dirtyLimit;
+    const std::uint64_t target = room < limit ? std::min(limit / 2, limit - room) : 0;
     const std::size_t ps = env->pageSize;
     // Coldest first, from this transaction and its ancestors alike: a page
     // that has not been touched for a while is the least likely to be soon,
@@ -1412,6 +1415,7 @@ void TxnImpl::spill()
     std::sort(list.begin(), list.end(), [](const SpillCandidate& x, const SpillCandidate& y) {
         return x.age > y.age || (x.age == y.age && x.pgno < y.pgno);
     });
+    const std::size_t candidates = list.size();
     std::size_t take = 0;
     for (std::uint64_t freed = 0; take < list.size() && freed < over; ++take)
         freed +=
@@ -1448,7 +1452,8 @@ void TxnImpl::spill()
     env->spilledPages.fetch_add(pages, std::memory_order_relaxed);
     // Everything it could write is written: the next spill would find only
     // what writes make dirty from here on.
-    env->spillExhausted = env->dirtyBytes.load(std::memory_order_relaxed) > target;
+    env->spillExhausted =
+        take == candidates && env->dirtyBytes.load(std::memory_order_relaxed) > target;
     // Cursors re-anchor rather than read a page they saw in a buffer.
     ++root()->seq;
 }

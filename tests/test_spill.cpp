@@ -383,6 +383,26 @@ TEST(aCommitsFreeListMayGoPastTheBudget)
     CHECK_EQ(env.stats().dirtyBytes, 0u);
 }
 
+/// A value whose buffer takes half the budget still fits: the spill before
+/// it frees what it needs, not only half the budget.
+TEST(aValueOfHalfTheBudgetSpillsWhatItNeeds)
+{
+    tst::Scratch scratch("spill-room");
+    Env env = Env::configure().pageSize(8192).sync(Durability::None).dirtyLimit(64u << 10).open(
+        scratch.file());
+    State expect;
+    env.write([&](Txn& txn) {
+        Db db = txn.mainDb();
+        for (int i = 0; i < 40; ++i) {
+            const std::string value = tst::blob(20000, std::uint64_t(i));  // a 32 KiB buffer
+            db.put(tst::keyOf(i), value);
+            expect[tst::keyOf(i)] = value;
+            CHECK(env.stats().dirtyBytes <= 64u << 10);
+        }
+    });
+    env.read([&](Txn& txn) { CHECK(contentsOf(txn) == expect); });
+}
+
 /// With spilling off the budget is a hard limit, as before.
 TEST(spillingOffFailsAtTheBudget)
 {
