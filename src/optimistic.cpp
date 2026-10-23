@@ -570,12 +570,23 @@ void OptimisticTxn::commit()
     EnvImpl& e = *t.env;
     internal::OccPending me;
     me.txn = &t;
+    struct Leaving
+    {
+        std::atomic<unsigned>* count = nullptr;
+        ~Leaving()
+        {
+            if (count)
+                count->fetch_sub(1, std::memory_order_relaxed);
+        }
+    } leaving;
     {
         std::unique_lock<std::mutex> lk(e.occMtx);
         // While another transaction has the turn, its commit goes alone.
         e.occTurn.wait(lk, [&] { return e.occExclusive == nullptr || e.occExclusive == &t; });
         e.occQueue.push_back(&me);
         e.occWaiting.store(unsigned(e.occQueue.size()), std::memory_order_relaxed);
+        e.occInCommit.fetch_add(1, std::memory_order_relaxed);
+        leaving.count = &e.occInCommit;
         // Lead only when there is work queued: under pipelined commits this
         // commit may already sit in a group whose leader has handed the lead on
         // and waits for the group's meta to land; that leader wakes it.

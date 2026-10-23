@@ -230,6 +230,11 @@ validated in order of conflicts already lost; from the eighth lost attempt a
 transaction holds back every other optimistic commit until it finishes, so a
 hot key cannot starve it.
 
+`EnvStats::optimisticCommits` counts `OptimisticTxn::commit()` calls in progress
+and `optimisticQueued` those waiting behind the group being applied: the queue's
+depth for monitoring, and what the tests wait on to line commits up in a known
+order instead of sleeping and hoping the scheduler did.
+
 ## Commit and Recovery
 
 1. Finalize named tree descriptors and the free tree.

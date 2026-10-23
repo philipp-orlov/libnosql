@@ -315,17 +315,34 @@ TEST(optimisticWriteSkewIsPrevented)
 
 namespace {
 
-/// Runs `fn` on its own thread once the writer slot is taken, and gives every
-/// such thread time to queue its commit before the slot is released. The first
-/// committer leads a group of its own and blocks on the slot; the ones after it
-/// queue behind it and go in the next group together.
+/// Waits until `done` holds, however slowly the machine runs; fails after a
+/// minute rather than hanging the suite.
+template <class Pred>
+void waitUntil(Pred done)
+{
+    const auto t0 = std::chrono::steady_clock::now();
+    while (!done()) {
+        if (std::chrono::steady_clock::now() - t0 > std::chrono::minutes(1))
+            CHECK(!"timed out waiting for the commit queue");
+        std::this_thread::yield();
+    }
+}
+
+/// Runs `fn` on its own thread once the writer slot is taken, and waits until
+/// its commit is queued before the next: the first committer leads a group of
+/// its own and blocks on the slot, the ones after it queue behind it in order
+/// and go in the next group together. Each `fn` must commit.
 struct HeldWriterSlot
 {
-    explicit HeldWriterSlot(Env& e) : blocker(e.writeTxn()) {}
-    void run(std::function<void()> fn, int settleMs = 100)
+    explicit HeldWriterSlot(Env& e) : env(e), blocker(e.writeTxn()) {}
+    void run(std::function<void()> fn)
     {
         threads.emplace_back(std::move(fn));
-        std::this_thread::sleep_for(std::chrono::milliseconds(settleMs));
+        const unsigned n = unsigned(threads.size());
+        waitUntil([&] {
+            const EnvStats s = env.stats();
+            return s.optimisticCommits == n && s.optimisticQueued == n - 1;
+        });
     }
     void release()
     {
@@ -333,6 +350,7 @@ struct HeldWriterSlot
         for (auto& t : threads)
             t.join();
     }
+    Env& env;
     Txn blocker;
     std::vector<std::thread> threads;
 };
@@ -353,10 +371,8 @@ TEST(optimisticGroupCommitAppliesQueuedCommitsTogether)
                     OptimisticTxn t(e);
                     t.put("", "k" + std::to_string(i), "v");
                     t.commit();
-                },
-                i == 0 ? 100 : 10);
+                });
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
         slot.release();
     }
     for (int i = 0; i < kThreads; ++i)
@@ -391,8 +407,8 @@ TEST(optimisticConflictInsideAGroupFailsOnlyTheLater)
         t.put("", "lead", "1");
         t.commit();
     });
-    slot.run(contender("a"), 10);
-    slot.run(contender("b"), 100);
+    slot.run(contender("a"));
+    slot.run(contender("b"));
     slot.release();
     CHECK_EQ(committed.load(), 1);
     CHECK_EQ(conflicted.load(), 1);
@@ -446,8 +462,7 @@ TEST(optimisticFailedMemberDoesNotSinkItsGroup)
             } catch (const Error& err) {
                 badCode = err.code();
             }
-        },
-        10);
+        });
     slot.run([&] {
         OptimisticTxn t(e);
         t.put("", "good", "1");
@@ -544,6 +559,8 @@ TEST(optimisticExclusiveAttemptHoldsBackOtherCommits)
             o.commit();
             otherCommitted = true;
         });
+        // A chance for the other commit to go ahead, which it must not take:
+        // on a slow machine the check is weaker, never wrong.
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
         const bool committedEarly = otherCommitted.load();
         t.commit();
@@ -586,7 +603,8 @@ TEST(optimisticWaitingCommitStillSeesConflictsAfterReleasingItsSnapshot)
             outcome = err.code();
         }
     });
-    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    // Its commit leads its own group and waits for the writer slot.
+    waitUntil([&] { return e.stats().optimisticCommits == 1; });
     blocker.mainDb().put("x", "blocker");
     blocker.commit();
     waiter.join();
@@ -761,8 +779,7 @@ TEST(optimisticScanConflictsInsideAGroup)
             OptimisticTxn t(e);
             t.put("items", "b", "2");
             t.commit();
-        },
-        10);
+        });
     slot.run([&] {
         OptimisticTxn t(e);
         scanAll(t, "items");
