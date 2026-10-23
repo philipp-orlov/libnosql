@@ -89,6 +89,12 @@ public:
         return size_ >= p.size_ && (p.size_ == 0 || std::memcmp(data_, p.data_, p.size_) == 0);
     }
 
+    bool endsWith(Slice p) const noexcept
+    {
+        return size_ >= p.size_ &&
+               (p.size_ == 0 || std::memcmp(data_ + size_ - p.size_, p.data_, p.size_) == 0);
+    }
+
     friend bool operator==(Slice a, Slice b) noexcept
     {
         return a.size_ == b.size_ && (a.size_ == 0 || std::memcmp(a.data_, b.data_, a.size_) == 0);
