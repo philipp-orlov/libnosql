@@ -41,9 +41,14 @@ void TxnImpl::releaseResources()
         for (const auto& [buf, npages] : owned)
             bytes += env->buffers.allocationSize(npages);
         env->buffers.release(owned.data(), owned.size());
-        env->dirtyBytes.fetch_sub(bytes, std::memory_order_relaxed);
+        env->dirtyBytes.fetch_sub(bytes - spilledBytes, std::memory_order_relaxed);
     }
     owned.clear();
+    spilledBytes = 0;
+    if (!spilled.empty())
+        spilled.release();  // a spilling transaction's table is not worth keeping
+    spillPool.clear();
+    spillList.clear();
     // `pool` only ever holds buffers that are also in `owned`, so dropping the
     // references here is enough.
     pool.clear();
@@ -93,6 +98,8 @@ void TxnImpl::releaseResources()
     trim(consumed);
     trim(carryNext);
     trim(occWritten);
+    trim(spillPool);
+    trim(spillList);
     region.reset();
     seen.clear();
     parent = nullptr;
@@ -150,6 +157,20 @@ void TxnImpl::loadSnapshot(const Meta& snapshot, std::shared_ptr<MappedRegion> m
     dbs[kFreeDbi].loaded = dbs[kMainDbi].loaded = dbs[kCatalogDbi].loaded = 1;
 }
 
+namespace {
+
+/// Refuses `bytes` more of dirty buffers past the budget. A budget, not a
+/// synchronization point: relaxed is enough.
+void chargeDirty(const EnvImpl* env, std::uint64_t bytes)
+{
+    const auto current = env->dirtyBytes.load(std::memory_order_relaxed);
+    if (env->dirtyLimit && (bytes > env->dirtyLimit || current > env->dirtyLimit - bytes))
+        throw Error(ErrorCode::OutOfMemory,
+                    "dirty page budget exceeded; reduce the batch or raise dirtyLimit");
+}
+
+}  // namespace
+
 Page* TxnImpl::allocBuffer(PageNo p, std::uint16_t flags, unsigned npages)
 {
     Page* buf = nullptr;
@@ -157,12 +178,17 @@ Page* TxnImpl::allocBuffer(PageNo p, std::uint16_t flags, unsigned npages)
         // Freed earlier in this same transaction, so it is already in `owned`.
         buf = pool.back();
         pool.pop_back();
+    } else if (npages == 1 && !spillPool.empty()) {
+        // Also in `owned`, but its memory went back to the OS: counted again.
+        const auto bytes = env->buffers.allocationSize(1);
+        chargeDirty(env, bytes);
+        buf = spillPool.back();
+        spillPool.pop_back();
+        spilledBytes -= bytes;
+        env->dirtyBytes.fetch_add(bytes, std::memory_order_relaxed);
     } else {
-        // A budget, not a synchronization point: relaxed is enough.
         const auto bytes = env->buffers.allocationSize(npages);
-        const auto current = env->dirtyBytes.load(std::memory_order_relaxed);
-        if (env->dirtyLimit && (bytes > env->dirtyLimit || current > env->dirtyLimit - bytes))
-            throw Error(ErrorCode::OutOfMemory, "dirty page budget exceeded; reduce the batch or raise dirtyLimit");
+        chargeDirty(env, bytes);
         buf = env->buffers.acquire(npages);
         try {
             owned.emplace_back(buf, npages);
@@ -366,8 +392,17 @@ void TxnImpl::freePage(PageNo p, unsigned count)
             loose.push_back(p + k);
         return;
     }
+    if (Page* buf = spilled.find(p)) {
+        // Ours as well; only the bytes went to the file early.
+        spilled.erase(p);
+        if (count == 1)
+            spillPool.push_back(buf);
+        for (unsigned k = 0; k < count; ++k)
+            loose.push_back(p + k);
+        return;
+    }
     for (TxnImpl* a = parent; a; a = a->parent) {
-        if (a->dirty.find(p)) {
+        if (a->dirty.find(p) || a->spilled.find(p)) {
             // An ancestor's private page: only reusable once we commit into it.
             for (unsigned k = 0; k < count; ++k)
                 retiredLocal.push_back(p + k);
@@ -627,6 +662,24 @@ void updateFreelist(TxnImpl* t)
 #endif
 constexpr bool kWriteThroughMapping = NOSQL_WRITE_THROUGH_MAPPING != 0;
 
+/// Readies a dirty buffer's bytes for the file; returns its length in pages.
+unsigned sealForFile(Page* buf, std::size_t ps)
+{
+    const bool big = isOverflow(buf);
+    const unsigned n = big ? ovPages(buf) : 1u;
+    if (!big) {
+        // Only a slotted page has a gap; an overflow page reuses those header
+        // words for its run length, and its tail was zeroed when it was made.
+        // Buffers are recycled, and node deletion compacts by moving bytes
+        // down and leaving the originals behind, so without this one page's
+        // leftovers would travel inside another page's free space and the same
+        // logical content would not produce the same bytes on disk.
+        std::memset(reinterpret_cast<std::byte*>(buf) + buf->lower, 0, pageUpper(buf) - buf->lower);
+    }
+    sealPage(buf, std::size_t(n) * ps);
+    return n;
+}
+
 /// Write dirty pages into the file and record the runs they occupy. Nothing
 /// is flushed here: writeMeta() decides, by durability mode, whether this
 /// commit flushes the data before its meta page.
@@ -647,8 +700,11 @@ void writePages(TxnImpl* t)
     // below then walk the file forwards, and the flush ranges coalesce.
     std::vector<std::pair<PageNo, Page*>>& ids = t->flushList;
     ids.clear();
-    ids.reserve(t->dirty.size());
+    ids.reserve(t->dirty.size() + t->spilled.size());
     t->dirty.forEach([&](PageNo pn, Page* buf) { ids.emplace_back(pn, buf); });
+    // Spilled pages are in the file already, but the flush, the validation
+    // cache and the ship log need their runs like any other's.
+    t->spilled.forEach([&](PageNo pn, Page*) { ids.emplace_back(pn, nullptr); });
     std::sort(ids.begin(), ids.end(),
               [](const auto& a, const auto& b) { return a.first < b.first; });
 
@@ -663,29 +719,36 @@ void writePages(TxnImpl* t)
                      unsigned(spans.size()));
         spans.clear();
     };
+    bool runSpilled = false;
     for (const auto& [p, buf] : ids) {
-        const bool big = isOverflow(buf);
-        const unsigned n = big ? ovPages(buf) : 1u;
-        if (!big) {
-            // Only a slotted page has a gap; an overflow page reuses those header
-            // words for its run length, and its tail was zeroed when it was made.
-            // Buffers are recycled, and node deletion compacts by moving bytes
-            // down and leaving the originals behind, so without this one page's
-            // leftovers would travel inside another page's free space and the same
-            // logical content would not produce the same bytes on disk.
-            std::memset(reinterpret_cast<std::byte*>(buf) + buf->lower, 0,
-                        pageUpper(buf) - buf->lower);
+        if (!buf) {
+            const Page* written = e->mapPage(*t->region, p);
+            const unsigned n = isOverflow(written) ? ovPages(written) : 1u;
+            e->validation.invalidate(p, n);
+            if (!runs.empty() && runs.back().second + 1 == p &&
+                (kWriteThroughMapping || runSpilled)) {
+                runs.back().second = p + n - 1;
+            } else {
+                if (!kWriteThroughMapping)
+                    writeSpans();
+                runs.emplace_back(p, p + n - 1);
+                runSpilled = true;
+            }
+            continue;
         }
-        sealPage(buf, std::size_t(n) * ps);
+        const unsigned n = sealForFile(buf, ps);
         // Before the meta that publishes these bytes: a reader that can see
         // them must find them unverified.
         e->validation.invalidate(p, n);
-        if (!runs.empty() && runs.back().second + 1 == p) {
+        // Spans gather only behind the run's first page, so without the
+        // mapping a written page never joins a spilled page's run.
+        if (!runs.empty() && runs.back().second + 1 == p && (kWriteThroughMapping || !runSpilled)) {
             runs.back().second = p + n - 1;
         } else {
             if (!kWriteThroughMapping)
                 writeSpans();
             runs.emplace_back(p, p + n - 1);
+            runSpilled = false;
         }
         if (kWriteThroughMapping) {
             os::observeIo(os::IoEvent::Write, std::size_t(n) * ps);
@@ -935,9 +998,13 @@ void commitNested(TxnImpl* t)
     TxnImpl* p = t->parent;
 
     t->dirty.forEach([&](PageNo pgno, Page* buf) { p->dirty.set(pgno, buf); });
+    t->spilled.forEach([&](PageNo pgno, Page* buf) { p->spilled.set(pgno, buf); });
     p->owned.insert(p->owned.end(), t->owned.begin(), t->owned.end());
     t->owned.clear();
     p->pool.insert(p->pool.end(), t->pool.begin(), t->pool.end());
+    p->spillPool.insert(p->spillPool.end(), t->spillPool.begin(), t->spillPool.end());
+    p->spilledBytes += t->spilledBytes;
+    t->spilledBytes = 0;
 
     // Pages the child copied away from. One of the parent's own private pages
     // is now unreachable everywhere and can be reused at once. A page private
@@ -953,6 +1020,17 @@ void commitNested(TxnImpl* t)
             const unsigned n = isOverflow(buf) ? ovPages(buf) : 1u;
             p->pool.push_back(buf);
             p->dirty.erase(pgno);
+            for (unsigned k = 0; k < n; ++k)
+                p->loose.push_back(pgno + k);
+            while (i + 1 < retired.size() && retired[i + 1] > pgno && retired[i + 1] < pgno + n)
+                ++i;
+        } else if (Page* gone = p->spilled.find(pgno)) {
+            // Likewise, but the buffer's memory went back: the file has the header.
+            const Page* written = p->env->mapPage(*p->region, pgno);
+            const unsigned n = isOverflow(written) ? ovPages(written) : 1u;
+            if (n == 1)
+                p->spillPool.push_back(gone);
+            p->spilled.erase(pgno);
             for (unsigned k = 0; k < n; ++k)
                 p->loose.push_back(pgno + k);
             while (i + 1 < retired.size() && retired[i + 1] > pgno && retired[i + 1] < pgno + n)
@@ -1031,6 +1109,15 @@ void abortNested(TxnImpl* t)
         for (unsigned k = 0; k < n; ++k)
             p->loose.push_back(pgno + k);
     });
+    // Spilled ones too; their bytes in the file are as dead as a buffer's.
+    t->spilled.forEach([&](PageNo pgno, Page*) {
+        const Page* written = t->env->mapPage(*t->region, pgno);
+        const unsigned n = isOverflow(written) ? ovPages(written) : 1u;
+        for (unsigned k = 0; k < n; ++k)
+            p->loose.push_back(pgno + k);
+    });
+    p->spilledBytes += t->spilledBytes;
+    t->spilledBytes = 0;
     p->loose.insert(p->loose.end(), t->loose.begin(), t->loose.end());
     // Never rewind the frontier: pages handed back above may sit beyond it.
     p->lastPgno = std::max(p->lastPgno, t->lastPgno);
@@ -1192,6 +1279,77 @@ void txnAbort(TxnImpl* t)
         return;
     }
     finishWriter(t);
+}
+
+// ----------------------------------------------------------------- spill ---
+
+void TxnImpl::spill()
+{
+    const std::uint64_t target = env->dirtyLimit / 2;
+    const std::size_t ps = env->pageSize;
+    // Oldest level first: an ancestor's pages are the least likely to be
+    // touched again.
+    std::vector<TxnImpl*> chain;
+    for (TxnImpl* a = this; a; a = a->parent)
+        chain.push_back(a);
+    for (auto level = chain.rbegin(); level != chain.rend(); ++level) {
+        TxnImpl* a = *level;
+        if (env->dirtyBytes.load(std::memory_order_relaxed) <= target)
+            break;
+        // Branch pages stay: nearly every write descends through them, and
+        // they are a small share of any tree.
+        std::vector<std::pair<PageNo, Page*>>& ids = a->spillList;
+        ids.clear();
+        a->dirty.forEach([&](PageNo pn, Page* buf) {
+            if (!isBranch(buf))
+                ids.emplace_back(pn, buf);
+        });
+        std::sort(ids.begin(), ids.end(),
+                  [](const auto& x, const auto& y) { return x.first < y.first; });
+        std::byte* base = a->region->m.base;
+        for (const auto& [p, buf] : ids) {
+            if (env->dirtyBytes.load(std::memory_order_relaxed) <= target)
+                break;
+            const unsigned n = sealForFile(buf, ps);
+            const std::size_t bytes = std::size_t(n) * ps;
+            env->validation.invalidate(p, n);
+            // Where it will commit: a page number no snapshot, durable or
+            // visible, refers to, so the write is as safe now as at commit.
+            if (kWriteThroughMapping) {
+                std::memcpy(base + p * ps, buf, bytes);
+                os::recordMappedWrite(env->fd, p * std::uint64_t(ps), base + p * ps, bytes);
+            } else {
+                os::writeAt(env->fd, p * std::uint64_t(ps), buf, bytes);
+            }
+            const std::size_t held = env->buffers.allocationSize(n);
+            os::discardMemory(buf, held);
+            a->dirty.erase(p);
+            a->spilled.set(p, buf);
+            a->spilledBytes += held;
+            env->dirtyBytes.fetch_sub(held, std::memory_order_relaxed);
+        }
+        ids.clear();
+    }
+    // Cursors re-anchor rather than read a page they saw in a buffer.
+    ++root()->seq;
+}
+
+Page* TxnImpl::unspill(PageNo p)
+{
+    Page* buf = spilled.find(p);
+    if (!buf)
+        return nullptr;
+    // Checked like any page read back from the file.
+    const Page* written = getPage(p, true);
+    const unsigned n = isOverflow(written) ? ovPages(written) : 1u;
+    const std::size_t held = env->buffers.allocationSize(n);
+    chargeDirty(env, held);
+    std::memcpy(buf, written, std::size_t(n) * env->pageSize);
+    spilled.erase(p);
+    dirty.set(p, buf);
+    spilledBytes -= held;
+    env->dirtyBytes.fetch_add(held, std::memory_order_relaxed);
+    return buf;
 }
 
 }  // namespace nosql::internal

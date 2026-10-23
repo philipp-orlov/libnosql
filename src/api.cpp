@@ -41,6 +41,28 @@ TxnImpl* writable(TxnImpl* t)
     return t;
 }
 
+/// Before a write: spills when the dirty budget may not hold it (a descent's
+/// path split at every level, a sibling, and the value). The caller's key and
+/// value may point into the very pages that go, so they are copied into
+/// `keep` first and redirected there.
+void makeRoom(TxnImpl* t, unsigned dbi, Slice& key, Slice& value, std::string& keep)
+{
+    const std::size_t ps = t->pageSize();
+    const std::uint64_t depth =
+        dbi < t->dbs.size() && t->dbs[dbi].loaded ? std::uint64_t(t->dbs[dbi].tree.depth) : 0;
+    if (!t->wantsSpill((depth + 2) * 3 * ps + value.size()))
+        return;
+    keep.reserve(key.size() + (value.data() ? value.size() : 0));
+    if (key.size())
+        keep.assign(reinterpret_cast<const char*>(key.data()), key.size());
+    if (value.data())
+        keep.append(reinterpret_cast<const char*>(value.data()), value.size());
+    t->spill();
+    key = Slice(keep.data(), key.size());
+    if (value.data())
+        value = Slice(keep.data() + key.size(), value.size());
+}
+
 /// A throwaway descent used by single-shot lookups; no anchor bookkeeping.
 CursorImpl probe(TxnImpl* t, unsigned dbi)
 {
@@ -592,6 +614,8 @@ TreeStats Db::stats() const
 bool Db::put(Slice key, Slice value, PutMode mode) const
 {
     TxnImpl* t = writable(txn_.get());
+    std::string keep;
+    makeRoom(t, dbi_, key, value, keep);
     CursorImpl c = probe(t, dbi_);
     const bool placed = treePut(c, key, value, mode, nullptr);
     noteWrite(t, dbi_, key);
@@ -601,9 +625,12 @@ bool Db::put(Slice key, Slice value, PutMode mode) const
 WritableSlice Db::reserve(Slice key, std::size_t size, PutMode mode) const
 {
     TxnImpl* t = writable(txn_.get());
+    std::string keep;
+    Slice value(nullptr, size);
+    makeRoom(t, dbi_, key, value, keep);
     CursorImpl c = probe(t, dbi_);
     WritableSlice w;
-    if (!treePut(c, key, Slice(nullptr, size), mode, &w))
+    if (!treePut(c, key, value, mode, &w))
         throw Error(mode == PutMode::InsertUnique ? ErrorCode::KeyExists : ErrorCode::NotFound,
                     "reserve did not place a value");
     noteWrite(t, dbi_, key);
@@ -613,6 +640,9 @@ WritableSlice Db::reserve(Slice key, std::size_t size, PutMode mode) const
 bool Db::erase(Slice key) const
 {
     TxnImpl* t = writable(txn_.get());
+    std::string keep;
+    Slice none;
+    makeRoom(t, dbi_, key, none, keep);
     CursorImpl c = probe(t, dbi_);
     const bool erased = treeDel(c, key);
     noteWrite(t, dbi_, key);
@@ -851,6 +881,8 @@ bool Cursor::seekExact(Slice k)
 bool Cursor::put(Slice k, Slice v, PutMode mode)
 {
     CursorImpl& c = attached(impl_, true);
+    std::string keep;
+    makeRoom(c.txn, c.dbi, k, v, keep);
     const bool placed = treePut(c, k, v, mode, nullptr);
     noteWrite(c.txn, c.dbi, k);
     return placed;
@@ -859,6 +891,10 @@ bool Cursor::put(Slice k, Slice v, PutMode mode)
 bool Cursor::erase()
 {
     CursorImpl& c = attached(impl_, true);
+    std::string keep;
+    Slice none;
+    Slice probeKey;
+    makeRoom(c.txn, c.dbi, probeKey, none, keep);
     cursorRevalidate(c);
     if (!c.positioned)
         return false;

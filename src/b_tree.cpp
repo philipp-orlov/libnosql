@@ -374,6 +374,10 @@ Page* touchLevel(CursorImpl& c, int lvl)
     Page* p = c.pg[lvl];
     if (t->isOwnDirty(p->pgno))
         return p;
+    if (Page* back = t->unspill(p->pgno)) {
+        c.pg[lvl] = back;  // the same page number: the parent needs no update
+        return back;
+    }
     const PageNo np = t->allocPages(1);
     Page* d = t->allocBuffer(np, p->flags, 1);
     std::memcpy(d, p, t->pageSize());
@@ -655,7 +659,9 @@ void rebalance(CursorImpl& c)
     // The sibling is about to be modified, so it must become ours first.
     PageNo spgno = branchChild(parent, sidx);
     Page* sib = t->getPage(spgno);
-    if (!t->isOwnDirty(spgno)) {
+    if (Page* back = t->isOwnDirty(spgno) ? nullptr : t->unspill(spgno)) {
+        sib = back;
+    } else if (!t->isOwnDirty(spgno)) {
         const PageNo np = t->allocPages(1);
         Page* d = t->allocBuffer(np, sib->flags, 1);
         std::memcpy(d, sib, ps);
@@ -1264,7 +1270,11 @@ bool treePut(CursorImpl& c, Slice key, Slice value, PutMode mode, WritableSlice*
         if (oldbig && big) {
             const PageNo oldp = bigPgno(n);
             Page* ovp = t->getPage(oldp);
-            if (t->isOwnDirty(oldp) && ovPages(ovp) == overflowRun(ps, value.size())) {
+            const bool fits = ovPages(ovp) == overflowRun(ps, value.size());
+            if (fits && !t->isOwnDirty(oldp))
+                if (Page* back = t->unspill(oldp))
+                    ovp = back;
+            if (fits && t->isOwnDirty(oldp)) {
                 const std::size_t span = std::size_t(ovPages(ovp)) * ps - kPageHdr;
                 n->vsize = std::uint32_t(value.size());
                 auto* dst = reinterpret_cast<std::byte*>(ovp) + kPageHdr;

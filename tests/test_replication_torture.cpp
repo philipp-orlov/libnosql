@@ -80,47 +80,52 @@ void randomCommit(Env& e, std::mt19937_64& rng)
 
 }  // namespace
 
+/// Also with a dirty budget small enough that most commits spill pages to the
+/// file before they commit: the capture must ship those pages too.
 TEST(aReplicaFollowsARandomWorkloadExactly)
 {
-    tst::Scratch dir("repltorture");
-    const fs::path store = dir.file(), ship = dir.file("ship");
-    const fs::path replica = dir.file("replica.db"), bundle = dir.file("d.bundle");
+    for (const std::uint64_t dirtyLimit : {std::uint64_t(256) << 20, std::uint64_t(128) << 10}) {
+        tst::Scratch dir("repltorture");
+        const fs::path store = dir.file(), ship = dir.file("ship");
+        const fs::path replica = dir.file("replica.db"), bundle = dir.file("d.bundle");
 
-    std::mt19937_64 rng(20240607);
-    Env e = Env::configure()
-                .sync(Durability::NoMetaSync)
-                .initialSize(64 << 10)
-                .growthStep(256 << 10)
-                .shipTo(ship)
-                .shipRetain(1000)
-                .open(store);
+        std::mt19937_64 rng(20240607);
+        Env e = Env::configure()
+                    .sync(Durability::NoMetaSync)
+                    .initialSize(64 << 10)
+                    .growthStep(256 << 10)
+                    .shipTo(ship)
+                    .shipRetain(1000)
+                    .dirtyLimit(dirtyLimit)
+                    .open(store);
 
-    for (int i = 0; i < 10; ++i)
-        randomCommit(e, rng);
-    {
-        Txn rt = e.readTxn();
-        copySnapshot(rt, replica);
-        rt.abort();
-    }
-    Checkpoint at = checkpointOf(replica);
-    ShipLog log(ship);
-
-    // Batches of varying length, so coalescing is exercised over one commit,
-    // over a handful, and over a few dozen.
-    for (int round = 0; round < 25; ++round) {
-        const int commits = 1 + int(rng() % 12);
-        for (int i = 0; i < commits; ++i)
+        for (int i = 0; i < 10; ++i)
             randomCommit(e, rng);
+        {
+            Txn rt = e.readTxn();
+            copySnapshot(rt, replica);
+            rt.abort();
+        }
+        Checkpoint at = checkpointOf(replica);
+        ShipLog log(ship);
 
-        CHECK(log.extract(at, bundle) == ShipStatus::Ok);
-        at = applyBundle(replica, bundle);
-        CHECK_EQ(at, checkpointOf(store));
-        CHECK(dumpFile(replica) == dumpEnv(e));
+        // Batches of varying length, so coalescing is exercised over one commit,
+        // over a handful, and over a few dozen.
+        for (int round = 0; round < 25; ++round) {
+            const int commits = 1 + int(rng() % 12);
+            for (int i = 0; i < commits; ++i)
+                randomCommit(e, rng);
+
+            CHECK(log.extract(at, bundle) == ShipStatus::Ok);
+            at = applyBundle(replica, bundle);
+            CHECK_EQ(at, checkpointOf(store));
+            CHECK(dumpFile(replica) == dumpEnv(e));
+        }
+
+        CHECK(at.txnid > 30u);
+        Env r = Env::configure().createIfMissing(false).open(replica);
+        r.read([](Txn& t) { checkIntegrity(t); });
     }
-
-    CHECK(at.txnid > 30u);
-    Env r = Env::configure().createIfMissing(false).open(replica);
-    r.read([](Txn& t) { checkIntegrity(t); });
 }
 
 TEST(replayingTheWholeChainOneCommitAtATimeGivesTheSameResult)

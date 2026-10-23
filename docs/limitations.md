@@ -27,12 +27,20 @@ in the "Terminology" section of `docs/design.md`.
 
 ## Real constraints
 
-* **A write transaction's dirty set must fit in RAM.** There is no spilling of
-  dirty pages to disk mid-transaction. Bulk loads of many gigabytes should be
-  split across several commits. `dirtyLimit` defaults to 256 MiB of active
-  page buffers, and a write that would exceed it fails with
-  `ErrorCode::OutOfMemory`; zero disables the limit. Compaction uses a streaming
-  direct-page builder.
+* **A write transaction larger than `dirtyLimit` spills.** `dirtyLimit`
+  defaults to 256 MiB of active page buffers. A write that would pass it first
+  writes leaf and overflow pages to the file, at the page numbers they will
+  commit at, and gives their memory back; a page touched again is read back in.
+  Branch pages stay in memory, so a transaction whose branch pages alone fill
+  the budget, or a single value larger than it, still fails with
+  `ErrorCode::OutOfMemory`, as every write past the budget does with
+  `spillDirtyPages(false)` or a page size below the system page size. Zero
+  disables the limit. In a transaction that has spilled, a slice it returned
+  earlier may read different bytes after a later write (never unmapped memory),
+  so copy what must survive the next write. Spilled pages cost one more write
+  and a read back when touched again; a bulk load of many gigabytes is still
+  faster split across several commits. Compaction uses a streaming direct-page
+  builder.
 * **`maxSize` is a hard ceiling**, set at open (default 64 GiB, a ceiling for a
   database that owns its disk rather than a budget). Exceeding it raises
   `ErrorCode::MapFull`; the store stays consistent on its last good commit.
@@ -135,7 +143,6 @@ in the "Terminology" section of `docs/design.md`.
 
 ## Not yet implemented, but sensible to add
 
-* Spilling dirty pages for transactions larger than memory.
 * Returning free tail pages to the filesystem (shrinking the file in place).
 
 ## Compared to server RDBMS engines (Oracle, SQL Server)

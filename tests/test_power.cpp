@@ -327,6 +327,7 @@ struct Workload
     Durability mode;
     bool pipelined;
     std::string name;
+    std::uint64_t dirtyLimit = 0;  // small enough to spill, or none
 };
 
 /// Commits that grow, rewrite and shrink the tree, with values from a few
@@ -368,6 +369,7 @@ Recorded record(const tst::Scratch& scratch, const Workload& w)
             .pageSize(kPage)
             .sync(w.mode)
             .pipelineCommits(w.pipelined)
+            .dirtyLimit(w.dirtyLimit)
             .syncInterval(std::chrono::hours(1));
     };
     Recorded out;
@@ -402,6 +404,9 @@ const Workload kWorkloads[] = {
     {Durability::NoMetaSync, false, "NoMetaSync"},
     {Durability::Lazy, false, "Lazy"},
     {Durability::None, false, "None"},
+    // Pages written to the file before their commit: as safe as at commit.
+    {Durability::Safe, false, "Safe, spilling", 48u << 10},
+    {Durability::NoMetaSync, false, "NoMetaSync, spilling", 48u << 10},
 };
 
 }  // namespace
