@@ -152,11 +152,11 @@ is built):
 | `memory` | allocation-free warm reuse, slab page buffers, bounded scratch, mapping ownership and allocation failures |
 | `allocbudget` | zero heap allocations per warm transaction, a flat heap across churn rounds, slices that survive a growth |
 | `mvcc` | snapshot isolation, readers versus writer, reader pinning |
-| `torture` | randomized operation mixes checked against a `std::map` oracle |
+| `torture` | randomized operation mixes checked against a `std::map` oracle (open-ended: `fuzz/fuzz_ops.cpp`, every tree flavour, nested and optimistic transactions, spills, shrinks, reopens and compactions) |
 | `optimistic` | `OptimisticTxn`: conflict detection, retries, group commit, escalation |
 | `separators` | shortest branch separators at splits, rebalances and bulk loads |
 | `pipeline` | pipelined `Safe` commits: visibility only once durable, failure handling |
-| `spill` | transactions many times `dirtyLimit`: same pages as unbounded, nested commit and abort, cursors and arguments across a spill, coldest pages first, trees of mostly branch pages |
+| `spill` | transactions many times `dirtyLimit`: same pages as unbounded, nested commit and abort, cursors and arguments across a spill, coldest pages first, trees of mostly branch pages, values of half the budget, commits whose free list passes it |
 | `corrupt` | pages that pass their checksum but lie about their layout: opening, reading and writing must end in an `Error`, never a stray read or write (fuzzing: `NOSQL_BUILD_FUZZERS`, `fuzz/fuzz_pages.cpp`) |
 | `prefix` | `DbFlags::PrefixKeys`: the same contents as a plain tree in fewer leaves and branch pages, shared suffixes in reverse order, seeks and scans, nesting, compaction, the format version |
 | `power` | every write and flush recorded and replayed: at each point, images that keep any subset of the unflushed sectors must open whole on a committed snapshot no older than the last one reported durable, in every durability mode, spilling and shrinking commits included |
