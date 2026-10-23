@@ -123,26 +123,50 @@ std::shared_ptr<TxnImpl> EnvImpl::acquireTxnLocked()
     return fresh;
 }
 
-void EnvImpl::readerAcquire(TxnId id)
+namespace {
+using SnapshotCounts = std::vector<std::pair<TxnId, unsigned>>;
+
+void countAcquire(SnapshotCounts& counts, TxnId id)
 {
     const auto it =
-        std::lower_bound(readers.begin(), readers.end(), id,
+        std::lower_bound(counts.begin(), counts.end(), id,
                          [](const std::pair<TxnId, unsigned>& e, TxnId v) { return e.first < v; });
-    if (it != readers.end() && it->first == id)
+    if (it != counts.end() && it->first == id)
         ++it->second;
     else
-        readers.insert(it, {id, 1u});
+        counts.insert(it, {id, 1u});
+}
+
+void countRelease(SnapshotCounts& counts, TxnId id) noexcept
+{
+    const auto it =
+        std::lower_bound(counts.begin(), counts.end(), id,
+                         [](const std::pair<TxnId, unsigned>& e, TxnId v) { return e.first < v; });
+    if (it == counts.end() || it->first != id)
+        return;
+    if (--it->second == 0)
+        counts.erase(it);
+}
+}  // namespace
+
+void EnvImpl::readerAcquire(TxnId id)
+{
+    countAcquire(readers, id);
 }
 
 void EnvImpl::readerRelease(TxnId id) noexcept
 {
-    const auto it =
-        std::lower_bound(readers.begin(), readers.end(), id,
-                         [](const std::pair<TxnId, unsigned>& e, TxnId v) { return e.first < v; });
-    if (it == readers.end() || it->first != id)
-        return;
-    if (--it->second == 0)
-        readers.erase(it);
+    countRelease(readers, id);
+}
+
+void EnvImpl::occPinAcquire(TxnId id)
+{
+    countAcquire(occPins, id);
+}
+
+void EnvImpl::occPinRelease(TxnId id) noexcept
+{
+    countRelease(occPins, id);
 }
 
 /// Extend the file and the mapping. Where the mapping has its address range

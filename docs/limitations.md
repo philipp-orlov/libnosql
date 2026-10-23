@@ -151,12 +151,14 @@ strike against it; libsql adds one on top), the storage-engine-level gaps are re
   hardware. Any workload with many independent concurrent writers is
   throughput-bound here in a way it structurally isn't on either commercial
   engine.
-  `OptimisticTxn` (`nosql/optimistic.hpp`) narrows this for transactions whose
-  work is not in the commit: the body runs without the writer slot, reads from
-  a snapshot and validates per key at commit, so application work overlaps
-  across threads. Commits still run one at a time and each still pays the
-  engine's commit cost, so a workload bound by fsync per commit gains nothing
-  from it. Plain `writeTxn` commits name no keys and conflict with every
+  `OptimisticTxn` (`nosql/optimistic.hpp`) narrows this. Its body runs without
+  the writer slot, reading from a snapshot, and its commit is validated per key
+  and applied in a group with the other optimistic commits waiting at the time:
+  one store commit, and one pair of device flushes under `Safe`, for the group.
+  Application work overlaps across threads, and fsync-bound commits share their
+  flushes. Pages are still written by one writer at a time, and two threads
+  whose commits strictly alternate gain nothing. Range scans are not validated,
+  and plain `writeTxn` commits name no keys, so they conflict with every
   optimistic transaction that began before them.
 * **Copy-on-write write amplification.** Every commit rewrites the full
   root-to-leaf path for every key touched, plus free-list maintenance (see

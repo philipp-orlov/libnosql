@@ -161,6 +161,32 @@ the commit, and a commit landing between a caller's sample and its wait returns
 immediately. Only top-level commits count; a nested commit publishes nothing.
 The message queue's blocking receive is built on this.
 
+### Optimistic transactions
+
+`OptimisticTxn` (`src/optimistic.cpp`) runs its body on a read snapshot and
+buffers its writes: an op list over one byte arena, with a hash index for
+read-your-writes once a transaction has 32 writes. Each thread keeps one spare
+set of buffers, so a warm stream of small transactions allocates nothing.
+
+At commit the transaction gives back its reader slot, which would otherwise pin
+page reclamation while it waits, and pins only its snapshot id
+(`EnvImpl::occPins`), which keeps the validation log's entries after that id.
+It then queues (`occQueue`). A committer that finds no group being applied
+becomes the leader: it takes up to 256 queued commits (about 8 MiB of buffered
+bytes), takes the writer slot, validates each against `occLog` (the keys each
+commit since its snapshot wrote) and against the keys already accepted into the
+group, replays the accepted ones into one write transaction, and commits it
+once. `publish()` records the group's written keys under its transaction id; a
+plain write transaction is recorded as writing unknown keys. Members whose
+writes fail to apply are dropped and the group retried without them.
+
+Waiters yield a few hundred times before sleeping on their own condition, and
+the leader wakes only its group and the next leader: without device flushes a
+group takes microseconds, about what a sleep and wake cost. Members are
+validated in order of conflicts already lost; from the eighth lost attempt a
+transaction holds back every other optimistic commit until it finishes, so a
+hot key cannot starve it.
+
 ## Commit and Recovery
 
 1. Finalize named tree descriptors and the free tree.

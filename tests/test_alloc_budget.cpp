@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "nosql/nosql.hpp"
+#include "nosql/optimistic.hpp"
 #include "tests/test_util.hpp"
 
 namespace {
@@ -199,6 +200,44 @@ TEST(warmTransactionsDoNotAllocate)
 /// The cluster-store pattern: a large store, and every round rewrites a fifth
 /// of it in one transaction. After warm-up a round leaves the heap no bigger
 /// and no more fragmented than it found it; no page buffer touches it.
+/// The same write pattern through optimistic transactions: per transaction a
+/// read of each key through view() and the two puts, all committed through the
+/// group-commit path. Warm, it allocates nothing either.
+TEST(warmOptimisticTransactionsDoNotAllocate)
+{
+    for (const Durability mode : {Durability::None, Durability::Lazy}) {
+        tst::Scratch scratch("alloc-optimistic");
+        Env env = Env::configure().pageSize(4096).sync(mode).open(scratch.file());
+        env.write([](Txn& t) {
+            t.db(kBlobs, DbFlags::Create);
+            t.db(kIndex, DbFlags::Create);
+        });
+        const std::vector<std::byte> value(512, std::byte{0x5a});
+        std::uint64_t seq = 0;
+        const auto write = [&] {
+            OptimisticTxn t(env);
+            for (int i = 0; i < 10; ++i, ++seq) {
+                const std::uint64_t id = seq % 4000;
+                const Key blob(id % 97, id), index(id % 97, ~id);
+                (void)t.view(kBlobs, blob);
+                t.put(kBlobs, blob, Slice(value.data(), value.size()));
+                t.put(kIndex, index, Slice::ref(seq));
+            }
+            t.commit();
+        };
+        for (int i = 0; i < 1000; ++i)
+            write();
+        const std::size_t before = heapCalls.load();
+        for (int i = 0; i < 1000; ++i)
+            write();
+        const std::size_t after = heapCalls.load();
+        std::printf("    optimistic, mode %d: %zu allocations in 1000 writes\n", int(mode),
+                    after - before);
+        CHECK_EQ(after - before, 0u);
+        env.read([](Txn& t) { checkIntegrity(t); });
+    }
+}
+
 TEST(churnRoundsKeepTheHeapFlat)
 {
     tst::Scratch scratch("alloc-churn");

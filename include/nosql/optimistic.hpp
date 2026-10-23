@@ -15,9 +15,15 @@ namespace nosql {
 ///
 /// Reads come from a snapshot taken at begin, and writes are buffered. Only
 /// commit() takes the writer slot: it validates the transaction against every
-/// commit made since its snapshot, and if none touched a key it read or wrote,
+/// commit made since its snapshot, and if none wrote a key it read or wrote,
 /// replays the buffered writes and commits them. Other writers can therefore
 /// run their bodies while this one runs its own.
+///
+/// Commits are grouped. Optimistic commits that arrive while one is being
+/// applied queue up, and the next of them to run applies the whole queue in
+/// one write transaction: one commit, and under Durability::Safe one pair of
+/// device flushes, for the lot. Each transaction in a group is still
+/// validated on its own and succeeds or fails on its own.
 ///
 /// Validation is on individual keys, so a committed history is serializable
 /// for point operations: a read, or a write, conflicts with any later commit
@@ -26,12 +32,24 @@ namespace nosql {
 /// transactions that depend on a range. A plain Env::writeTxn commit names no
 /// keys, so it conflicts with every optimistic transaction that began before it.
 ///
-/// Commits still run one at a time, and each one still pays the engine's
-/// commit cost. The gain is in the work done between begin and commit.
+/// A transaction's buffers are recycled per thread, so a steady stream of
+/// small transactions allocates nothing once warm (values returned by get()
+/// that do not fit a std::string's inline buffer aside; view() avoids those).
 class OptimisticTxn
 {
 public:
-    explicit OptimisticTxn(Env& env);
+    /// `attempt` is how many times this transaction has already lost a
+    /// conflict; optimistic() passes it, and a caller retrying by hand should
+    /// too. Within a group the leader validates higher attempts first. From
+    /// kExclusiveAfter attempts on, the transaction also holds back every other
+    /// optimistic commit from its begin until it finishes, so no other
+    /// optimistic transaction can win its keys again: a hot key cannot starve
+    /// it. Their bodies keep running; only their commits wait. Plain write
+    /// transactions are not held back. Such a transaction must not commit a
+    /// second optimistic transaction on the same store before it finishes.
+    explicit OptimisticTxn(Env& env, unsigned attempt = 0);
+
+    static constexpr unsigned kExclusiveAfter = 8;
     ~OptimisticTxn();  // aborts if not committed
     OptimisticTxn(OptimisticTxn&&) noexcept;
     OptimisticTxn& operator=(OptimisticTxn&&) noexcept;
@@ -43,23 +61,36 @@ public:
     /// snapshot. The read is validated at commit.
     std::optional<std::string> get(Slice db, Slice key);
 
-    /// Buffer a write. A sub-database that does not exist yet is created at commit.
+    /// Like get(), without copying. The slice stays valid until the next put(),
+    /// erase(), commit() or abort() on this transaction.
+    std::optional<Slice> view(Slice db, Slice key);
+
+    /// Buffer a write. A sub-database that does not exist yet is created at
+    /// commit. Keys and values outside the store's limits are refused here,
+    /// with the errors Db::put would raise.
     void put(Slice db, Slice key, Slice value);
 
     /// Buffer a delete. Deleting an absent key is not an error.
     void erase(Slice db, Slice key);
 
     /// Validate and apply. Throws Error(ErrorCode::Conflict) if a later commit
-    /// touched a key this transaction read or wrote; the transaction is then
-    /// finished and nothing was applied. Either way the transaction is finished.
+    /// wrote a key this transaction read or wrote; nothing was applied then.
+    /// Any other error applying this transaction's writes is thrown here too,
+    /// and does not affect the other transactions committed with it. Either
+    /// way the transaction is finished.
     void commit();
 
     /// Discard the buffered writes and release the snapshot.
     void abort();
 
+    struct Impl;  // public so the group-commit leader can apply other threads' writes
+
 private:
-    struct Impl;
     Impl& active();  // throws BadTransaction once finished
+    void finish() noexcept;
+    /// Applies the group in env.occBatch as the group-commit leader. Outcomes go
+    /// into each member's pending record; it never throws.
+    static void applyBatch(internal::EnvImpl& env) noexcept;
     std::unique_ptr<Impl> impl_;
 };
 
@@ -71,7 +102,7 @@ template <class F>
 void optimistic(Env& env, F&& body, unsigned maxAttempts = 100)
 {
     for (unsigned attempt = 1;; ++attempt) {
-        OptimisticTxn t(env);
+        OptimisticTxn t(env, attempt - 1);
         body(t);
         try {
             t.commit();
