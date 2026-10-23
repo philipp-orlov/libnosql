@@ -43,8 +43,10 @@ struct OptimisticTxn::Impl
 
     std::string bytes;
     std::vector<Op> ops;                 // in the order they were made
-    std::vector<std::uint64_t> touched;  // every key read or written
-    std::vector<std::uint64_t> written;  // every key written
+    std::vector<std::uint64_t> touched;  // every key read or written, and scanned dbs
+    std::vector<std::uint64_t> written;  // every key written, and its db's occDbKey
+    std::vector<std::uint32_t> scanOps;  // scratch for scan(): buffered ops in range
+    bool scanning = false;
     /// Latest op per key hash, built once a transaction has kIndexAfter writes;
     /// below that a backward scan is faster.
     std::unordered_map<std::uint64_t, std::uint32_t> index;
@@ -106,6 +108,9 @@ struct OptimisticTxn::Impl
 
     void add(Slice db, Slice key, Slice value, bool erase)
     {
+        if (scanning)
+            throw Error(ErrorCode::BadTransaction,
+                        "cannot write during a scan of this transaction");
         if (key.empty() || key.size() > internal::maxKeySize(env->pageSize))
             throw Error(ErrorCode::KeyTooLarge, key.empty() ? "empty keys are not allowed"
                                                             : "key exceeds the page-size limit");
@@ -128,6 +133,7 @@ struct OptimisticTxn::Impl
         ops.push_back(op);
         touched.push_back(op.hash);
         written.push_back(op.hash);
+        written.push_back(internal::occDbKey(db.view()));  // sortUnique drops repeats
         if (!index.empty()) {
             index[op.hash] = std::uint32_t(ops.size() - 1);
         } else if (ops.size() >= kIndexAfter) {
@@ -177,6 +183,8 @@ struct OptimisticTxn::Impl
         ops.clear();
         touched.clear();
         written.clear();
+        scanOps.clear();
+        scanning = false;
         index.clear();
         constexpr std::size_t kRetainBytes = 1u << 20, kRetainOps = 4096;
         if (bytes.capacity() > kRetainBytes)
@@ -378,6 +386,82 @@ std::optional<std::string> OptimisticTxn::get(Slice db, Slice key)
     if (!v)
         return std::nullopt;
     return v->string();
+}
+
+void OptimisticTxn::scanImpl(Slice db, Slice lo, Slice hi, bool (*call)(void*, Slice, Slice),
+                             void* ctx)
+{
+    Impl& t = active();
+    if (t.scanning)
+        throw Error(ErrorCode::BadTransaction, "scans of one transaction cannot nest");
+    t.touched.push_back(internal::occDbKey(db.view()));
+    const Db* d = t.snapshotDb(db);
+    const internal::CompareFn cmp =
+        d ? internal::comparatorFor(std::uint32_t(d->flags())) : &internal::cmpLexicographic;
+    const auto inRange = [&](Slice k) {
+        return (lo.empty() || cmp(k, lo) >= 0) && (hi.empty() || cmp(k, hi) < 0);
+    };
+
+    const auto keyAt = [&](std::uint32_t op) { return t.slice(t.ops[op].key, t.ops[op].keyLen); };
+
+    // This transaction's writes in range, in key order, the latest per key last.
+    std::vector<std::uint32_t>& own = t.scanOps;
+    own.clear();
+    for (std::uint32_t i = 0; i < t.ops.size(); ++i) {
+        const Impl::Op& op = t.ops[i];
+        if (t.slice(op.db, op.dbLen).view() == db.view() && inRange(keyAt(i)))
+            own.push_back(i);
+    }
+    std::sort(own.begin(), own.end(), [&](std::uint32_t a, std::uint32_t b) {
+        const int c = cmp(keyAt(a), keyAt(b));
+        return c < 0 || (c == 0 && a < b);
+    });
+
+    struct ScanGuard
+    {
+        bool& flag;
+        ~ScanGuard() { flag = false; }
+    } guard{t.scanning};
+    t.scanning = true;
+
+    Cursor c;
+    Slice sk, sv;
+    bool more = false;
+    if (d) {
+        c = d->cursor();
+        more = lo.empty() ? c.first(sk, sv) : c.seek(lo, sk, sv);
+        if (more && !hi.empty() && cmp(sk, hi) >= 0)
+            more = false;
+    }
+    std::size_t i = 0;
+    while (more || i < own.size()) {
+        // The latest of this transaction's writes to the next key it wrote.
+        std::size_t last = i;
+        while (last + 1 < own.size() && cmp(keyAt(own[last + 1]), keyAt(own[i])) == 0)
+            ++last;
+        // Negative: the snapshot's key comes first; positive: ours; zero: same key.
+        int order;
+        if (!more)
+            order = 1;
+        else if (i >= own.size())
+            order = -1;
+        else
+            order = cmp(sk, keyAt(own[i]));
+        if (order < 0) {  // only the snapshot has this key
+            if (!call(ctx, sk, sv))
+                return;
+        } else {  // this transaction wrote it, over the snapshot's value if any
+            const Impl::Op& op = t.ops[own[last]];
+            if (!op.erase && !call(ctx, keyAt(own[last]), t.slice(op.value, op.valueLen)))
+                return;
+            i = last + 1;
+        }
+        if (order <= 0 && more) {
+            more = c.next(sk, sv);
+            if (more && !hi.empty() && cmp(sk, hi) >= 0)
+                more = false;
+        }
+    }
 }
 
 void OptimisticTxn::put(Slice db, Slice key, Slice value)

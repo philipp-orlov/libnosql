@@ -6,6 +6,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <type_traits>
 
 #include "nosql/nosql.hpp"
 
@@ -25,11 +26,11 @@ namespace nosql {
 /// device flushes, for the lot. Each transaction in a group is still
 /// validated on its own and succeeds or fails on its own.
 ///
-/// Validation is on individual keys, so a committed history is serializable
-/// for point operations: a read, or a write, conflicts with any later commit
-/// that wrote the same (sub-database, key). Range scans are not tracked, so a
-/// phantom insert into a scanned range is not detected; use Env::writeTxn for
-/// transactions that depend on a range.
+/// Point reads and writes are validated on their (sub-database, key): each
+/// conflicts with any later commit that wrote the same key. A scan is validated
+/// on its whole sub-database: it conflicts with any later commit that wrote
+/// anything there, which catches phantoms at the cost of some needless
+/// conflicts. A committed history is therefore serializable.
 ///
 /// Plain Env::writeTxn transactions that begin while any optimistic one exists
 /// record the keys they write, and conflict only on those. One that began
@@ -70,6 +71,30 @@ public:
     /// erase(), commit() or abort() on this transaction.
     std::optional<Slice> view(Slice db, Slice key);
 
+    /// Calls fn(key, value) for each entry of sub-database `db` with
+    /// lo <= key < hi in that sub-database's order (an empty `lo` or `hi` is
+    /// unbounded), as this transaction sees them: its buffered writes merged
+    /// over the snapshot. fn may return false to stop. The slices are valid
+    /// during the call; fn must not write to this transaction. Validated at
+    /// commit as a read of the whole sub-database.
+    template <class F>
+    void scan(Slice db, Slice lo, Slice hi, F&& fn)
+    {
+        using Fn = std::remove_reference_t<F>;
+        scanImpl(
+            db, lo, hi,
+            [](void* ctx, Slice k, Slice v) {
+                Fn& f = *static_cast<Fn*>(ctx);
+                if constexpr (std::is_void_v<decltype(f(k, v))>) {
+                    f(k, v);
+                    return true;
+                } else {
+                    return bool(f(k, v));
+                }
+            },
+            &fn);
+    }
+
     /// Buffer a write. A sub-database that does not exist yet is created at
     /// commit. Keys and values outside the store's limits are refused here,
     /// with the errors Db::put would raise.
@@ -92,6 +117,7 @@ public:
 
 private:
     Impl& active();  // throws BadTransaction once finished
+    void scanImpl(Slice db, Slice lo, Slice hi, bool (*call)(void*, Slice, Slice), void* ctx);
     void finish() noexcept;
     /// Applies the group in env.occBatch as the group-commit leader. Outcomes go
     /// into each member's pending record; it never throws.

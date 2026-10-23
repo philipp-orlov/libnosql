@@ -127,6 +127,7 @@ void TxnImpl::reset()
     noSpend = false;
     occTrack = false;
     occUnknown = false;
+    occLastDbi = ~0u;
     seq = 1;
 }
 

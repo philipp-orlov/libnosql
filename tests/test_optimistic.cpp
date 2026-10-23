@@ -594,6 +594,189 @@ TEST(optimisticWaitingCommitStillSeesConflictsAfterReleasingItsSnapshot)
     CHECK(valueOf(e, "x") == std::optional<std::string>("blocker"));
 }
 
+namespace {
+
+std::vector<std::pair<std::string, std::string>> scanAll(OptimisticTxn& t, const char* db,
+                                                         Slice lo = Slice(), Slice hi = Slice())
+{
+    std::vector<std::pair<std::string, std::string>> out;
+    t.scan(db, lo, hi, [&](Slice k, Slice v) { out.emplace_back(k.string(), v.string()); });
+    return out;
+}
+
+using Pairs = std::vector<std::pair<std::string, std::string>>;
+
+}  // namespace
+
+TEST(optimisticScanMergesItsOwnWrites)
+{
+    tst::Scratch s("optimistic");
+    Env e = Env::configure().open(s.file());
+    e.write([](Txn& w) {
+        Db d = w.db("items", DbFlags::Create);
+        for (const char* k : {"a", "b", "c", "d"})
+            d.put(k, std::string("old-") + k);
+    });
+    OptimisticTxn t(e);
+    t.put("items", "b", "new-b");    // overwrite
+    t.erase("items", "c");           // delete
+    t.put("items", "e", "new-e");    // insert past the end
+    t.put("items", "aa", "x");       // insert between
+    t.put("items", "aa", "new-aa");  // the latest write wins
+    t.erase("items", "zz");          // erase of an absent key shows nothing
+    t.put("other", "b", "elsewhere");
+    CHECK(
+        scanAll(t, "items") ==
+        Pairs({{"a", "old-a"}, {"aa", "new-aa"}, {"b", "new-b"}, {"d", "old-d"}, {"e", "new-e"}}));
+    CHECK(scanAll(t, "items", "aa", "d") == Pairs({{"aa", "new-aa"}, {"b", "new-b"}}));
+    CHECK(scanAll(t, "items", "c", "") == Pairs({{"d", "old-d"}, {"e", "new-e"}}));
+    // Stopping early.
+    int seen = 0;
+    t.scan("items", "", "", [&](Slice, Slice) { return ++seen < 2; });
+    CHECK_EQ(seen, 2);
+    // A sub-database only this transaction has created.
+    t.put("fresh", "k", "v");
+    CHECK(scanAll(t, "fresh") == Pairs({{"k", "v"}}));
+    CHECK(scanAll(t, "absent").empty());
+    t.commit();
+}
+
+TEST(optimisticScanFollowsTheSubDatabaseOrder)
+{
+    tst::Scratch s("optimistic");
+    Env e = Env::configure().open(s.file());
+    e.write([](Txn& w) {
+        Db r = w.db("rev", DbFlags::Create | DbFlags::ReverseKey);
+        r.put("xa", "1");
+        r.put("ab", "2");
+        Db n = w.db("ints", DbFlags::Create | DbFlags::IntegerKey);
+        n.put(Slice::ref(std::uint64_t(300)), "300");
+        n.put(Slice::ref(std::uint64_t(2)), "2");
+    });
+    OptimisticTxn t(e);
+    t.put("rev", "zb", "3");  // sorts between "xa" and "ab" back to front
+    // Reverse order compares from the last byte: "xa" < "ab" < "zb".
+    CHECK(scanAll(t, "rev") == Pairs({{"xa", "1"}, {"ab", "2"}, {"zb", "3"}}));
+    const std::uint64_t forty = 40;
+    t.put("ints", Slice::ref(forty), "40");
+    std::vector<std::string> order;
+    t.scan("ints", "", "", [&](Slice, Slice v) { order.push_back(v.string()); });
+    CHECK(order == std::vector<std::string>({"2", "40", "300"}));
+    t.commit();
+}
+
+TEST(optimisticScanConflictsWithLaterWritesToItsSubDatabase)
+{
+    // A phantom: the scan saw nothing in range, then someone inserted there.
+    tst::Scratch s("optimistic");
+    Env e = Env::configure().open(s.file());
+    e.write([](Txn& w) { w.db("items", DbFlags::Create).put("z", "outside the range"); });
+    OptimisticTxn t(e);
+    CHECK(scanAll(t, "items", "a", "c").empty());
+    t.put("summary", "count", "0");
+    e.write([](Txn& w) { w.db("items").put("b", "phantom"); });
+    CHECK_THROWS(t.commit(), ErrorCode::Conflict);
+
+    // An optimistic insert counts the same.
+    OptimisticTxn u(e);
+    scanAll(u, "items");
+    u.put("summary", "count", "2");
+    OptimisticTxn inserter(e);
+    inserter.put("items", "c", "another");
+    inserter.commit();
+    CHECK_THROWS(u.commit(), ErrorCode::Conflict);
+
+    // Writes to other sub-databases, and point use of the scanned one by
+    // others, do not.
+    OptimisticTxn v(e);
+    scanAll(v, "items");
+    v.put("summary", "count", "3");
+    e.write([](Txn& w) { w.db("elsewhere", DbFlags::Create).put("k", "v"); });
+    v.commit();
+}
+
+TEST(optimisticScanWriteSkewIsPrevented)
+{
+    // The on-call rule again, but each doctor counts the others with a scan.
+    tst::Scratch s("optimistic");
+    Env e = Env::configure().sync(Durability::None).open(s.file());
+    std::atomic<int> broken{0};
+    for (int round = 0; round < 150; ++round) {
+        e.write([](Txn& w) {
+            Db d = w.db("oncall", DbFlags::Create);
+            d.put("alice", "1");
+            d.put("bob", "1");
+        });
+        auto leave = [&](const char* self) {
+            optimistic(e, [&](OptimisticTxn& t) {
+                int on = 0;
+                t.scan("oncall", "", "", [&](Slice, Slice v) { on += v.view() == "1"; });
+                if (on >= 2)
+                    t.put("oncall", self, "0");
+            });
+        };
+        std::thread a([&] { leave("alice"); });
+        std::thread b([&] { leave("bob"); });
+        a.join();
+        b.join();
+        int on = 0;
+        e.read([&](Txn& r) {
+            Cursor c = r.db("oncall").cursor();
+            Slice k, v;
+            for (bool ok = c.first(k, v); ok; ok = c.next(k, v))
+                on += v.view() == "1";
+        });
+        if (on == 0)
+            ++broken;
+    }
+    CHECK_EQ(broken.load(), 0);
+}
+
+TEST(optimisticWriteDuringScanIsRefused)
+{
+    tst::Scratch s("optimistic");
+    Env e = Env::configure().open(s.file());
+    e.write([](Txn& w) { w.db("items", DbFlags::Create).put("a", "1"); });
+    OptimisticTxn t(e);
+    CHECK_THROWS(t.scan("items", "", "", [&](Slice, Slice) { t.put("items", "b", "2"); }),
+                 ErrorCode::BadTransaction);
+    t.put("items", "b", "2");  // fine once the scan is over
+    t.commit();
+}
+
+TEST(optimisticScanConflictsInsideAGroup)
+{
+    tst::Scratch s("optimistic");
+    Env e = Env::configure().sync(Durability::None).open(s.file());
+    e.write([](Txn& w) { w.db("items", DbFlags::Create).put("a", "1"); });
+    ErrorCode scanner = ErrorCode::Ok;
+    HeldWriterSlot slot(e);
+    slot.run([&] {
+        OptimisticTxn t(e);
+        t.put("", "lead", "1");
+        t.commit();
+    });
+    slot.run(
+        [&] {
+            OptimisticTxn t(e);
+            t.put("items", "b", "2");
+            t.commit();
+        },
+        10);
+    slot.run([&] {
+        OptimisticTxn t(e);
+        scanAll(t, "items");
+        t.put("", "summary", "1");
+        try {
+            t.commit();
+        } catch (const Error& err) {
+            scanner = err.code();
+        }
+    });
+    slot.release();
+    CHECK(scanner == ErrorCode::Conflict);
+}
+
 int main()
 {
     return tst::runAll("optimistic");

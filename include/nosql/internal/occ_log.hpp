@@ -22,6 +22,14 @@ inline std::uint64_t occKey(std::string_view db, std::string_view key) noexcept
     return h ^ (std::hash<std::string_view>{}(key) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2));
 }
 
+/// The hash every write to sub-database `db` records as well as its key's, and
+/// a range read records instead of keys: a scan conflicts with any later write
+/// to the sub-database it scanned. Keys are never empty, so it names no key.
+inline std::uint64_t occDbKey(std::string_view db) noexcept
+{
+    return occKey(db, std::string_view());
+}
+
 /// True if two sorted, unique hash lists share an element.
 inline bool occIntersects(const std::vector<std::uint64_t>& a,
                           const std::vector<std::uint64_t>& b) noexcept

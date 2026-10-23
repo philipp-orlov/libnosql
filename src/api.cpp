@@ -119,7 +119,12 @@ void noteWrite(TxnImpl* t, unsigned dbi, Slice key)
         t->occWritten.clear();
         return;
     }
-    t->occWritten.push_back(occKey(t->dbs[dbi].name, key.view()));
+    const std::string& name = t->dbs[dbi].name;
+    t->occWritten.push_back(occKey(name, key.view()));
+    if (dbi != t->occLastDbi) {  // once per run of writes to one sub-database
+        t->occWritten.push_back(occDbKey(name));
+        t->occLastDbi = dbi;
+    }
 }
 
 /// A write that removes keys nobody listed: the commit conflicts with every
