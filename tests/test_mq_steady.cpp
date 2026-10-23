@@ -123,13 +123,24 @@ TEST(abandonedAndRejectedWorkIsAlwaysRecovered)
                     case 1:  // transient failure: hand it straight back
                         q.nack(std::move(r));
                         continue;
-                    default:
-                        // A message may be delivered many times, but only the
-                        // delivery that acks it removes it, so exactly one ack
-                        // per message must succeed.
-                        if (acked[id].fetch_add(1) == 0)
+                    default: {
+                        // A message may be delivered many times, and a delivery
+                        // whose lease lapsed before its ack was swept back and
+                        // redelivered: its ack is stale and settles nothing.
+                        // Count the acks that do settle; exactly one per
+                        // message must. The transactional ack reports a stale
+                        // receipt, which the plain one ignores.
+                        bool settled = true;
+                        try {
+                            e.write([&](Txn& t) { q.ack(t, std::move(r)); });
+                        } catch (const Error& err) {
+                            if (err.code() != ErrorCode::BadTransaction)
+                                throw;
+                            settled = false;
+                        }
+                        if (settled && acked[id].fetch_add(1) == 0)
                             done.fetch_add(1, std::memory_order_relaxed);
-                        q.ack(std::move(r));
+                    }
                 }
             }
         });
