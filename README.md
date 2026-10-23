@@ -79,9 +79,9 @@ private headers in `include/nosql/internal`, and helpers in `include/tests` and
 live in `src/internal`. Only public API headers are installed.
 The Release suite passes 20/20 tests, and so does an ASan/UBSan build (both run
 natively on aarch64 Ubuntu 20.04 with GCC 9.4 on 2026-09-29). `mqsteady` had failed an
-acknowledgement-count assertion in an earlier sanitizer run; it did not reproduce in
-that run or in ten repetitions, but its cause was never identified. See
-[docs/design.md](docs/design.md).
+acknowledgement-count assertion in an earlier sanitizer run; the test counted a delivery
+before its ack, and a consumer delayed past its lease counted one that another had
+settled. It now counts only acks that settle. See [docs/design.md](docs/design.md).
 CI runs the suite in Release, under ASan/UBSan, and under Clang's ThreadSanitizer
 (`.github/workflows/ci.yml`). Windows and big-endian runtime validation remain
 separate gates.

@@ -559,13 +559,16 @@ tests are registered only when their subsystem is built, and `hardening` covers 
 file-safety and failure-poisoning behavior of "Opening a Store" and "Failure".
 On 2026-09-29 all 20 passed natively on aarch64 Ubuntu 20.04 with GCC 9.4 in
 Release, and all 20 passed in a RelWithDebInfo build with `NOSQL_ENABLE_ASAN=ON`
-(ASan and UBSan, leak detection on). `mqsteady`, whose
-`abandonedAndRejectedWorkIsAlwaysRecovered` case failed an acknowledgement-count
-assertion in an earlier sanitizer run, passed ten consecutive repetitions under
-ASan/UBSan. That failure has not been reproduced, but its cause was never
-identified (the test uses 50 ms leases and counts before calling `ack`, so a
-delayed settlement can count a stale receipt), so this is absence of evidence, not
-a fix.
+(ASan and UBSan, leak detection on). `mqsteady`'s
+`abandonedAndRejectedWorkIsAlwaysRecovered` case had once failed an
+acknowledgement-count assertion under a sanitizer. The cause was the test, not the
+queue: it counted a delivery as acked before calling `ack`, so a consumer held up
+past its 50 ms lease counted a delivery that had meanwhile been swept back and
+acked by another consumer, whose ack, not the stale one, settled it. Making one
+consumer in fifty sleep 80 ms before counting reproduces the failure every run
+(a count of 2); the test now counts only acks that settle, through the
+transactional `ack`, which reports a stale receipt, and passes under the same
+delay.
 
 `tests/Ubuntu2004.Dockerfile` builds with `-pedantic-errors` on stock Ubuntu 20.04
 (CMake 3.16), runs the tests, installs the package and builds and runs
