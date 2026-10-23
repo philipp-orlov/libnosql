@@ -1,6 +1,6 @@
 # Benchmarks are executables, not tests: they print a table and optionally a
 # JSON/CSV file, and are meant to be run pinned to a core in Release.
-foreach(name kv checksum optimistic)
+foreach(name kv checksum optimistic features)
     add_executable(bench_${name} bench_${name}.cpp)
     target_link_libraries(bench_${name} PRIVATE nosql Threads::Threads)
     target_include_directories(bench_${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

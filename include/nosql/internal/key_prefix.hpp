@@ -20,6 +20,14 @@
 #include "nosql/error.hpp"
 #include "nosql/internal/format.hpp"
 
+/// For the few checks on every cursor step and search probe, which the
+/// compiler otherwise leaves out of line once the throw paths make them look big.
+#if defined(_MSC_VER)
+#define NOSQL_ALWAYS_INLINE __forceinline
+#else
+#define NOSQL_ALWAYS_INLINE inline __attribute__((always_inline))
+#endif
+
 namespace nosql::internal {
 
 /// Room the prefix block of a `plen`-byte prefix takes.
@@ -183,6 +191,10 @@ inline void validateHeader(const Page* p, std::size_t ps)
         bad("page slot and node bounds out of range");
 }
 
+/// Throws the Corrupted error for a node outside its page. Out of line and
+/// cold, so the checks below stay small enough to inline into every search.
+[[noreturn]] void throwNodeOutOfRange();
+
 /// Whether node `i` of a page whose header passed lies inside the node area
 /// ending at `top`. Reads the node's header only once its offset is known to
 /// leave room for one.
@@ -207,15 +219,56 @@ inline bool nodeFits(const Page* p, unsigned i, std::size_t top) noexcept
 inline void checkNode(const Page* p, unsigned i, std::size_t ps)
 {
     if (!nodeFits(p, i, nodeTop(p, ps)))
-        throw Error(ErrorCode::Corrupted, "node out of range");
+        throwNodeOutOfRange();
 }
 
 /// Node `i`'s key, checked to lie inside the node area ending at `top`.
 inline Slice checkedKey(const Page* p, unsigned i, std::size_t top)
 {
     if (!nodeFits(p, i, top))
-        throw Error(ErrorCode::Corrupted, "node out of range");
+        throwNodeOutOfRange();
     return nodeKey(p, i);
+}
+
+/// The key of branch node `i` or leaf node `i`, its offset and key checked to
+/// lie inside the node area ending at `top`: all a search reads. A leaf's
+/// value is checked where it is read (leafValue).
+NOSQL_ALWAYS_INLINE Slice checkedBranchKey(const Page* p, unsigned i, std::size_t top)
+{
+    const auto* base = reinterpret_cast<const std::byte*>(p);
+    const std::size_t off = slots(p)[i], upper = p->upper;
+    if (off < upper || off + sizeof(BranchNode) > top || (off & 3))
+        throwNodeOutOfRange();
+    const std::size_t ksize = readLittle<std::uint16_t>(base + off + 6);
+    if (off + sizeof(BranchNode) + ksize > top)
+        throwNodeOutOfRange();
+    return Slice(base + off + sizeof(BranchNode), ksize);
+}
+NOSQL_ALWAYS_INLINE Slice checkedLeafKey(const Page* p, unsigned i, std::size_t top)
+{
+    const auto* base = reinterpret_cast<const std::byte*>(p);
+    const std::size_t off = slots(p)[i], upper = p->upper;
+    if (off < upper || off + sizeof(LeafNode) > top || (off & 3))
+        throwNodeOutOfRange();
+    const std::size_t ksize = readLittle<std::uint16_t>(base + off + 2);
+    if (off + sizeof(LeafNode) + ksize > top)
+        throwNodeOutOfRange();
+    return Slice(base + off + sizeof(LeafNode), ksize);
+}
+
+/// Leaf node `i` of a page whose header passed, key and value both checked to
+/// lie inside the node area ending at `top`.
+NOSQL_ALWAYS_INLINE const LeafNode* checkedLeafNode(const Page* p, unsigned i, std::size_t top)
+{
+    const auto* base = reinterpret_cast<const std::byte*>(p);
+    const std::size_t off = slots(p)[i];
+    if (off < p->upper || off + sizeof(LeafNode) > top || (off & 3))
+        throwNodeOutOfRange();
+    const auto* n = reinterpret_cast<const LeafNode*>(base + off);
+    const std::size_t payload = (n->flags & N_BIGDATA) ? sizeof(PageNo) : std::size_t(n->vsize);
+    if (off + sizeof(LeafNode) + n->ksize + payload > top)
+        throwNodeOutOfRange();
+    return n;
 }
 
 /// Branch `p`'s child `i` and the entries under it, the node checked first.
@@ -230,13 +283,19 @@ inline std::uint64_t checkedCount(const Page* p, unsigned i, std::size_t ps)
     return branchCount(p, i);
 }
 
-/// Every node of a page whose header passed lies inside it.
+/// Every node of a page whose header passed lies inside it. One loop per page
+/// type, so the type is not tested per node.
 inline void validateNodes(const Page* p, std::size_t ps)
 {
     const std::size_t top = nodeTop(p, ps);
-    for (unsigned i = 0; i < p->nkeys; ++i)
-        if (!nodeFits(p, i, top))
-            throw Error(ErrorCode::Corrupted, "node out of range");
+    const unsigned n = p->nkeys;
+    if (isLeaf(p)) {
+        for (unsigned i = 0; i < n; ++i)
+            (void)checkedLeafNode(p, i, top);
+    } else {
+        for (unsigned i = 0; i < n; ++i)
+            (void)checkedBranchKey(p, i, top);
+    }
 }
 
 }  // namespace nosql::internal
