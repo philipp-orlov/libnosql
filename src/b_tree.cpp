@@ -558,7 +558,6 @@ void splitPage(CursorImpl& c, int level, unsigned newindx, const Entry& ne)
         level = 1;
     }
 
-    const bool shortSeparators = leaf && comparatorFor(tr.flags) == &cmpLexicographic;
     const unsigned split = chooseSplit(ents, count, newindx, leaf, usable, t->scratch());
 
     const PageNo sn = t->allocPages(1);
@@ -579,12 +578,11 @@ void splitPage(CursorImpl& c, int level, unsigned newindx, const Entry& ne)
 
     // Promote the separator first. This may cascade all the way to a new root,
     // but it never touches `mp` or `np`, so the pointers below stay good.
-    // Byte order needs only the shortest prefix of the right leaf's first key
-    // that still sorts after the left leaf's last key. Other orders keep the
-    // whole key: a prefix is not a separator under them.
-    Slice sep = ents[split].key;
-    if (shortSeparators)
-        sep = shortestSeparator(ents[split - 1].key, ents[split].key);
+    // A leaf's first key is more than a separator needs: byte and reverse
+    // order need only enough of it to sort after the left leaf's last key.
+    const Slice sep =
+        leaf ? separatorFor(comparatorFor(tr.flags), ents[split - 1].key, ents[split].key)
+             : ents[split].key;
     branchInsert(c, level - 1, sep, sn, rightCount);
 
     pageInit(mp, mp->pgno, mp->flags, ps);
@@ -614,8 +612,8 @@ void rebalance(CursorImpl& c)
 
     Page* p = c.pg[c.top];
     const bool leaf = isLeaf(p);
-    // Byte-ordered leaves take the shortest separator when a shift moves one.
-    const bool shortSeparators = leaf && comparatorFor(tr.flags) == &cmpLexicographic;
+    // Leaves take the shortest separator their order allows when a shift moves one.
+    const CompareFn cmp = comparatorFor(tr.flags);
     const unsigned minkeys = leaf ? 1u : 2u;
     if (p->nkeys >= minkeys && pageUsed(p, ps) >= minFill)
         return;
@@ -726,10 +724,10 @@ void rebalance(CursorImpl& c)
         if (pageRoom(left) < entryCost(e, leaf))
             return;
         // The new separator is right's slot 1 key, already a valid lower bound;
-        // in byte order, enough of it to sort after the entry moving left.
+        // for leaves, only enough of it to sort after the entry moving left.
         Slice nk = nodeKey(right, 1);
-        if (shortSeparators)
-            nk = shortestSeparator(e.key, nk);
+        if (leaf)
+            nk = separatorFor(cmp, e.key, nk);
         std::byte* nkbuf = t->scratch().alloc(nk.size() ? nk.size() : 1);
         std::memcpy(nkbuf, nk.data(), nk.size());
         const Slice newsep(nkbuf, nk.size());
@@ -761,11 +759,10 @@ void rebalance(CursorImpl& c)
         const std::ptrdiff_t need = std::ptrdiff_t(entryCost(e, leaf)) + sepDelta;
         if (std::ptrdiff_t(pageRoom(right)) < need)
             return;
-        // The moved key becomes right's lower bound; in byte order, only enough
-        // of it to sort after what is left behind as left's last key.
-        const Slice sep = shortSeparators
-                              ? shortestSeparator(nodeKey(left, left->nkeys - 2), movedKey)
-                              : movedKey;
+        // The moved key becomes right's lower bound; for leaves, only enough of
+        // it to sort after what is left behind as left's last key.
+        const Slice sep =
+            leaf ? separatorFor(cmp, nodeKey(left, left->nkeys - 2), movedKey) : movedKey;
         if (pageRoom(parent) + nodeSize(parent, ridx) < branchNodeSize(sep.size()))
             return;
         if (!leaf && !branchSetKey(right, 0, rsep))

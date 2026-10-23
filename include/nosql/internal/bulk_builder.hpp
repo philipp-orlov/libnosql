@@ -213,11 +213,19 @@ private:
         const std::uint64_t entries = leaf_.page()->nkeys;
         const auto number = file_.writePage(leaf_.page());
         ++tree_.leafPages;
-        // In byte order the separator needs only enough of this leaf's first key
-        // to sort after the previous leaf's last; it serves every level above,
-        // where it bounds the same two subtrees. The first leaf's is never stored.
-        if (!lastOfPrevious_.empty() && comparatorFor(tree_.flags) == &cmpLexicographic)
-            leaf_.minimum.resize(shortestSeparator(lastOfPrevious_, leaf_.minimum).size());
+        // The separator needs only enough of this leaf's first key to sort after
+        // the previous leaf's last (a prefix in byte order, a suffix in reverse
+        // order); it serves every level above, where it bounds the same two
+        // subtrees. The first leaf's is never stored.
+        if (!lastOfPrevious_.empty()) {
+            const Slice sep =
+                separatorFor(comparatorFor(tree_.flags), lastOfPrevious_, leaf_.minimum);
+            const auto from =
+                std::size_t(sep.data() - reinterpret_cast<const std::byte*>(leaf_.minimum.data()));
+            const std::size_t len = sep.size();
+            leaf_.minimum.erase(0, from);
+            leaf_.minimum.resize(len);
+        }
         child(0, leaf_.minimum, number, entries);
         lastOfPrevious_ = previous_;
         leaf_.reset(P_LEAF);

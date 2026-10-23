@@ -44,6 +44,30 @@ inline Slice shortestSeparator(Slice left, Slice right) noexcept
     return Slice(right.data(), std::min(right.size(), d + 1));
 }
 
+/// shortestSeparator for cmpReverse trees, which compare from the last byte
+/// back: there a suffix of `right` is the shortest separator. Never empty.
+inline Slice shortestSeparatorReverse(Slice left, Slice right) noexcept
+{
+    const std::size_t n = std::min(left.size(), right.size());
+    std::size_t d = 0;
+    while (d < n && left.data()[left.size() - 1 - d] == right.data()[right.size() - 1 - d])
+        ++d;
+    const std::size_t len = std::min(right.size(), d + 1);
+    return Slice(right.data() + right.size() - len, len);
+}
+
+/// The separator to store between two adjacent leaves, `left`'s last key and
+/// `right`'s first: shortened under byte and reverse order, whole under
+/// integer order, where a shorter key has a different width.
+inline Slice separatorFor(CompareFn cmp, Slice left, Slice right) noexcept
+{
+    if (cmp == &cmpLexicographic)
+        return shortestSeparator(left, right);
+    if (cmp == &cmpReverse)
+        return shortestSeparatorReverse(left, right);
+    return right;
+}
+
 /// An optimistic commit waiting in EnvImpl::occQueue; defined in optimistic.cpp.
 struct OccPending;
 
