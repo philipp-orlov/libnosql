@@ -369,8 +369,23 @@ the entries they divide; merges and shifts move counts with the nodes. Range
 counts (`Db::countRange`) and `Cursor::skip` descend by them.
 
 `dirtyLimit` defaults to 256 MiB of active page buffers, including nested writers;
-a write that would exceed it fails with `ErrorCode::OutOfMemory`, and zero disables
-the limit. `bufferCache` defaults to 32 MiB and bounds idle buffer
+zero disables the limit. A write that may pass it spills first (`TxnImpl::spill`,
+called on entry to `put`, `reserve`, `erase` and the cursor writes, never inside a
+descent, which holds page pointers): starting with the outermost transaction, it
+seals leaf and overflow pages in page order and writes them where they will commit,
+until half the budget is free. Those page numbers are free in every snapshot,
+durable or visible, so the early write is as safe as the one at commit, and the
+`power` suite replays power cuts through spilling commits. The buffer's memory
+goes back to the OS (`discardMemory`) but its address stays owned, so a stale
+pointer still reads mapped memory; the write's own key and value are copied first
+in case they point into one, and open cursors re-anchor. A spilled page touched
+again is read back, verified, into the same buffer under the same page number
+(`unspill`), so a spilling transaction lays out exactly the pages an unbounded one
+would; one that is freed, by the transaction or by an aborted child, is free at
+once like any dirty page. At commit, spilled pages join the runs that are flushed,
+invalidated in the validation cache and captured for shipping. Past the budget
+with spilling off, or with nothing left to spill, a write fails with
+`ErrorCode::OutOfMemory`. `bufferCache` defaults to 32 MiB and bounds idle buffer
 payload bytes. Page buffers never come from the heap. Each request rounds up to
 a power-of-two class of pages, and each class is carved from slabs the pool maps
 from the OS itself (1 MiB, or 64 pages if that is more; a class larger than that
@@ -567,7 +582,7 @@ replaying a correct record with its flushes taken out must fail some, and does.
 It models a device that honours flushes; one that acknowledges a flush it has not
 performed is outside what any ordering can survive.
 
-The suite is 25 CTest binaries in a full build (19 core, `mq` and `mqsteady`,
+The suite is 26 CTest binaries in a full build (20 core, `mq` and `mqsteady`,
 `replication`, `replicationtorture` and `fault`, and `tar`); the optional-layer
 tests are registered only when their subsystem is built, and `hardening` covers the
 file-safety and failure-poisoning behavior of "Opening a Store" and "Failure".

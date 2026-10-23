@@ -130,7 +130,7 @@ no network, and every case cleans up its own scratch directory under the
 system temp path. `ctest` exits non-zero if anything fails, so a pipeline
 needs nothing more than the three commands above.
 
-Twenty-five test binaries are registered in a full build, each with a 900-second timeout
+Twenty-six test binaries are registered in a full build, each with a 900-second timeout
 (the `mq`, `mqsteady`, replication and `tar` entries exist only when their subsystem
 is built):
 
@@ -151,6 +151,7 @@ is built):
 | `optimistic` | `OptimisticTxn`: conflict detection, retries, group commit, escalation |
 | `separators` | shortest branch separators at splits, rebalances and bulk loads |
 | `pipeline` | pipelined `Safe` commits: visibility only once durable, failure handling |
+| `spill` | transactions many times `dirtyLimit`: same pages as unbounded, nested commit and abort, cursors and arguments across a spill |
 | `power` | every write and flush recorded and replayed: at each point, images that keep any subset of the unflushed sectors must open whole on a committed snapshot no older than the last one reported durable, in every durability mode |
 | `mq` | queue semantics: FIFO, leases, redelivery, dead-lettering |
 | `mqsteady` | queues under sustained send/receive: no unbounded growth |
@@ -229,7 +230,8 @@ default, so `nosql::Env store("app.db")` works too.
 | `cacheReadChecksums(b)` | off | let readers trust a page check this process already made; see the integrity tradeoff below. |
 | `revalidateAfter(d)` | 1 minute | how long a cached page check may be trusted; zero means for ever. |
 | `bufferCache(n)` | 32 MiB | page buffers kept recycled between transactions. |
-| `dirtyLimit(n)` | 256 MiB | active dirty page buffers; a write past it fails with `ErrorCode::OutOfMemory`; zero disables. |
+| `dirtyLimit(n)` | 256 MiB | active dirty page buffers; a transaction past it spills pages to the file early; zero disables. |
+| `spillDirtyPages(on)` | on | off: a write past `dirtyLimit` fails with `ErrorCode::OutOfMemory` instead. |
 | `shipTo(dir)`, `shipRetain(n)`, `shipSegmentSize(n)` | off, 16, 64 MiB | change shipping; see Replication. |
 
 Store files are also opened close-on-exec, never through a symbolic link, and are

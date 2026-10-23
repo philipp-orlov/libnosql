@@ -127,6 +127,10 @@ struct EnvImpl
     Durability dura = Durability::Safe;
     std::atomic<bool> failed{false};
     std::uint64_t dirtyLimit = 256ull << 20;
+    /// Write a transaction's pages out early rather than fail at dirtyLimit
+    /// (TxnImpl::spill). Off where a page is smaller than a system page: its
+    /// buffer's memory could not be handed back on its own.
+    bool spill = true;
     std::atomic<std::uint64_t> dirtyBytes{0};
 
     std::shared_ptr<MappedRegion> region;  ///< current mapping
@@ -392,6 +396,14 @@ struct TxnImpl
     /// it is idle). Buffers return to the environment's bounded recycler when
     /// the transaction ends, including cacheable overflow runs.
     std::vector<std::pair<Page*, unsigned>> owned;
+    /// Pages written to the file before commit to stay within dirtyLimit, by
+    /// page number, with the buffer they left. Its memory went back to the OS
+    /// but its address stays in `owned`, so a stale pointer still lands on
+    /// mapped memory; touching the page again brings it back (unspill).
+    PageTable spilled;
+    std::vector<Page*> spillPool;    ///< spilled single-page buffers whose page was freed
+    std::uint64_t spilledBytes = 0;  ///< of `owned`, not counted in dirtyBytes
+    std::vector<std::pair<PageNo, Page*>> spillList;  ///< spill() scratch
 
     /// Commit-path scratch, kept on the transaction so a commit allocates
     /// nothing it has not already allocated once.
@@ -519,6 +531,21 @@ struct TxnImpl
 
     /// Allocate (or recycle) a dirty buffer of `npages` contiguous pages.
     Page* allocBuffer(PageNo p, std::uint16_t flags, unsigned npages);
+    /// Whether a write that may dirty `bytes` more should spill() first.
+    bool wantsSpill(std::uint64_t bytes) const noexcept
+    {
+        const std::uint64_t limit = env->dirtyLimit;
+        return limit && env->spill &&
+               env->dirtyBytes.load(std::memory_order_relaxed) + bytes > limit;
+    }
+    /// Writes this transaction's and its ancestors' leaf and overflow pages to
+    /// the file, at the page numbers they will commit at, until half the dirty
+    /// budget is free, and hands their buffers' memory back. Only between
+    /// operations: no page pointer of an internal descent may be live.
+    void spill();
+    /// The buffer of spilled page or overflow run `p`, read back in and dirty
+    /// again; null if `p` is not one this transaction spilled.
+    Page* unspill(PageNo p);
     PageNo allocPages(unsigned count);
     void freePage(PageNo p, unsigned count = 1);
     void markDirty(unsigned dbi) noexcept { dbs[dbi].dirty = 1; }

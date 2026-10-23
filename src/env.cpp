@@ -467,6 +467,8 @@ Env Env::Options::open(const std::filesystem::path& path) const
 
     const std::size_t ps = e->pageSize;
     e->buffers.configure(ps, bufferCache_);
+    // A spilled buffer gives its memory back only as whole system pages.
+    e->spill = spillDirtyPages_ && ps >= os::systemPageSize();
     if (cacheReadChecksums_)
         e->validation.configure(ps, std::max<std::uint64_t>(maxSize_, 16 * ps), revalidateAfter_);
     // One page copy plus its entry list, with room for a recursive split.

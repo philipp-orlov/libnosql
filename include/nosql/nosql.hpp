@@ -555,6 +555,18 @@ public:
             dirtyLimit_ = bytes;
             return *this;
         }
+        /// On by default: a write transaction that reaches dirtyLimit writes
+        /// some of its pages to the file early, at the page numbers they will
+        /// commit at, and gives their memory back, instead of failing with
+        /// ErrorCode::OutOfMemory. A page it touches again is read back. In such
+        /// a transaction a slice it returned may then read different bytes,
+        /// though never unmapped memory; copy what you need across writes.
+        /// Off where the page size is below the system page size.
+        Options& spillDirtyPages(bool on = true)
+        {
+            spillDirtyPages_ = on;
+            return *this;
+        }
         /// Capture every commit's changed pages into `dir` so a replica can be
         /// advanced from them. Off by default; roughly doubles the bytes a
         /// commit writes. See nosql/replication.hpp and docs/replication.md.
@@ -602,6 +614,7 @@ public:
         std::chrono::milliseconds revalidateAfter_{60000};
         std::size_t bufferCache_ = 32u << 20;
         std::uint64_t dirtyLimit_ = 256ull << 20;
+        bool spillDirtyPages_ = true;
         std::filesystem::path ship_;
         std::uint64_t shipSegment_ = 64ull << 20;
         unsigned shipRetain_ = 16;
