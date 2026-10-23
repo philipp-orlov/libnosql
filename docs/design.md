@@ -519,7 +519,11 @@ that opening, reading and writing each ends in an `Error`; under ASan with
 undefined behaviour made fatal it is a fixed-seed fuzzer, and `fuzz/fuzz_pages.cpp`
 (`NOSQL_BUILD_FUZZERS`, clang) is the open-ended libFuzzer one. Its findings, a
 catalog flag read before its node was checked and a misaligned `upper` a writer
-then placed nodes under, are fixed and replayed by the suite.
+then placed nodes under, are fixed and replayed by the suite. Its sibling `fuzz/fuzz_ops.cpp` drives well-formed stores instead: random
+puts, erases, cursor walks that write as they go, nested and optimistic
+transactions, older snapshots, shrinks, reopens and compactions, over every tree
+flavour and page size and a dirty budget small enough to spill, each read checked
+against a `std::map`. CI runs both briefly on every push.
 
 Every committed-page access validates by default. Dirty private pages are sealed
 only before publication. Overflow bounds are checked before hashing a run.

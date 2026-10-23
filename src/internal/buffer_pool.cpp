@@ -80,7 +80,7 @@ Page* BufferPool::acquire(unsigned npages)
     std::lock_guard<std::mutex> lk(mtx_);
     if (Page* p = free_[c]) {
         Page* next;
-        std::memcpy(&next, p, sizeof next);
+        std::memcpy(&next, static_cast<void*>(p), sizeof next);
         free_[c] = next;
         retained_ -= classPages(c) * page_size_;
         return p;
@@ -109,7 +109,7 @@ void BufferPool::purge() noexcept
     for (unsigned c = 0; c < kClasses; ++c) {
         while (Page* p = free_[c]) {
             Page* next;
-            std::memcpy(&next, p, sizeof next);
+            std::memcpy(&next, static_cast<void*>(p), sizeof next);
             free_[c] = next;
             toSlab(p, int(c));
         }
@@ -189,7 +189,7 @@ void BufferPool::giveBack(Page* buf, int c) noexcept
         return;
     const std::size_t bytes = classPages(c) * page_size_;
     if (bytes <= cap_ - retained_) {
-        std::memcpy(buf, &free_[c], sizeof free_[c]);
+        std::memcpy(static_cast<void*>(buf), &free_[c], sizeof free_[c]);
         free_[c] = buf;
         retained_ += bytes;
         return;
