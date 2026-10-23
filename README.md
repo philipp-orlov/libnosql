@@ -82,7 +82,9 @@ natively on aarch64 Ubuntu 20.04 with GCC 9.4 on 2026-09-29). `mqsteady` had fai
 acknowledgement-count assertion in an earlier sanitizer run; it did not reproduce in
 that run or in ten repetitions, but its cause was never identified. See
 [docs/design.md](docs/design.md).
-ThreadSanitizer, Windows, and big-endian runtime validation remain separate gates.
+CI runs the suite in Release, under ASan/UBSan, and under Clang's ThreadSanitizer
+(`.github/workflows/ci.yml`). Windows and big-endian runtime validation remain
+separate gates.
 Consume it from another project with `find_package(nosql)` and link
 `nosql::nosql`, or just `add_subdirectory`.
 

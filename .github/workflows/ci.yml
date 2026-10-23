@@ -1,0 +1,64 @@
+# Builds and tests on every push and pull request: a Release build, an
+# address+undefined sanitizer build, and a thread sanitizer build.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -j4
+
+  asan:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DNOSQL_ENABLE_ASAN=ON
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --test-dir build --output-on-failure -j4
+
+  tsan:
+    # Clang, not GCC: GCC 13's libtsan does not intercept pthread_mutex_clocklock,
+    # which std::timed_mutex::try_lock_for uses, and so reports every timed
+    # writer's unlock as an unlock of an unlocked mutex.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build clang-18 libclang-rt-18-dev
+      - name: Fit the address space to the thread sanitizer
+        # With the kernel's full mmap randomization the sanitizer's fixed
+        # shadow layout can collide with a mapping, and it aborts at start.
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_CXX_COMPILER=clang++-18 -DNOSQL_ENABLE_TSAN=ON
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        # The allocation-counting suites are not built here; see tests/CMakeLists.txt.
+        env:
+          TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+        run: ctest --test-dir build --output-on-failure -j4

@@ -7,6 +7,12 @@ set(NOSQL_TEST_LIST Basic:basic Env:env Cursor:cursor Named:named Nested:nested
     Overflow:overflow Reclaim:reclaim Steady:steady Memory:memory
     Mvcc:mvcc Torture:torture Format:format Checksum:checksum Hardening:hardening
     AllocBudget:alloc_budget Optimistic:optimistic Separators:separators)
+# The thread sanitizer brings its own allocator, and slows the store enough to
+# move when its containers reach their high-water marks: the suites that count
+# allocations measure neither concurrency nor anything true of a normal build.
+if(NOSQL_ENABLE_TSAN)
+    list(REMOVE_ITEM NOSQL_TEST_LIST Memory:memory AllocBudget:alloc_budget)
+endif()
 if(NOSQL_WITH_MQ)
     list(APPEND NOSQL_TEST_LIST Mq:mq MqSteady:mq_steady)
 endif()
@@ -26,7 +32,7 @@ foreach(entry ${NOSQL_TEST_LIST})
 endforeach()
 target_sources(test_checksum PRIVATE checksum_reference.cpp)
 
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT BUILD_SHARED_LIBS)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT BUILD_SHARED_LIBS AND NOT NOSQL_ENABLE_TSAN)
     target_compile_definitions(test_memory PRIVATE NOSQL_TEST_WRAP_ALLOCATIONS)
     target_link_options(test_memory PRIVATE
         "LINKER:--wrap=aligned_alloc" "LINKER:--wrap=free"

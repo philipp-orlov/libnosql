@@ -9,6 +9,7 @@ option(NOSQL_BUILD_EXAMPLES "Build the examples" ON)
 option(NOSQL_BUILD_TOOLS "Build the nosql command line tool" ON)
 option(NOSQL_BUILD_BENCHMARKS "Build the benchmarks (see benchmarks/)" OFF)
 option(NOSQL_ENABLE_ASAN "Build with address+undefined sanitizers" OFF)
+option(NOSQL_ENABLE_TSAN "Build with the thread sanitizer" OFF)
 # Subsystems layered on the key-value store. A consumer that uses only the KV
 # layer (libsql does) switches off what it does not use: less code to build,
 # patch and audit, and no parsers of segment or archive files from disk.
@@ -70,6 +71,13 @@ target_link_libraries(nosql PUBLIC Threads::Threads)
 if(NOSQL_ENABLE_ASAN AND NOT MSVC)
     target_compile_options(nosql PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer -g)
     target_link_options(nosql PUBLIC -fsanitize=address,undefined)
+endif()
+if(NOSQL_ENABLE_TSAN AND NOT MSVC)
+    if(NOSQL_ENABLE_ASAN)
+        message(FATAL_ERROR "NOSQL_ENABLE_ASAN and NOSQL_ENABLE_TSAN cannot be combined")
+    endif()
+    target_compile_options(nosql PUBLIC -fsanitize=thread -fno-omit-frame-pointer -g)
+    target_link_options(nosql PUBLIC -fsanitize=thread)
 endif()
 
 set_target_properties(nosql PROPERTIES
