@@ -293,9 +293,11 @@ void checkIntegrity(Txn& t)
         for (PageNo page = 0; page <= impl->lastPgno; ++page)
             if (!(c.seen[page / 64] & (std::uint64_t(1) << (page % 64))))
                 c.bad("allocated page is neither live nor free", page);
-        // The count EnvStats reports without a walk must match one.
+        // The count EnvStats reports without a walk must match one. It follows
+        // the commit writers build on, which under pipelined commits can be
+        // ahead of the newest one readers see.
         std::lock_guard<std::mutex> lk(impl->env->mtx);
-        if (impl->env->meta.txnid == impl->meta.txnid && impl->env->freeTreePages != listed)
+        if (impl->env->writerMeta.txnid == impl->meta.txnid && impl->env->freeTreePages != listed)
             throw Error(ErrorCode::Corrupted,
                         "integrity: free-page count differs from the free list");
     }

@@ -5,6 +5,7 @@
 // a commit's meta reaches the device with the next commit's data, yet a commit
 // still returns only once durable and readers still see only durable commits.
 #include <atomic>
+#include <condition_variable>
 #include <cstdio>
 #include <filesystem>
 #include <map>
@@ -218,6 +219,58 @@ TEST(pipelinedOptimisticGroupsLoseNothing)
     e.read([](Txn& t) { CHECK(t.mainDb().get("n")->string() == "240"); });
     const EnvStats st = e.stats();
     CHECK_EQ(st.durableTxn, st.lastTxn);
+}
+
+TEST(pipelinedCommitInFlightKeepsReadersChecksWhole)
+{
+    // Writers build on a commit readers cannot see yet: the free-page count
+    // EnvStats keeps follows the former, and a reader's integrity check of
+    // the newest snapshot it sees must not hold it to that count.
+    tst::Scratch s("pipeline");
+    Env e = Env::configure().pipelineCommits().open(s.file());
+    e.write([](Txn& t) {
+        for (int k = 0; k < 2000; ++k)
+            t.mainDb().put(tst::keyOf(std::uint64_t(k)), tst::blob(300, std::uint64_t(k)));
+    });
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool paused = false, resume = false;
+    std::thread writer([&] {
+        ScopedIoObserver hold([&](IoEvent ev, std::size_t) {
+            if (ev != IoEvent::MetaBarrier)
+                return;
+            std::unique_lock<std::mutex> lk(mtx);
+            paused = true;
+            cv.notify_all();
+            cv.wait(lk, [&] { return resume; });
+        });
+        // Frees far more pages than the meta page lists: the free list grows.
+        e.write([](Txn& t) { t.mainDb().clear(); });
+    });
+    {
+        std::unique_lock<std::mutex> lk(mtx);
+        cv.wait(lk, [&] { return paused; });
+    }
+    std::string failed;
+    std::uint64_t seen = 0;
+    const EnvStats st = e.stats();
+    try {
+        e.read([&](Txn& t) {
+            seen = t.id();
+            checkIntegrity(t);
+        });
+    } catch (const std::exception& ex) {
+        failed = ex.what();
+    }
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        resume = true;
+    }
+    cv.notify_all();
+    writer.join();
+    CHECK_EQ(seen, st.lastTxn);  // the commit in flight is not seen
+    CHECK_EQ(failed, std::string());
+    e.read([&](Txn& t) { checkIntegrity(t); });
 }
 
 TEST(pipelinedFailedOwnFlushFailsTheCommit)
