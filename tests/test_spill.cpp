@@ -452,6 +452,53 @@ TEST(abortedChildrenDoNotFillTheBudget)
     env.read([&](Txn& txn) { CHECK(contentsOf(txn) == expect); });
 }
 
+/// shrink() under a budget: with spilling it moves as much as without one,
+/// a leaf whose overflow runs alone pass the budget included; with spilling
+/// off it moves what fits and leaves the rest where it is, never failing.
+TEST(shrinkMovesWhatTheBudgetAllows)
+{
+    auto shrunk = [](std::uint64_t limit, bool spill) {
+        tst::Scratch scratch("spill-shrink");
+        Env env = Env::configure()
+                      .pageSize(4096)
+                      .sync(Durability::None)
+                      .dirtyLimit(limit)
+                      .spillDirtyPages(spill)
+                      .open(scratch.file());
+        State expect;
+        // Filler low in the file, in commits the budget takes without a spill.
+        for (int round = 0; round < 16; ++round)
+            env.write([&](Txn& txn) {
+                Db db = txn.mainDb();
+                for (int i = 0; i < 15; ++i)
+                    db.put(tst::keyOf(round * 15 + i, "filler"), tst::blob(2000, std::uint64_t(i)));
+            });
+        // Runs of five pages above it, all named from one leaf.
+        for (int i = 0; i < 24; ++i)
+            env.write([&](Txn& txn) {
+                const std::string value = tst::blob(18000, std::uint64_t(i));
+                txn.mainDb().put(tst::keyOf(i, "run"), value);
+                expect[tst::keyOf(i, "run")] = value;
+            });
+        env.write([&](Txn& txn) {
+            Db db = txn.mainDb();
+            for (int i = 0; i < 240; ++i)
+                db.erase(tst::keyOf(i, "filler"));
+        });
+        const std::uint64_t cut = env.shrink();
+        CHECK_EQ(env.stats().dirtyBytes, 0u);
+        env.read([&](Txn& txn) {
+            checkIntegrity(txn);
+            CHECK(contentsOf(txn) == expect);
+        });
+        return cut;
+    };
+    const std::uint64_t unbounded = shrunk(0, true);
+    CHECK(unbounded > 256u << 10);
+    CHECK_EQ(shrunk(64u << 10, true), unbounded);
+    CHECK(shrunk(64u << 10, false) <= unbounded);
+}
+
 /// With spilling off the budget is a hard limit, as before.
 TEST(spillingOffFailsAtTheBudget)
 {
