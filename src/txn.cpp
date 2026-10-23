@@ -419,6 +419,19 @@ void TxnImpl::freePage(PageNo p, unsigned count)
 
 namespace {
 
+/// vector::assign that grows the capacity geometrically. assign() allocates
+/// exactly what it is given, so a list whose high-water mark creeps up, as
+/// the free-list remainder does with the timing of Lazy syncs, would
+/// allocate again at every new mark.
+template <class V, class It>
+void assignGrowing(V& v, It first, It last)
+{
+    const auto n = std::size_t(last - first);
+    if (n > v.capacity())
+        v.reserve(std::max(n, 2 * v.capacity()));
+    v.assign(first, last);
+}
+
 void flushNamedTrees(TxnImpl* t)
 {
     for (unsigned i = kCatalogDbi + 1; i < t->dbs.size(); ++i) {
@@ -556,7 +569,7 @@ void updateFreelist(TxnImpl* t)
         // the unspent remainder of what it absorbed goes into the tree. The
         // next small commit then absorbs the inline entry, needs nothing from
         // the tree, and writes no free-list page at all.
-        remainder.assign(remainderBegin, t->reclaim.end());
+        assignGrowing(remainder, remainderBegin, t->reclaim.end());
         const std::size_t oldChunks = (remainder.size() + chunkPages - 1) / chunkPages;
         const bool useOldKeys = keepReusable && oldChunks <= kRemainderChunks;
         pinned.clear();
@@ -565,7 +578,7 @@ void updateFreelist(TxnImpl* t)
             for (const PageNo p : freed)
                 (t->env->isBorn(p) ? exempt : pinned).push_back(p);
         } else {
-            pinned.assign(freed.begin(), freed.end());
+            assignGrowing(pinned, freed.begin(), freed.end());
         }
         retired = useOldKeys ? &pinned : &freed;
         inlineFreed = !retired->empty() && retired->size() <= kInlineMax;
@@ -625,7 +638,7 @@ void updateFreelist(TxnImpl* t)
     }
     t->freeTreeDelta += std::int64_t(listed);
     if (inlineFreed) {
-        t->inlinePages.assign(retired->begin(), retired->end());
+        assignGrowing(t->inlinePages, retired->begin(), retired->end());
         t->inlineOurs = true;
     }
 
@@ -941,7 +954,7 @@ TxnId writeMeta(TxnImpl* t)
         // platforms that flush by range. Then this meta goes in without a
         // barrier of its own, and the writer slot goes to the next writer,
         // which builds on it. Readers see it once it lands.
-        e->syncRuns.assign(t->flushRuns.begin(), t->flushRuns.end());
+        assignGrowing(e->syncRuns, t->flushRuns.begin(), t->flushRuns.end());
         if (e->unflushedTxn)
             e->syncRuns.insert(e->syncRuns.begin(), {e->unflushedSlot, e->unflushedSlot});
         const std::int64_t began = steadyNs();

@@ -8,6 +8,7 @@
 #include <malloc.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <new>
@@ -152,9 +153,12 @@ struct Workload
 void checkWarmTransactions(Durability mode, bool cachedChecksums)
 {
     tst::Scratch scratch("alloc-budget");
+    // Lazy syncs every hundred writes rather than on a timer, as in the
+    // optimistic case below: warm-up and measurement must see the same syncs.
     Env env = Env::configure()
                   .pageSize(4096)
                   .sync(mode)
+                  .syncInterval(std::chrono::hours(1))
                   .cacheReadChecksums(cachedChecksums)
                   .open(scratch.file());
     env.write([](Txn& t) {
@@ -168,13 +172,18 @@ void checkWarmTransactions(Durability mode, bool cachedChecksums)
     // measured window allocates nothing.
     const int warm = mode == Durability::Safe ? 2000 : 1000;
     const int measured = mode == Durability::Safe ? 50 : 1000;
-    for (int i = 0; i < warm; ++i)
+    const auto write = [&](int i) {
         work.write();
+        if (mode == Durability::Lazy && i % 100 == 99)
+            env.sync();
+    };
+    for (int i = 0; i < warm; ++i)
+        write(i);
     for (int i = 0; i < 100; ++i)
         work.read();
     const std::size_t before = heapCalls.load();
     for (int i = 0; i < measured; ++i)
-        work.write();
+        write(i);
     const std::size_t afterWrites = heapCalls.load();
     for (int i = 0; i < measured; ++i)
         work.read();
@@ -207,7 +216,15 @@ TEST(warmOptimisticTransactionsDoNotAllocate)
 {
     for (const Durability mode : {Durability::None, Durability::Lazy}) {
         tst::Scratch scratch("alloc-optimistic");
-        Env env = Env::configure().pageSize(4096).sync(mode).open(scratch.file());
+        // Lazy syncs come every hundred writes, not on a timer: a sync moves
+        // what the free list keeps reusable, and with it the high-water marks
+        // of the commit's scratch, so warm-up and measurement must see the same
+        // pattern however slowly the machine runs them.
+        Env env = Env::configure()
+                      .pageSize(4096)
+                      .sync(mode)
+                      .syncInterval(std::chrono::hours(1))
+                      .open(scratch.file());
         env.write([](Txn& t) {
             t.db(kBlobs, DbFlags::Create);
             t.db(kIndex, DbFlags::Create);
@@ -224,6 +241,8 @@ TEST(warmOptimisticTransactionsDoNotAllocate)
                 t.put(kIndex, index, Slice::ref(seq));
             }
             t.commit();
+            if (mode == Durability::Lazy && seq % 1000 == 0)
+                env.sync();
         };
         for (int i = 0; i < 1000; ++i)
             write();
