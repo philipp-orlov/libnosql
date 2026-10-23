@@ -122,7 +122,13 @@ mixed widths. Application encodings must honor this ordering contract.
 (`fileMode()` overrides it; an existing file keeps its mode), and takes a
 whole-file `flock`: exclusive for read-write, shared for `readOnly()`. The lock
 replaces a `.lck` file; a conflicting opener gets `ErrorCode::Busy`. Windows uses
-`LockFileEx` the same way but applies no mode, symlink or owner checks.
+`LockFileEx` the same way but applies no mode, symlink or owner checks. Its locks
+are mandatory, so it locks one byte past any data rather than the file: other
+handles, a checkpoint or a snapshot copy in the same process among them, still
+read the store. A replacement (compaction, a replica's apply) renames with POSIX
+semantics where the volume has them, which may replace a file still open, and
+falls back to `MoveFileEx`; ship-log segments are opened shared for deletion so
+pruning can remove them while a scan holds them. CI builds and tests with MSVC.
 
 On Linux the file's filesystem type is checked: network and user-space
 filesystems (NFS, SMB, FUSE, Ceph, 9p and others) are refused with
@@ -646,8 +652,9 @@ revision. The installed consumer is not a CTest entry. None of this establishes
 runtime correctness on any particular board or its vendor kernel.
 
 Run examples in a disposable directory because several create databases/archives in
-their working directory. Windows, big-endian runtime, exhaustive fault schedules and
-physical power-loss testing remain separate validation gates.
+their working directory. Big-endian runtime, exhaustive fault schedules and
+physical power-loss testing remain separate validation gates; Windows is tested in
+CI with MSVC (not `hardening` or `allocbudget`, which are POSIX- and glibc-specific).
 
 Continuous integration (`.github/workflows/ci.yml`) runs the suite on every push and
 pull request three ways: Release, ASan/UBSan, and ThreadSanitizer. The thread
