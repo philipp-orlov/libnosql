@@ -225,7 +225,14 @@ TEST(lazyBackgroundSyncBoundsAnIdleStoresLoss)
                     .sync(Durability::Lazy)
                     .syncInterval(milliseconds(30))
                     .open(s.file("plain.db"));
-        put(e, 0);
+        // A commit made more than an interval after the last sync syncs
+        // itself, as a slow open can make the first one: commit until one is
+        // left in memory, then wait.
+        int i = 0;
+        do
+            put(e, i++);
+        while (e.stats().durableTxn == e.stats().lastTxn && i < 100);
+        CHECK(e.stats().durableTxn < e.stats().lastTxn);
         std::this_thread::sleep_for(milliseconds(150));
         CHECK(e.stats().durableTxn < e.stats().lastTxn);
     }
