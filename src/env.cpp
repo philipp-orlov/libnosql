@@ -269,6 +269,25 @@ void EnvImpl::growLocked(std::uint64_t needed)
     region = std::move(fresh);
 }
 
+/// Cut the file to `bytes` (Env::shrink()). A reserved mapping keeps its
+/// address range, and its extent past the new end is mapped again in place
+/// when the file grows; a plain one is unmapped by its size, so it is
+/// replaced by a mapping of the new size and kept for whoever still holds it.
+void EnvImpl::shrinkLocked(std::uint64_t bytes)
+{
+    if (bytes >= region->m.size)
+        return;
+    os::resizeFile(fd, bytes);
+    if (region->m.reserved) {
+        region->m.size = std::size_t(bytes);
+        return;
+    }
+    auto fresh = std::make_shared<MappedRegion>();
+    fresh->m = os::mapFile(fd, std::size_t(bytes), !readOnly);
+    staleRegions.push_back(std::move(region));
+    region = std::move(fresh);
+}
+
 /// Drop mappings nobody references any more. Safe only at a transaction
 /// boundary, where the last raw pointers into them have gone out of scope.
 void EnvImpl::releaseStaleRegions()

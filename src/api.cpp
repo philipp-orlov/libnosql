@@ -1023,10 +1023,10 @@ std::uint64_t Env::shrink()
 #ifndef _WIN32
         {
             std::lock_guard<std::mutex> lk(e->mtx);
-            const std::uint64_t bytes = (std::uint64_t(t->lastPgno) + 1) * ps;
-            if (bytes < e->region->m.size) {
-                os::resizeFile(e->fd, bytes);
-                e->region->m.size = std::size_t(bytes);
+            e->shrinkLocked((std::uint64_t(t->lastPgno) + 1) * ps);
+            if (t->region != e->region) {
+                t->seen.push_back(std::move(t->region));
+                t->region = e->region;
             }
         }
 #else
