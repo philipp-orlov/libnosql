@@ -550,14 +550,28 @@ For reconstruction, implement and test primitives in dependency order:
 
 Every stage needs narrow tests before relying on higher-level stress tests.
 `internal::os::ScopedIoObserver` supplies thread-local deterministic I/O failures,
-including partial write progress and publication barriers. It does not model
-volatile device caches or every power-loss reordering.
+including partial write progress and publication barriers. Copying the file at
+one of those moments assumes every write before it landed; the `power` suite
+drops that assumption. An `internal::os::WriteRecorder` sees every write, through
+a system call or as a store into the mapping (`recordMappedWrite`), every resize
+and every flush, in program order. The test replays the record against a model
+of the device: bytes a flush covered are kept, and every sector written since may
+hold any version written to it or the one before, the file size likewise. At each
+point it builds images that keep none of that, all of it, random sectors and
+random whole pages, and each must pass `checkIntegrity` and hold exactly a
+committed snapshot no older than the newest the store reported durable. At every
+whole-file flush the model must equal the real file, so a write the recorder
+missed fails the test rather than weakening it. Removing the data barrier before
+a `Safe` meta write, or before the meta write of a `Lazy` sync, fails most images;
+replaying a correct record with its flushes taken out must fail some, and does.
+It models a device that honours flushes; one that acknowledges a flush it has not
+performed is outside what any ordering can survive.
 
-The suite is 20 CTest binaries in a full build (14 core, `mq` and `mqsteady`,
+The suite is 25 CTest binaries in a full build (19 core, `mq` and `mqsteady`,
 `replication`, `replicationtorture` and `fault`, and `tar`); the optional-layer
 tests are registered only when their subsystem is built, and `hardening` covers the
 file-safety and failure-poisoning behavior of "Opening a Store" and "Failure".
-On 2026-09-29 all 20 passed natively on aarch64 Ubuntu 20.04 with GCC 9.4 in
+On 2026-09-29 all 20 then registered passed natively on aarch64 Ubuntu 20.04 with GCC 9.4 in
 Release, and all 20 passed in a RelWithDebInfo build with `NOSQL_ENABLE_ASAN=ON`
 (ASan and UBSan, leak detection on). `mqsteady`'s
 `abandonedAndRejectedWorkIsAlwaysRecovered` case had once failed an

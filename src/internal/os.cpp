@@ -225,6 +225,8 @@ void resizeFile(FileHandle h, std::uint64_t bytes)
         fail(ErrorCode::IoError, "SetFilePointerEx");
     if (!::SetEndOfFile(h))
         fail(ErrorCode::IoError, "SetEndOfFile");
+    if (WriteRecorder* r = writeRecorder.load(std::memory_order_relaxed))
+        r->resized(h, bytes);
 }
 
 void syncFile(FileHandle h, bool)
@@ -232,6 +234,8 @@ void syncFile(FileHandle h, bool)
     observeIo(IoEvent::Sync);
     if (!::FlushFileBuffers(h))
         fail(ErrorCode::IoError, "FlushFileBuffers");
+    if (WriteRecorder* r = writeRecorder.load(std::memory_order_relaxed))
+        r->flushed(h, 0, 0);
 }
 
 void reserveSpace(FileHandle, std::uint64_t, std::uint64_t)
@@ -292,6 +296,7 @@ void writeAt(FileHandle h, std::uint64_t offset, const void* src, std::size_t le
             fail(ErrorCode::IoError, "WriteFile");
         if (put == 0)
             throw Error(ErrorCode::IoError, "WriteFile made no progress");
+        recordMappedWrite(h, offset, p, put);
         observeIo(IoEvent::WriteProgress, put);
         p += put;
         offset += put;
@@ -358,6 +363,8 @@ void flushRange(FileHandle h, const Mapping& m, std::size_t offset, std::size_t 
         fail(ErrorCode::IoError, "FlushViewOfFile");
     if (!::FlushFileBuffers(h))
         fail(ErrorCode::IoError, "FlushFileBuffers");
+    if (WriteRecorder* r = writeRecorder.load(std::memory_order_relaxed))
+        r->flushed(h, 0, 0);
 }
 
 void advise(const Mapping& m, std::size_t offset, std::size_t length, Advice a) noexcept
@@ -446,6 +453,8 @@ void resizeFile(FileHandle fd, std::uint64_t bytes)
     observeIo(IoEvent::Resize, std::size_t(bytes));
     if (::ftruncate(fd, off_t(bytes)) != 0)
         fail(ErrorCode::IoError, "ftruncate");
+    if (WriteRecorder* r = writeRecorder.load(std::memory_order_relaxed))
+        r->resized(fd, bytes);
 }
 
 void syncFile(FileHandle fd, bool metadata)
@@ -454,6 +463,8 @@ void syncFile(FileHandle fd, bool metadata)
     const int rc = metadata ? ::fsync(fd) : ::fdatasync(fd);
     if (rc != 0)
         fail(ErrorCode::IoError, "fsync");
+    if (WriteRecorder* r = writeRecorder.load(std::memory_order_relaxed))
+        r->flushed(fd, 0, 0);
 }
 
 void reserveSpace(FileHandle fd, std::uint64_t offset, std::uint64_t length)
@@ -565,6 +576,7 @@ void writeAt(FileHandle fd, std::uint64_t offset, const void* src, std::size_t l
         }
         if (n == 0)
             throw Error(ErrorCode::IoError, "pwrite made no progress");
+        recordMappedWrite(fd, offset, p, std::size_t(n));
         observeIo(IoEvent::WriteProgress, std::size_t(n));
         p += n;
         offset += std::uint64_t(n);
@@ -604,6 +616,16 @@ void writeAtV(FileHandle fd, std::uint64_t offset, const Span* parts, unsigned c
             }
             if (w == 0)
                 throw Error(ErrorCode::IoError, "pwritev made no progress");
+            if (WriteRecorder* r = writeRecorder.load(std::memory_order_relaxed)) {
+                std::uint64_t at = offset;
+                std::size_t left = std::size_t(w);
+                for (unsigned i = 0; i < n && left; ++i) {
+                    const std::size_t part = std::min(left, iov[i].iov_len);
+                    r->written(fd, at, iov[i].iov_base, part);
+                    at += part;
+                    left -= part;
+                }
+            }
             observeIo(IoEvent::WriteProgress, std::size_t(w));
             offset += std::uint64_t(w);
             total -= std::size_t(w);
@@ -717,7 +739,10 @@ void flushRange(FileHandle fd, const Mapping& m, std::size_t offset, std::size_t
         if (errno != EINVAL)
             fail(ErrorCode::IoError, "msync");
         syncFile(fd, false);
+        return;
     }
+    if (WriteRecorder* r = writeRecorder.load(std::memory_order_relaxed))
+        r->flushed(fd, begin, end - begin);
 }
 
 void advise(const Mapping& m, std::size_t offset, std::size_t length, Advice a) noexcept
