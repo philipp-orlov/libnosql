@@ -740,22 +740,75 @@ void syncTo(EnvImpl& e, const os::Mapping& view, const Meta& m)
     e.lastSyncNs.store(steadyNs(), std::memory_order_relaxed);
 }
 
-/// Makes the commit visible to new transactions.
-void publish(EnvImpl& e, TxnImpl* t, const Meta& m)
+/// Makes a commit visible to new readers and to commit waiters. Caller holds mtx.
+void publishToReadersLocked(EnvImpl& e, const Meta& m)
 {
-    std::lock_guard<std::mutex> lk(e.mtx);
     e.meta = m;
+    e.commitGen.store(m.txnid, std::memory_order_release);
+}
+
+/// Makes a commit the one the next writer builds on. Caller holds mtx.
+void publishToWritersLocked(EnvImpl& e, TxnImpl* t, const Meta& m)
+{
+    e.writerMeta = m;
     e.carryOver.swap(t->carryNext);
     e.freeTreePages = std::uint64_t(std::int64_t(e.freeTreePages) + t->freeTreeDelta);
-    e.commitGen.store(m.txnid, std::memory_order_release);
     e.occLog.record(m.txnid, t->occTrack && !t->occUnknown ? &t->occWritten : nullptr);
     // Every snapshot still validated against, a reader's or an optimistic
-    // commit's, is at or after the oldest one held, so entries at or before it
-    // can no longer conflict with anything.
-    TxnId oldest = e.readers.empty() ? TxnId(m.txnid) : TxnId(e.readers.front().first);
+    // commit's, is at or after the oldest one held, and a new one starts at
+    // the newest readers may see; entries at or before that can no longer
+    // conflict with anything.
+    TxnId oldest = e.readers.empty() ? TxnId(e.meta.txnid) : TxnId(e.readers.front().first);
     if (!e.occPins.empty())
         oldest = std::min(oldest, TxnId(e.occPins.front().first));
     e.occLog.trim(oldest);
+}
+
+/// Makes the commit visible to everyone at once: every mode but pipelined Safe.
+void publish(EnvImpl& e, TxnImpl* t, const Meta& m)
+{
+    std::lock_guard<std::mutex> lk(e.mtx);
+    publishToReadersLocked(e, m);
+    publishToWritersLocked(e, t, m);
+}
+
+/// A pipelined commit's meta has reached the device, by a later commit's data
+/// flush or by its own: readers may see it now, and its committer may return.
+/// Caller holds syncMtx.
+void landPipelined(EnvImpl& e, bool carried)
+{
+    e.lastMetaCarried.store(carried, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lk(e.mtx);
+        e.durableTxn = e.unflushedTxn;
+        publishToReadersLocked(e, e.unflushedMeta);
+    }
+    e.durableSlot = e.unflushedSlot;
+    e.unflushedTxn = 0;
+    e.commitCv.notify_all();
+}
+
+/// Flushes pipelined commit `id`'s meta page itself, unless a later commit's
+/// data flush carried it already.
+void flushOwnMeta(EnvImpl& e, TxnId id)
+{
+    std::lock_guard<std::mutex> sl(e.syncMtx);
+    if (e.unflushedTxn != id || e.failed.load())
+        return;
+    std::shared_ptr<MappedRegion> keep;
+    {
+        std::lock_guard<std::mutex> lk(e.mtx);
+        keep = e.region;
+    }
+    try {
+        os::flushRange(e.fd, keep->m, std::size_t(e.unflushedSlot) * e.pageSize, e.pageSize);
+    } catch (...) {
+        // The kernel may drop the page after a failed flush; see Failure.
+        e.failed.store(true);
+        e.commitCv.notify_all();
+        throw;
+    }
+    landPipelined(e, false);
 }
 
 /// Builds the new meta and publishes it. What reaches the file, and when,
@@ -764,7 +817,7 @@ void publish(EnvImpl& e, TxnImpl* t, const Meta& m)
 /// storage before those pages. Torn writes of the meta page itself are
 /// handled by the two-slot checksum scheme in loadMeta() (env.cpp), not by
 /// write ordering.
-void writeMeta(TxnImpl* t)
+TxnId writeMeta(TxnImpl* t)
 {
     EnvImpl* e = t->env;
     Meta m = t->meta;
@@ -809,6 +862,30 @@ void writeMeta(TxnImpl* t)
     m.inlineTxn = inlineTxn;
     m.checksum = metaChecksum(m);
 
+    if (e->pipelined) {
+        std::lock_guard<std::mutex> sl(e->syncMtx);
+        // One barrier for this commit's data and for the previous commit's
+        // meta, still waiting for one; the runs name that page too, for the
+        // platforms that flush by range. Then this meta goes in without a
+        // barrier of its own, and the writer slot goes to the next writer,
+        // which builds on it. Readers see it once it lands.
+        e->syncRuns.assign(t->flushRuns.begin(), t->flushRuns.end());
+        if (e->unflushedTxn)
+            e->syncRuns.insert(e->syncRuns.begin(), {e->unflushedSlot, e->unflushedSlot});
+        const std::int64_t began = steadyNs();
+        os::flushData(e->fd, t->region->m, e->syncRuns, e->pageSize);
+        e->dataFlushNs.store(steadyNs() - began, std::memory_order_relaxed);
+        if (e->unflushedTxn)
+            landPipelined(*e, true);
+        const unsigned slot = storeMeta(*e, t->region->m, m);
+        e->unflushedTxn = m.txnid;
+        e->unflushedSlot = slot;
+        e->unflushedMeta = m;
+        std::lock_guard<std::mutex> lk(e->mtx);
+        publishToWritersLocked(*e, t, m);
+        return m.txnid;
+    }
+
     const bool lazyDue =
         e->dura == Durability::Lazy &&
         steadyNs() - e->lastSyncNs.load(std::memory_order_relaxed) >= e->syncIntervalNs;
@@ -844,6 +921,7 @@ void writeMeta(TxnImpl* t)
     }
     // After the flush, so a woken waiter's snapshot always contains the commit.
     e->commitCv.notify_all();
+    return 0;
 }
 
 void commitNested(TxnImpl* t)
@@ -922,6 +1000,7 @@ void finishWriter(TxnImpl* t)
         std::lock_guard<std::mutex> lk(e->mtx);
         e->releaseStaleRegions();
     }
+    e->writersPending.fetch_sub(1, std::memory_order_relaxed);
     e->writeMtx.unlock();
 }
 
@@ -947,9 +1026,10 @@ void abortNested(TxnImpl* t)
 
 }  // namespace
 
-
-void txnCommit(TxnImpl* t)
+void txnCommit(TxnImpl* t, TxnId* awaitLater)
 {
+    if (awaitLater)
+        *awaitLater = 0;
     EnvImpl* e = t->env;
     if (t->child)
         throw Error(ErrorCode::BadTransaction, "commit the nested transaction first");
@@ -974,6 +1054,7 @@ void txnCommit(TxnImpl* t)
     // usable and only this transaction is lost. Everything after that point
     // poisons the handle (see Env::writeTxn).
     bool untouched = true;
+    TxnId pending = 0;  // a pipelined commit whose meta still waits for its flush
     if (t->occTrack && !t->occUnknown) {
         // Sorted now, so publish() can hand it to the log under the lock as is.
         std::sort(t->occWritten.begin(), t->occWritten.end());
@@ -989,19 +1070,58 @@ void txnCommit(TxnImpl* t)
         }
         untouched = false;
         writePages(t);
-        writeMeta(t);
+        pending = writeMeta(t);
         // Reads the bytes back out of the mapping writePages() just wrote
         // through, so a segment carries what the store holds rather than what
         // the dirty buffers held. Cannot fail the commit: see ShipWriter.
         if (e->ship)
-            e->ship->capture(e->meta, t->flushRuns, t->region->m.base);
+            e->ship->capture(e->writerMeta, t->flushRuns, t->region->m.base);
     } catch (...) {
         if (!untouched)
             e->failed.store(true);
         finishWriter(t);
         throw;
     }
-    finishWriter(t);
+    finishWriter(t);  // the next writer may start while this one's meta waits
+    if (pending) {
+        if (awaitLater)
+            *awaitLater = pending;
+        else
+            awaitDurable(*e, pending);
+    }
+}
+
+void awaitDurable(EnvImpl& e, TxnId id)
+{
+    // Only a pipelined commit waits for its own meta. Under Lazy and None the
+    // durable commit lags on purpose, and no flush here would move it.
+    if (!e.pipelined)
+        return;
+    // Worth waiting for a successor to carry the meta when one is visible, or
+    // when the last meta was carried and so commits are arriving as a stream;
+    // for about two data flushes at most, about what flushing it here costs.
+    // A lone writer flushes at once and pays no wait.
+    constexpr std::int64_t kMinPatienceNs = 50'000;
+    const std::int64_t patience =
+        std::max(kMinPatienceNs, 2 * e.dataFlushNs.load(std::memory_order_relaxed));
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::nanoseconds(patience);
+    std::unique_lock<std::mutex> lk(e.mtx);
+    while (e.durableTxn < id) {
+        if (e.failed.load())
+            throw Error(ErrorCode::IoError,
+                        "a flush failed before this commit's meta reached the device; close and "
+                        "reopen the environment");
+        const bool successor = e.writersPending.load(std::memory_order_relaxed) != 0 ||
+                               e.occWaiting.load(std::memory_order_relaxed) != 0 ||
+                               e.lastMetaCarried.load(std::memory_order_relaxed);
+        if (!successor || std::chrono::steady_clock::now() >= deadline) {
+            lk.unlock();
+            flushOwnMeta(e, id);
+            lk.lock();
+            continue;
+        }
+        e.commitCv.wait_until(lk, deadline);
+    }
 }
 
 void syncEnv(EnvImpl& e, bool force)
@@ -1034,8 +1154,12 @@ void syncEnv(EnvImpl& e, bool force)
     os::flushRange(e.fd, view, 0, view.size);
     os::syncFile(e.fd, true);
     if (e.unflushedTxn) {
-        markDurable(e, e.unflushedTxn, e.unflushedSlot);
-        e.unflushedTxn = 0;
+        if (e.pipelined) {
+            landPipelined(e, false);
+        } else {
+            markDurable(e, e.unflushedTxn, e.unflushedSlot);
+            e.unflushedTxn = 0;
+        }
     }
 }
 

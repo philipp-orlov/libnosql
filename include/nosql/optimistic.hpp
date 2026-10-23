@@ -120,8 +120,9 @@ private:
     void scanImpl(Slice db, Slice lo, Slice hi, bool (*call)(void*, Slice, Slice), void* ctx);
     void finish() noexcept;
     /// Applies the group in env.occBatch as the group-commit leader. Outcomes go
-    /// into each member's pending record; it never throws.
-    static void applyBatch(internal::EnvImpl& env) noexcept;
+    /// into each member's pending record; it never throws. Returns the commit
+    /// whose durability the group still waits for under pipelined commits.
+    static std::uint64_t applyBatch(internal::EnvImpl& env) noexcept;
     std::unique_ptr<Impl> impl_;
 };
 

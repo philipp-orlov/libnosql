@@ -19,7 +19,6 @@ namespace nosql {
 using namespace internal;
 
 namespace internal {
-void txnCommit(TxnImpl*);
 void txnAbort(TxnImpl*);
 }  // namespace internal
 
@@ -180,6 +179,7 @@ Txn Env::writeTxn()
     EnvImpl* e = &openEnv(impl_);
     if (e->readOnly)
         throw Error(ErrorCode::ReadOnly, "store was opened read-only");
+    e->writersPending.fetch_add(1, std::memory_order_relaxed);  // until finishWriter
     e->writeMtx.lock();
     return beginWriter();
 }
@@ -189,9 +189,12 @@ Txn Env::writeTxn(std::chrono::milliseconds timeout)
     EnvImpl* e = &openEnv(impl_);
     if (e->readOnly)
         throw Error(ErrorCode::ReadOnly, "store was opened read-only");
-    if (!e->writeMtx.try_lock_for(timeout))
+    e->writersPending.fetch_add(1, std::memory_order_relaxed);  // until finishWriter
+    if (!e->writeMtx.try_lock_for(timeout)) {
+        e->writersPending.fetch_sub(1, std::memory_order_relaxed);
         throw Error(ErrorCode::Busy, "another write transaction held the store for " +
                                          std::to_string(timeout.count()) + " ms");
+    }
     return beginWriter();
 }
 
@@ -208,14 +211,14 @@ Txn Env::beginWriter()
             t = e->acquireTxnLocked();
             t->env = e;
             t->readOnly = false;
-            t->loadSnapshot(e->meta, e->region);
+            t->loadSnapshot(e->writerMeta, e->region);
             // Under mtx, which every optimistic snapshot is taken under too.
             t->occTrack = e->occActive.load(std::memory_order_relaxed) != 0;
             t->oldest = e->oldestSnapshot();
             t->readersOldest = t->oldest;
             t->exemptEpoch = 0;
             if (e->deferredMeta()) {
-                const TxnId newest = e->meta.txnid;
+                const TxnId newest = e->writerMeta.txnid;
                 t->readersOldest =
                     e->readers.empty() ? newest : std::min<TxnId>(e->readers.front().first, newest);
                 t->exemptEpoch = std::min<TxnId>(e->durableTxn, newest);
@@ -235,6 +238,7 @@ Txn Env::beginWriter()
         t->loose.reserve(16);
         t->txnid = t->meta.txnid + 1;
     } catch (...) {
+        e->writersPending.fetch_sub(1, std::memory_order_relaxed);
         e->writeMtx.unlock();
         throw;
     }
@@ -359,6 +363,22 @@ void Txn::commit()
     const std::shared_ptr<EnvImpl> keep = std::move(env_);
     if (!held->finished)
         txnCommit(held.get());
+}
+
+void Txn::commit(std::uint64_t* awaitLater)
+{
+    *awaitLater = 0;
+    if (!impl_)
+        return;
+    if (!impl_->finished && impl_->child)
+        throw Error(ErrorCode::BadTransaction, "commit the nested transaction first");
+    const std::shared_ptr<TxnImpl> held = std::move(impl_);
+    const std::shared_ptr<EnvImpl> keep = std::move(env_);
+    if (!held->finished) {
+        TxnId pending = 0;
+        txnCommit(held.get(), &pending);
+        *awaitLater = pending;
+    }
 }
 
 void Txn::abort()
