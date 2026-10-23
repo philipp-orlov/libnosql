@@ -133,6 +133,16 @@ struct EnvImpl
     /// buffer's memory could not be handed back on its own.
     bool spill = true;
     std::atomic<std::uint64_t> dirtyBytes{0};
+    std::atomic<std::uint64_t> spilledPages{0};    ///< EnvStats::spilledPages
+    std::atomic<std::uint64_t> unspilledPages{0};  ///< EnvStats::unspilledPages
+    // The writer's alone, across its nested transactions:
+    std::uint32_t touchClock = 0;  ///< TxnImpl::touch()
+    /// The last spill wrote every leaf and overflow page it could and still
+    /// left more than it aimed for; no other is tried until a write makes
+    /// such a page dirty again, since it could only find what that made.
+    /// Nothing else clears it: a new transaction has nothing to spill until
+    /// it makes such a page, and that clears it.
+    bool spillExhausted = false;
 
     std::shared_ptr<MappedRegion> region;  ///< current mapping
     /// Mappings replaced by a growth (only where the mapping cannot grow in
@@ -405,7 +415,14 @@ struct TxnImpl
     PageTable spilled;
     std::vector<Page*> spillPool;    ///< spilled single-page buffers whose page was freed
     std::uint64_t spilledBytes = 0;  ///< of `owned`, not counted in dirtyBytes
-    std::vector<std::pair<PageNo, Page*>> spillList;  ///< spill() scratch
+    struct SpillCandidate
+    {
+        std::uint32_t age;  ///< touches since this buffer's last
+        PageNo pgno;
+        Page* buf;
+        TxnImpl* owner;  ///< this transaction or an ancestor
+    };
+    std::vector<SpillCandidate> spillList;  ///< spill() scratch
 
     /// Commit-path scratch, kept on the transaction so a commit allocates
     /// nothing it has not already allocated once.
@@ -573,8 +590,18 @@ struct TxnImpl
     bool wantsSpill(std::uint64_t bytes) const noexcept
     {
         const std::uint64_t limit = env->dirtyLimit;
-        return limit && env->spill &&
+        return limit && env->spill && !env->spillExhausted &&
                env->dirtyBytes.load(std::memory_order_relaxed) + bytes > limit;
+    }
+    /// Stamps dirty buffer `buf` of `npages` with the touch clock, in the
+    /// checksum trailer that sealing the page overwrites, for spill() to send
+    /// the coldest pages first. Only with a budget: nothing reads it otherwise.
+    void touch(Page* buf, unsigned npages = 1) noexcept
+    {
+        if (env->dirtyLimit)
+            writeLittle<std::uint32_t>(reinterpret_cast<std::byte*>(buf) +
+                                           std::size_t(npages) * env->pageSize - kPageChecksumBytes,
+                                       ++env->touchClock);
     }
     /// Writes this transaction's and its ancestors' leaf and overflow pages to
     /// the file, at the page numbers they will commit at, until half the dirty

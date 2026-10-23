@@ -156,7 +156,7 @@ is built):
 | `optimistic` | `OptimisticTxn`: conflict detection, retries, group commit, escalation |
 | `separators` | shortest branch separators at splits, rebalances and bulk loads |
 | `pipeline` | pipelined `Safe` commits: visibility only once durable, failure handling |
-| `spill` | transactions many times `dirtyLimit`: same pages as unbounded, nested commit and abort, cursors and arguments across a spill |
+| `spill` | transactions many times `dirtyLimit`: same pages as unbounded, nested commit and abort, cursors and arguments across a spill, coldest pages first, trees of mostly branch pages |
 | `corrupt` | pages that pass their checksum but lie about their layout: opening, reading and writing must end in an `Error`, never a stray read or write (fuzzing: `NOSQL_BUILD_FUZZERS`, `fuzz/fuzz_pages.cpp`) |
 | `prefix` | `DbFlags::PrefixKeys`: the same contents as a plain tree in fewer leaves, seeks and scans, nesting, compaction, the format version |
 | `power` | every write and flush recorded and replayed: at each point, images that keep any subset of the unflushed sectors must open whole on a committed snapshot no older than the last one reported durable, in every durability mode |

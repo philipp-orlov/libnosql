@@ -390,6 +390,7 @@ std::byte* overflowCreate(TxnImpl* t, std::size_t vsize, PageNo* out)
     // The caller writes the first `vsize` bytes; zero only the tail, so a run
     // costs one small memset rather than a full-run one.
     std::memset(data + vsize, 0, std::size_t(n) * ps - kPageHdr - vsize);
+    t->touch(h, n);
     *out = p0;
     return data;
 }
@@ -408,8 +409,10 @@ Page* touchLevel(CursorImpl& c, int lvl)
 {
     TxnImpl* t = c.txn;
     Page* p = c.pg[lvl];
-    if (t->isOwnDirty(p->pgno))
+    if (t->isOwnDirty(p->pgno)) {
+        t->touch(p);
         return p;
+    }
     if (Page* back = t->unspill(p->pgno)) {
         c.pg[lvl] = back;  // the same page number: the parent needs no update
         return back;
@@ -418,6 +421,7 @@ Page* touchLevel(CursorImpl& c, int lvl)
     Page* d = t->allocBuffer(np, p->flags, 1);
     std::memcpy(d, p, t->pageSize());
     d->pgno = np;
+    t->touch(d);
     t->freePage(p->pgno);
     c.pg[lvl] = d;
     if (lvl == 0) {
@@ -659,6 +663,7 @@ void splitPage(CursorImpl& c, int level, unsigned newindx, const Entry& ne)
         const PageNo rn = t->allocPages(1);
         Page* rp = t->allocBuffer(rn, P_BRANCH, 1);
         pageInit(rp, rn, P_BRANCH, ps);
+        t->touch(rp);
         nodeAddBranch(rp, 0, Slice(), mp->pgno, 0);  // -infinity child; counted below
         for (int i = c.top; i >= 0; --i) {
             c.pg[i + 1] = c.pg[i];
@@ -683,6 +688,7 @@ void splitPage(CursorImpl& c, int level, unsigned newindx, const Entry& ne)
     const std::uint16_t kind = std::uint16_t(mp->flags & ~P_PREFIX);
     Page* np = t->allocBuffer(sn, kind, 1);
     pageInit(np, sn, kind, ps);
+    t->touch(np);
     if (leaf)
         ++tr.leafPages;
     else
@@ -881,6 +887,7 @@ void rebalance(CursorImpl& c)
         Page* d = t->allocBuffer(np, sib->flags, 1);
         std::memcpy(d, sib, ps);
         d->pgno = np;
+        t->touch(d);
         t->freePage(spgno);
         setBranchChild(parent, sidx, np);
         sib = d;
@@ -1466,6 +1473,7 @@ bool treePut(CursorImpl& c, Slice key, Slice value, PutMode mode, WritableSlice*
         const PageNo np = t->allocPages(1);
         Page* p = t->allocBuffer(np, P_LEAF, 1);
         pageInit(p, np, P_LEAF, ps);
+        t->touch(p);
         tr.root = np;
         tr.depth = 1;
         tr.leafPages = 1;
@@ -1536,6 +1544,7 @@ bool treePut(CursorImpl& c, Slice key, Slice value, PutMode mode, WritableSlice*
                 else
                     std::memset(dst, 0, value.size());
                 std::memset(dst + value.size(), 0, span - value.size());
+                t->touch(ovp, ovPages(ovp));
                 if (out)
                     *out = WritableSlice(dst, value.size());
                 ++t->root()->seq;

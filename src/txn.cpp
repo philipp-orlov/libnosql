@@ -202,6 +202,8 @@ Page* TxnImpl::allocBuffer(PageNo p, std::uint16_t flags, unsigned npages)
     buf->pgno = p;
     buf->flags = flags;
     dirty.set(p, buf);
+    if (!(flags & P_BRANCH))
+        env->spillExhausted = false;  // something a spill could write again
     return buf;
 }
 
@@ -1314,49 +1316,66 @@ void TxnImpl::spill()
 {
     const std::uint64_t target = env->dirtyLimit / 2;
     const std::size_t ps = env->pageSize;
-    // Oldest level first: an ancestor's pages are the least likely to be
-    // touched again.
-    std::vector<TxnImpl*> chain;
+    // Coldest first, from this transaction and its ancestors alike: a page
+    // that has not been touched for a while is the least likely to be soon,
+    // so the least likely to be read back. Branch pages stay: nearly every
+    // write descends through them, and they are a small share of any tree.
+    std::vector<SpillCandidate>& list = spillList;
+    list.clear();
+    const std::uint32_t now = env->touchClock;
     for (TxnImpl* a = this; a; a = a->parent)
-        chain.push_back(a);
-    for (auto level = chain.rbegin(); level != chain.rend(); ++level) {
-        TxnImpl* a = *level;
-        if (env->dirtyBytes.load(std::memory_order_relaxed) <= target)
-            break;
-        // Branch pages stay: nearly every write descends through them, and
-        // they are a small share of any tree.
-        std::vector<std::pair<PageNo, Page*>>& ids = a->spillList;
-        ids.clear();
         a->dirty.forEach([&](PageNo pn, Page* buf) {
-            if (!isBranch(buf))
-                ids.emplace_back(pn, buf);
+            if (isBranch(buf))
+                return;
+            const unsigned n = isOverflow(buf) ? ovPages(buf) : 1u;
+            const auto stamp = readLittle<std::uint32_t>(reinterpret_cast<std::byte*>(buf) +
+                                                         std::size_t(n) * ps - kPageChecksumBytes);
+            list.push_back({now - stamp, pn, buf, a});  // modular: the clock may wrap
         });
-        std::sort(ids.begin(), ids.end(),
-                  [](const auto& x, const auto& y) { return x.first < y.first; });
+    // Only as many as the target needs, then in file order, which the file
+    // system writes best.
+    std::uint64_t over = env->dirtyBytes.load(std::memory_order_relaxed);
+    over = over > target ? over - target : 0;
+    std::sort(list.begin(), list.end(), [](const SpillCandidate& x, const SpillCandidate& y) {
+        return x.age > y.age || (x.age == y.age && x.pgno < y.pgno);
+    });
+    std::size_t take = 0;
+    for (std::uint64_t freed = 0; take < list.size() && freed < over; ++take)
+        freed +=
+            env->buffers.allocationSize(isOverflow(list[take].buf) ? ovPages(list[take].buf) : 1u);
+    list.resize(take);
+    std::sort(list.begin(), list.end(),
+              [](const SpillCandidate& x, const SpillCandidate& y) { return x.pgno < y.pgno; });
+    std::uint64_t pages = 0;
+    for (const SpillCandidate& s : list) {
+        TxnImpl* a = s.owner;
+        Page* buf = s.buf;
+        const PageNo p = s.pgno;
         std::byte* base = a->region->m.base;
-        for (const auto& [p, buf] : ids) {
-            if (env->dirtyBytes.load(std::memory_order_relaxed) <= target)
-                break;
-            const unsigned n = sealForFile(buf, ps);
-            const std::size_t bytes = std::size_t(n) * ps;
-            env->validation.invalidate(p, n);
-            // Where it will commit: a page number no snapshot, durable or
-            // visible, refers to, so the write is as safe now as at commit.
-            if (kWriteThroughMapping) {
-                std::memcpy(base + p * ps, buf, bytes);
-                os::recordMappedWrite(env->fd, p * std::uint64_t(ps), base + p * ps, bytes);
-            } else {
-                os::writeAt(env->fd, p * std::uint64_t(ps), buf, bytes);
-            }
-            const std::size_t held = env->buffers.allocationSize(n);
-            os::discardMemory(buf, held);
-            a->dirty.erase(p);
-            a->spilled.set(p, buf);
-            a->spilledBytes += held;
-            env->dirtyBytes.fetch_sub(held, std::memory_order_relaxed);
+        const unsigned n = sealForFile(buf, ps);
+        const std::size_t bytes = std::size_t(n) * ps;
+        env->validation.invalidate(p, n);
+        // Where it will commit: a page number no snapshot, durable or
+        // visible, refers to, so the write is as safe now as at commit.
+        if (kWriteThroughMapping) {
+            std::memcpy(base + p * ps, buf, bytes);
+            os::recordMappedWrite(env->fd, p * std::uint64_t(ps), base + p * ps, bytes);
+        } else {
+            os::writeAt(env->fd, p * std::uint64_t(ps), buf, bytes);
         }
-        ids.clear();
+        const std::size_t held = env->buffers.allocationSize(n);
+        os::discardMemory(buf, held);
+        a->dirty.erase(p);
+        a->spilled.set(p, buf);
+        a->spilledBytes += held;
+        env->dirtyBytes.fetch_sub(held, std::memory_order_relaxed);
+        pages += n;
     }
+    list.clear();
+    env->spilledPages.fetch_add(pages, std::memory_order_relaxed);
+    // Everything it could write is written: the next spill would find only
+    // what writes make dirty from here on.
+    env->spillExhausted = env->dirtyBytes.load(std::memory_order_relaxed) > target;
     // Cursors re-anchor rather than read a page they saw in a buffer.
     ++root()->seq;
 }
@@ -1376,6 +1395,9 @@ Page* TxnImpl::unspill(PageNo p)
     dirty.set(p, buf);
     spilledBytes -= held;
     env->dirtyBytes.fetch_add(held, std::memory_order_relaxed);
+    env->unspilledPages.fetch_add(n, std::memory_order_relaxed);
+    env->spillExhausted = false;
+    touch(buf, n);
     return buf;
 }
 
