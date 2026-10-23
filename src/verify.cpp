@@ -47,12 +47,12 @@ struct Checker
 
     void checkPageHeader(const Page* p, const Tree& tr)
     {
-        const bool prefixed = p->flags == (P_LEAF | P_PREFIX);
+        const bool prefixed = p->flags == (P_LEAF | P_PREFIX) || p->flags == (P_BRANCH | P_PREFIX);
         if (p->flags != P_BRANCH && p->flags != P_LEAF && !prefixed)
             bad("invalid tree page flags", p->pgno);
         if (prefixed && !(tr.flags & std::uint32_t(DbFlags::PrefixKeys)))
-            bad("prefix-compressed leaf in a tree that does not compress", p->pgno);
-        // Nodes end below the checksum, and on a P_PREFIX leaf below its prefix.
+            bad("prefix-compressed page in a tree that does not compress", p->pgno);
+        // Nodes end below the checksum, and on a P_PREFIX page below its prefix.
         std::size_t top = ps - kPageChecksumBytes;
         std::size_t plen = 0;
         if (prefixed) {
@@ -82,6 +82,15 @@ struct Checker
                 bad("overlapping node bodies", p->pgno);
     }
 
+    /// Key `i` of `p` whole, its page's prefix included; empty for branch
+    /// slot 0, which stores none.
+    std::string wholeKey(const Page* p, unsigned i) const
+    {
+        if (isBranch(p) && i == 0)
+            return std::string();
+        return leafPrefix(p, ps).string() + nodeKey(p, i).string();
+    }
+
     struct Span
     {
         std::string lo, hi;
@@ -105,8 +114,11 @@ struct Checker
         const unsigned firstReal = isBranch(p) ? 1u : 0u;
         if (isBranch(p) && p->nkeys && nodeKey(p, 0).size() != 0)
             bad("branch slot 0 is not an empty -infinity placeholder", pgno);
+        std::vector<std::string> keys(p->nkeys);
+        for (unsigned i = 0; i < p->nkeys; ++i)
+            keys[i] = wholeKey(p, i);
         for (unsigned i = firstReal + 1; i < p->nkeys; ++i)
-            if (cmp(nodeKey(p, i - 1), nodeKey(p, i)) >= 0)
+            if (cmp(Slice(keys[i - 1]), Slice(keys[i])) >= 0)
                 bad("keys are not strictly increasing within the page", pgno);
 
         Span span;
@@ -114,12 +126,9 @@ struct Checker
             if (depth != tr.depth)
                 bad("leaf depth differs from tree descriptor", pgno);
             ++leafPages;
-            // Within a P_PREFIX leaf the suffixes order as the keys do: they
-            // all follow the same prefix, in byte order.
             if (p->nkeys) {
-                const std::string prefix = leafPrefix(p, ps).string();
-                span.lo = prefix + nodeKey(p, 0).string();
-                span.hi = prefix + nodeKey(p, p->nkeys - 1).string();
+                span.lo = keys[0];
+                span.hi = keys[p->nkeys - 1];
             }
             span.entries = p->nkeys;
             for (unsigned i = 0; i < p->nkeys; ++i) {
@@ -167,9 +176,9 @@ struct Checker
 
             // Slot 0 is the -infinity placeholder and is never compared, so only
             // slots >= 1 have to bound their subtree from below.
-            if (i >= 1 && cmp(Slice(sub.lo), nodeKey(p, i)) < 0)
+            if (i >= 1 && cmp(Slice(sub.lo), Slice(keys[i])) < 0)
                 bad("subtree holds a key below its separator", pgno);
-            if (i + 1 < p->nkeys && cmp(Slice(sub.hi), nodeKey(p, i + 1)) >= 0)
+            if (i + 1 < p->nkeys && cmp(Slice(sub.hi), Slice(keys[i + 1])) >= 0)
                 bad("subtree holds a key at or above the next separator", pgno);
 
             if (first) {

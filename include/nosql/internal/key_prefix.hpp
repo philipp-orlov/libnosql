@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Philipp Orlov
 // SPDX-License-Identifier: Apache-2.0
 
-// Leaf key prefix compression (DbFlags::PrefixKeys).
+// Key prefix compression (DbFlags::PrefixKeys).
 //
 // A P_PREFIX leaf stores the bytes every one of its keys starts with once, in
 // a block at the top of the node area just under the checksum: the prefix,
@@ -11,6 +11,10 @@
 // upwards from `upper`, never moves it. Only byte-ordered trees compress:
 // there the shared prefix of a sorted page is the shared prefix of its first
 // and last key, and a key compares with the page by its prefix first.
+//
+// A P_PREFIX branch page does the same for its separators, slots 1 and up:
+// slot 0 is the -infinity child, whose key is empty and never compared, so
+// its node stores nothing and the prefix is what slots 1 and n-1 share.
 
 #pragma once
 
@@ -36,7 +40,8 @@ inline constexpr std::size_t prefixBlock(std::size_t plen) noexcept
     return align4(plen + 2);
 }
 
-/// The prefix the keys of leaf `p` share; empty unless it is P_PREFIX.
+/// The prefix the keys of leaf or branch `p` share; empty unless it is
+/// P_PREFIX.
 inline Slice leafPrefix(const Page* p, std::size_t ps) noexcept
 {
     if (!(p->flags & P_PREFIX))
@@ -109,6 +114,22 @@ std::size_t leafPrefixFor(const E* e, unsigned n) noexcept
     return plen;
 }
 
+/// Writes the prefix block of `prefix` at the top of empty page `p`;
+/// returns where the nodes under it end.
+inline std::size_t writePrefixBlock(Page* p, Slice prefix, std::size_t ps) noexcept
+{
+    auto* base = reinterpret_cast<std::byte*>(p);
+    std::size_t upper = ps - kPageChecksumBytes;
+    if (const std::size_t plen = prefix.size()) {
+        upper -= prefixBlock(plen);
+        auto* end = base + ps - kPageChecksumBytes - 2;
+        std::memset(base + upper, 0, std::size_t(end - plen - (base + upper)));
+        std::memcpy(end - plen, prefix.data(), plen);
+        writeLittle(end, std::uint16_t(plen));
+    }
+    return upper;
+}
+
 /// Rewrites `p` as leaf `pgno` holding `n` sorted entries whose keys share
 /// `plen` bytes. The entries must not point into `p`.
 template <class E>
@@ -120,14 +141,7 @@ void layoutLeaf(Page* p, PageNo pgno, const E* e, unsigned n, std::size_t plen,
     p->nkeys = 0;
     p->lower = std::uint16_t(kPageHdr);
     auto* base = reinterpret_cast<std::byte*>(p);
-    std::size_t upper = ps - kPageChecksumBytes;
-    if (plen) {
-        upper -= prefixBlock(plen);
-        auto* end = base + ps - kPageChecksumBytes - 2;
-        std::memset(base + upper, 0, std::size_t(end - plen - (base + upper)));
-        std::memcpy(end - plen, e[0].key.data(), plen);
-        writeLittle(end, std::uint16_t(plen));
-    }
+    std::size_t upper = writePrefixBlock(p, Slice(n ? e[0].key.data() : nullptr, plen), ps);
     for (unsigned i = 0; i < n; ++i) {
         const bool big = (e[i].flags & N_BIGDATA) != 0;
         const std::size_t ksize = e[i].key.size() - plen;
@@ -150,6 +164,30 @@ void layoutLeaf(Page* p, PageNo pgno, const E* e, unsigned n, std::size_t plen,
     p->nkeys = std::uint16_t(n);
     p->lower = std::uint16_t(kPageHdr + 2 * std::size_t(n));
     p->upper = std::uint16_t(upper);
+}
+
+/// Bytes `n` branch entries take on one page whose separators share `plen`
+/// bytes; entry 0's key is not stored.
+template <class E>
+std::size_t branchLayoutBytes(const E* e, unsigned n, std::size_t plen) noexcept
+{
+    std::size_t total = plen ? prefixBlock(plen) : 0;
+    for (unsigned i = 0; i < n; ++i)
+        total += 2 + branchNodeSize(i ? e[i].key.size() - plen : 0);
+    return total;
+}
+
+/// The prefix `n` sorted branch entries are best laid out with: what the
+/// separators of entries 1 and n-1 share, when that saves room; 0 otherwise.
+template <class E>
+std::size_t branchPrefixFor(const E* e, unsigned n) noexcept
+{
+    if (n < 2)
+        return 0;
+    const std::size_t plen = std::min<std::size_t>(commonPrefix(e[1].key, e[n - 1].key), 0xffff);
+    if (!plen || branchLayoutBytes(e, n, plen) >= branchLayoutBytes(e, n, 0))
+        return 0;
+    return plen;
 }
 
 // A checksum proves a page holds the bytes that were written, not that their
@@ -176,7 +214,7 @@ inline void validateHeader(const Page* p, std::size_t ps)
     const auto bad = [](const char* what) { throw Error(ErrorCode::Corrupted, what); };
     const std::uint16_t flags = p->flags;
     std::size_t top = ps - kPageChecksumBytes;
-    if (flags == (P_LEAF | P_PREFIX)) {
+    if (flags == (P_LEAF | P_PREFIX) || flags == (P_BRANCH | P_PREFIX)) {
         const std::size_t plen =
             readLittle<std::uint16_t>(reinterpret_cast<const std::byte*>(p) + top - 2);
         if (!plen || prefixBlock(plen) > top - kPageHdr)

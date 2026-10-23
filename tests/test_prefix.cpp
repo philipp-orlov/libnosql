@@ -5,6 +5,7 @@
 // Everything a byte-ordered tree does, checked against a std::map, plus what
 // compression is for: fewer pages for keys with long common prefixes.
 
+#include <algorithm>
 #include <filesystem>
 #include <map>
 #include <random>
@@ -116,6 +117,67 @@ TEST(prefixKeysMatchAPlainTreeInFewerPages)
             CHECK(prefixed.leafPages * 10 < plain.leafPages * 9);  // at least a tenth fewer
         CHECK(txn.db("prefixed").flags() & DbFlags::PrefixKeys);
     });
+}
+
+/// Separators share prefixes too: keys behind a long common path fill a
+/// branch page with what follows it, so the tree needs fewer branch pages and
+/// fewer levels. Growing it, then erasing most of it at random, splits and
+/// merges branch pages whose prefixes change, all checked against a map.
+TEST(branchPagesStoreTheirSeparatorsPrefixOnce)
+{
+    tst::Scratch scratch("prefix-branch");
+    Env env = Env::configure().pageSize(4096).sync(Durability::None).open(scratch.file());
+    const std::string path =
+        "region/eu-central/cluster/0007/namespace/payments/ledger/" + std::string(120, 'p') + "/";
+    auto key = [&](std::uint64_t i) { return path + tst::keyOf(i % 7) + "/" + tst::keyOf(i); };
+    State plain, prefixed;
+    std::mt19937_64 rng(4);
+    std::vector<std::uint64_t> ids(30000);
+    for (std::uint64_t i = 0; i < ids.size(); ++i)
+        ids[i] = i;
+    std::shuffle(ids.begin(), ids.end(), rng);
+    for (std::size_t at = 0; at < ids.size(); at += 3000)
+        env.write([&](Txn& txn) {
+            Db a = txn.db("plain", DbFlags::Create);
+            Db b = txn.db("prefixed", DbFlags::Create | DbFlags::PrefixKeys);
+            for (std::size_t i = at; i < at + 3000; ++i) {
+                a.put(key(ids[i]), "v");
+                b.put(key(ids[i]), "v");
+                plain[key(ids[i])] = prefixed[key(ids[i])] = "v";
+            }
+        });
+    env.read([&](Txn& txn) {
+        checkIntegrity(txn);
+        const TreeStats a = txn.db("plain").stats();
+        const TreeStats b = txn.db("prefixed").stats();
+        if (!NOSQL_PREFIX_KEYS_DEFAULT) {               // else both compress
+            CHECK(b.branchPages * 20 < a.branchPages);  // 4 against 228: 23 with leaves alone
+            CHECK(b.depth < a.depth);
+        }
+        CHECK(contentsOf(txn.db("prefixed")) == prefixed);
+    });
+    std::shuffle(ids.begin(), ids.end(), rng);
+    for (std::size_t at = 0; at < 27000; at += 1500) {
+        env.write([&](Txn& txn) {
+            Db b = txn.db("prefixed");
+            for (std::size_t i = at; i < at + 1500; ++i) {
+                CHECK(b.erase(key(ids[i])));
+                prefixed.erase(key(ids[i]));
+                // Now and then a key outside the path: a separator without
+                // its page's prefix.
+                if (i % 97 == 0) {
+                    const std::string other = "other/" + tst::keyOf(i);
+                    b.put(other, "w");
+                    prefixed[other] = "w";
+                }
+            }
+        });
+        env.read([&](Txn& txn) {
+            checkIntegrity(txn);
+            CHECK(contentsOf(txn.db("prefixed")) == prefixed);
+            CHECK_EQ(txn.db("prefixed").count(), std::uint64_t(prefixed.size()));
+        });
+    }
 }
 
 /// Seeks, ranges, prefix scans, counts, ranks and backward walks see the keys

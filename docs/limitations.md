@@ -21,7 +21,7 @@ in the "Terminology" section of `docs/design.md`.
   ordering it was not built with. A user-supplied function pointer cannot be
   persisted, and getting it wrong silently corrupts the tree.
 * **Encryption, compression, a query language.** Not this library's job, beyond
-  storing a leaf's shared key prefix once (`DbFlags::PrefixKeys`). A query
+  storing a page's shared key prefix once (`DbFlags::PrefixKeys`). A query
   language is provided one layer up by [libsql](../../libsql), a SQL engine (tables,
   indexes, joins, a planner) that stores its data in a libnosql store; libnosql itself
   has no schema, no query parser and no planner.
