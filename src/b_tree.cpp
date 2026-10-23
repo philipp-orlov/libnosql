@@ -1406,6 +1406,7 @@ bool treePut(CursorImpl& c, Slice key, Slice value, PutMode mode, WritableSlice*
 {
     TxnImpl* t = c.txn;
     const std::size_t ps = t->pageSize();
+    Arena::Scope rewind(t->scratch());  // copies of arguments that alias the leaf
     if (key.size() > maxKeySize(ps) || key.empty())
         throw Error(ErrorCode::KeyTooLarge,
                     key.empty() ? "empty keys are not allowed" : "key exceeds the page-size limit");
@@ -1510,6 +1511,23 @@ bool treePut(CursorImpl& c, Slice key, Slice value, PutMode mode, WritableSlice*
                 return true;
             }
         }
+        // The caller's key or value may sit in this leaf (a cursor's key)
+        // or in the run about to be freed; both move or go away below.
+        const auto inside = [](Slice s, const void* base, std::size_t bytes) {
+            const auto* b = static_cast<const std::byte*>(base);
+            return s.data() && s.data() < b + bytes && s.data() + s.size() > b;
+        };
+        const auto keep = [&](Slice& s) {
+            std::byte* copy = t->scratch().alloc(s.size() ? s.size() : 1);
+            std::memcpy(copy, s.data(), s.size());
+            s = Slice(copy, s.size());
+        };
+        const Page* oldRun = oldbig ? t->getPage(bigPgno(n)) : nullptr;
+        const std::size_t runBytes = oldRun ? std::size_t(ovPages(oldRun)) * ps : 0;
+        if (inside(key, p, ps) || (oldRun && inside(key, oldRun, runBytes)))
+            keep(key);
+        if (inside(value, p, ps) || (oldRun && inside(value, oldRun, runBytes)))
+            keep(value);
         if (oldbig)
             overflowRelease(t, tr, bigPgno(n));
         nodeDel(p, at);

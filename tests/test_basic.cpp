@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <cstring>
+#include <map>
 #include "nosql/nosql.hpp"
 #include "tests/test_util.hpp"
 
@@ -180,6 +181,45 @@ TEST(appendModeDemandsAscendingKeys)
         // Ascending bulk loads should pack pages nearly full.
         CHECK(d.stats().leafPages < 2001 / 12);
     });
+}
+
+/// A key or value read from the very leaf a put rewrites, in a transaction
+/// that already owns that leaf: replacing the value with one of another size
+/// moves the leaf's bytes before the new entry is written, so the put must
+/// have copied what it was given first.
+TEST(putTakesItsArgumentsFromTheLeafItRewrites)
+{
+    tst::Scratch s("basic-alias");
+    Env env = Env::configure().pageSize(4096).open(s.file());
+    std::map<std::string, std::string> expect;
+    env.write([&](Txn& txn) {
+        Db db = txn.mainDb();
+        for (int i = 0; i < 400; ++i) {
+            const std::string key = tst::keyOf(std::uint64_t(i));
+            db.put(key, tst::blob(20 + i % 7, std::uint64_t(i)));
+            expect[key] = tst::blob(20 + i % 7, std::uint64_t(i));
+        }
+        for (int i = 0; i < 400; ++i) {
+            const std::string key = tst::keyOf(std::uint64_t(i));
+            Cursor c = db.cursor();
+            CHECK(c.seekExact(key));
+            // The key from the leaf, a value one byte longer than its own.
+            const std::string longer = expect[key] + "+";
+            db.put(c.key(), longer);
+            expect[key] = longer;
+            // And a value taken from a neighbour on the same leaf, resized.
+            if (i > 0) {
+                CHECK(c.seekExact(key));
+                const Slice from = db.get(tst::keyOf(std::uint64_t(i - 1))).value();
+                db.put(c.key(), from);
+                expect[key] = expect[tst::keyOf(std::uint64_t(i - 1))];
+            }
+        }
+        for (const auto& [k, v] : expect)
+            CHECK(db.get(k).value().string() == v);
+        CHECK_EQ(db.count(), std::uint64_t(expect.size()));
+    });
+    env.read([](Txn& t) { checkIntegrity(t); });
 }
 
 int main()
