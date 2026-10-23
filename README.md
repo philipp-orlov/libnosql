@@ -147,7 +147,7 @@ is built):
 | `named` | sub-databases, flags, directory hiding, drop |
 | `nested` | savepoints, deep nesting, abort semantics |
 | `overflow` | large values, overflow runs, reclaim of runs |
-| `reclaim` | free list, GC rules, drop returning pages |
+| `reclaim` | free list, GC rules, drop returning pages, free-list runs, `shrink()` with and without a reader open |
 | `steady` | long-run plateau: page count and file size stop moving |
 | `memory` | allocation-free warm reuse, slab page buffers, bounded scratch, mapping ownership and allocation failures |
 | `allocbudget` | zero heap allocations per warm transaction, a flat heap across churn rounds, slices that survive a growth |
@@ -159,7 +159,7 @@ is built):
 | `spill` | transactions many times `dirtyLimit`: same pages as unbounded, nested commit and abort, cursors and arguments across a spill, coldest pages first, trees of mostly branch pages |
 | `corrupt` | pages that pass their checksum but lie about their layout: opening, reading and writing must end in an `Error`, never a stray read or write (fuzzing: `NOSQL_BUILD_FUZZERS`, `fuzz/fuzz_pages.cpp`) |
 | `prefix` | `DbFlags::PrefixKeys`: the same contents as a plain tree in fewer leaves and branch pages, shared suffixes in reverse order, seeks and scans, nesting, compaction, the format version |
-| `power` | every write and flush recorded and replayed: at each point, images that keep any subset of the unflushed sectors must open whole on a committed snapshot no older than the last one reported durable, in every durability mode |
+| `power` | every write and flush recorded and replayed: at each point, images that keep any subset of the unflushed sectors must open whole on a committed snapshot no older than the last one reported durable, in every durability mode, spilling and shrinking commits included |
 | `mq` | queue semantics: FIFO, leases, redelivery, dead-lettering |
 | `mqsteady` | queues under sustained send/receive: no unbounded growth |
 | `replication` | checkpoints, base images, bundle format, apply, divergence |
@@ -386,7 +386,10 @@ suspect store.
 
 `compact(src, dst)` rewrites a store into a fresh, densely packed file.
 Deleted pages are recycled in place by the free list, but a store that once
-grew large stays large on disk; compaction is how you give the space back.
+grew large stays large on disk until you give the space back: `env.shrink()`
+does it in place, moving the pages near the end of the file down into free ones
+and truncating the free tail (not on Windows, where a mapped file cannot be cut),
+and `compact()` does it into a new file, packed densely.
 
 ## Blob storage
 

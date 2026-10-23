@@ -144,7 +144,9 @@ in the "Terminology" section of `docs/design.md`.
 
 ## Not yet implemented, but sensible to add
 
-* Returning free tail pages to the filesystem (shrinking the file in place).
+* Nothing on the list for now. Returning free tail pages to the filesystem is
+  `Env::shrink()`; it waits for open readers rather than moving what they see,
+  and on Windows it stops using the tail without cutting the file.
 
 ## Compared to server RDBMS engines (Oracle, SQL Server)
 
