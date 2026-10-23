@@ -253,7 +253,7 @@ Checkpoint applyBundle(const std::filesystem::path& store, const std::filesystem
     const BundleScan scan = scanBundle(bundleFile, bundle);
 
     // Exclusive: this is also what enforces "the store must not be open".
-    const os::File storeFile(os::openFile(store, false, false, false, true, true));
+    os::File storeFile(os::openFile(store, false, false, false, true, true));
     const Meta cur = readNewestMeta(storeFile, store);
     const Checkpoint here{cur.txnid, cur.checksum, cur.storeId, cur.commitId};
 
@@ -306,6 +306,11 @@ Checkpoint applyBundle(const std::filesystem::path& store, const std::filesystem
     for (unsigned slot = 0; slot < 2; ++slot)
         os::writeAt(replacement.fd(), std::uint64_t(slot) * ps + kPageHdr,
                     &scan.target, sizeof scan.target);
+#ifdef _WIN32
+    // Windows renames over an open file only with POSIX semantics, which not
+    // every volume or version has; the store is no longer needed here.
+    storeFile.close();
+#endif
     replacement.publish();
     return target;
 }

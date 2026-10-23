@@ -6,9 +6,11 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <new>
 #include <string>
+#include <vector>
 
 #include "nosql/error.hpp"
 
@@ -163,6 +165,19 @@ void discardMemory(void* p, std::size_t bytes) noexcept
 
 #ifdef _WIN32
 
+namespace {
+
+/// The byte openFile() locks: past any file this store could have.
+OVERLAPPED lockByte() noexcept
+{
+    OVERLAPPED ov{};
+    ov.Offset = 0;
+    ov.OffsetHigh = 0x7fffffffu;
+    return ov;
+}
+
+}  // namespace
+
 FileHandle openFile(const std::filesystem::path& path, bool readOnly, bool create,
                     bool exclusiveCreate, bool lock, bool replaceable, unsigned /*mode*/)
 {
@@ -188,11 +203,13 @@ FileHandle openFile(const std::filesystem::path& path, bool readOnly, bool creat
     }
     if (!lock)
         return h;
-    // Whole-file advisory lock: exclusive for writers, shared for readers.
-    // This is what replaces a .lck side file -- one process at a time.
-    OVERLAPPED ov{};
+    // One process at a time: exclusive for writers, shared for readers. Windows
+    // byte-range locks are mandatory, so the lock covers one byte far past any
+    // data rather than the file: another handle, this process's own included,
+    // may still read the store (a checkpoint, a snapshot copy).
+    OVERLAPPED ov = lockByte();
     const DWORD flags = LOCKFILE_FAIL_IMMEDIATELY | (readOnly ? 0 : LOCKFILE_EXCLUSIVE_LOCK);
-    if (!::LockFileEx(h, flags, 0, MAXDWORD, MAXDWORD, &ov)) {
+    if (!::LockFileEx(h, flags, 0, 1, 0, &ov)) {
         ::CloseHandle(h);
         throw Error(ErrorCode::Busy, "store is already open in another process: " + path.string());
     }
@@ -202,8 +219,8 @@ FileHandle openFile(const std::filesystem::path& path, bool readOnly, bool creat
 void closeFile(FileHandle h) noexcept
 {
     if (h && h != INVALID_HANDLE_VALUE) {
-        OVERLAPPED ov{};
-        ::UnlockFileEx(h, 0, MAXDWORD, MAXDWORD, &ov);
+        OVERLAPPED ov = lockByte();
+        ::UnlockFileEx(h, 0, 1, 0, &ov);  // fails harmlessly on a handle that took no lock
         ::CloseHandle(h);
     }
 }
@@ -256,8 +273,37 @@ bool isNetworkFilesystemType(unsigned long) noexcept
 void replaceFile(const std::filesystem::path& source, const std::filesystem::path& target, bool replace)
 {
     observeIo(IoEvent::Replace);
-    if (!::MoveFileExW(source.c_str(), target.c_str(),
-                      (replace ? MOVEFILE_REPLACE_EXISTING : 0) | MOVEFILE_WRITE_THROUGH))
+    // POSIX rename semantics where the volume has them (NTFS, Windows 10 1709
+    // on): the target may still be open, as a replica's store is while a bundle
+    // is applied to it, which MoveFileEx refuses with ERROR_ACCESS_DENIED. The
+    // structure is FILE_RENAME_INFO with its Flags member, spelled out because
+    // older SDK and MinGW headers lack it.
+    struct RenameInfo
+    {
+        DWORD flags;
+        HANDLE root;
+        DWORD nameBytes;
+        WCHAR name[1];
+    };
+    constexpr DWORD kReplaceIfExists = 0x1, kPosixSemantics = 0x2;
+    constexpr auto kFileRenameInfoEx = FILE_INFO_BY_HANDLE_CLASS(22);
+    bool renamed = false;
+    HANDLE h = ::CreateFileW(source.c_str(), DELETE | SYNCHRONIZE,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        const std::wstring name = std::filesystem::absolute(target).wstring();
+        std::vector<std::byte> buffer(sizeof(RenameInfo) + name.size() * sizeof(WCHAR));
+        auto* info = reinterpret_cast<RenameInfo*>(buffer.data());
+        info->flags = (replace ? kReplaceIfExists : 0) | kPosixSemantics;
+        info->root = nullptr;
+        info->nameBytes = DWORD(name.size() * sizeof(WCHAR));
+        std::memcpy(info->name, name.c_str(), info->nameBytes);
+        renamed = ::SetFileInformationByHandle(h, kFileRenameInfoEx, info, DWORD(buffer.size())) != 0;
+        ::CloseHandle(h);
+    }
+    if (!renamed && !::MoveFileExW(source.c_str(), target.c_str(),
+                                   (replace ? MOVEFILE_REPLACE_EXISTING : 0) | MOVEFILE_WRITE_THROUGH))
         fail(ErrorCode::IoError, "MoveFileExW");
     observeIo(IoEvent::Replaced);
 }
@@ -290,7 +336,7 @@ void writeAt(FileHandle h, std::uint64_t offset, const void* src, std::size_t le
         OVERLAPPED ov{};
         ov.Offset = DWORD(offset & 0xffffffffu);
         ov.OffsetHigh = DWORD(offset >> 32);
-        const DWORD want = DWORD(std::min<std::size_t>(length, ioCallback ? 65536u : 0x10000000u));
+        const DWORD want = DWORD(std::min<std::size_t>(length, ioCallback() ? 65536u : 0x10000000u));
         DWORD put = 0;
         if (!::WriteFile(h, p, want, &put, &ov))
             fail(ErrorCode::IoError, "WriteFile");
@@ -568,7 +614,7 @@ void writeAt(FileHandle fd, std::uint64_t offset, const void* src, std::size_t l
     observeIo(IoEvent::Write, length);
     const auto* p = static_cast<const std::byte*>(src);
     while (length) {
-        const ssize_t n = ::pwrite(fd, p, ioCallback ? std::min<std::size_t>(length, 65536) : length, off_t(offset));
+        const ssize_t n = ::pwrite(fd, p, ioCallback() ? std::min<std::size_t>(length, 65536) : length, off_t(offset));
         if (n < 0) {
             if (errno == EINTR)
                 continue;

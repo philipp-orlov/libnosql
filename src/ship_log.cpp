@@ -197,7 +197,9 @@ const char* kNotShipDir = "not a shipping directory: ";
 /// or out of sequence. Returns false when the file is not a segment at all.
 bool parseSegment(const std::filesystem::path& path, std::uint32_t& pageSize, Segment& out)
 {
-    os::File f(os::openFile(path, true, false, false, /*lock=*/false));
+    // Shared for deletion: prune() removes segments while the scan that found
+    // them still holds them open, which Windows otherwise refuses.
+    os::File f(os::openFile(path, true, false, false, /*lock=*/false, /*replaceable=*/true));
     const std::uint64_t bytes = os::fileSize(f);
     if (bytes < sizeof(SegmentHeader))
         return false;
@@ -215,7 +217,7 @@ bool parseSegment(const std::filesystem::path& path, std::uint32_t& pageSize, Se
 
     const auto indexPath = path.string() + ".idx";
     if (std::filesystem::exists(indexPath)) {
-        const os::File index(os::openFile(indexPath, true, false, false, false));
+        const os::File index(os::openFile(indexPath, true, false, false, false, true));
         const auto indexBytes = os::fileSize(index);
         std::uint64_t expected = sizeof h;
         Meta prior{};
