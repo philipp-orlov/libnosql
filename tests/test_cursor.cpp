@@ -152,6 +152,31 @@ TEST(prefixRange)
     });
 }
 
+/// Under ReverseKey a prefix in the tree's order is a common ending: those
+/// keys sit together, where the ones starting alike do not.
+TEST(prefixRangeUnderReverseKeyMatchesEndings)
+{
+    tst::Scratch s("cursor");
+    Env e = Env::configure().maxDbs(2).open(s.file());
+    e.write([](Txn& t) {
+        auto d = t.db("hosts", DbFlags::ReverseKey | DbFlags::Create);
+        for (int i = 0; i < 300; ++i) {
+            d.put("h" + std::to_string(i) + ".example.com", "e");
+            d.put("h" + std::to_string(i) + ".example.org", "o");
+            d.put("example.com.h" + std::to_string(i), "x");
+        }
+    });
+    e.read([](Txn& t) {
+        int n = 0;
+        for (auto [key, value] : t.db("hosts").prefix(".example.com")) {
+            CHECK(key.endsWith(".example.com"));
+            CHECK(value.view() == "e");
+            ++n;
+        }
+        CHECK_EQ(n, 300);
+    });
+}
+
 TEST(eraseWhileIterating)
 {
     tst::Scratch s("cursor");

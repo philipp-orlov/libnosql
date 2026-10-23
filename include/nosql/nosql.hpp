@@ -204,7 +204,9 @@ public:
     Range from(Slice lo) const;               ///< [lo, end)
     Range upto(Slice hi) const;               ///< [begin, hi)
     Range between(Slice lo, Slice hi) const;  ///< [lo, hi)
-    Range prefix(Slice p) const;              ///< every key starting with p
+    /// Every key that starts with p in the sub-database's order: with
+    /// ReverseKey, which reads keys back to front, every key ending with p.
+    Range prefix(Slice p) const;
 
 private:
     friend class Txn;

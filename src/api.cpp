@@ -944,7 +944,10 @@ bool inside(CursorImpl& c, const std::optional<std::string>& hi,
             const std::optional<std::string>& pfx)
 {
     const Slice k = leafKeyAt(c, c.pg[c.top], c.idx[c.top]);
-    if (pfx && !k.startsWith(Slice(*pfx)))
+    // Under ReverseKey the keys that share a prefix in the tree's order, the
+    // ones next to each other, are those that end the same.
+    if (pfx && !((c.tree().flags & std::uint32_t(DbFlags::ReverseKey)) ? k.endsWith(Slice(*pfx))
+                                                                       : k.startsWith(Slice(*pfx))))
         return false;
     if (hi && c.cmp()(k, Slice(*hi)) >= 0)
         return false;
