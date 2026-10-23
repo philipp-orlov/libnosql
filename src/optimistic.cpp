@@ -229,8 +229,6 @@ thread_local std::unique_ptr<OptimisticTxn::Impl> spare;
 /// dirty-page budget.
 constexpr std::size_t kMaxBatch = 256;
 constexpr std::size_t kMaxBatchBytes = 8u << 20;
-/// Times a waiting committer yields before it sleeps.
-constexpr unsigned kSpins = 256;
 
 void sortUnique(std::vector<std::uint64_t>& v)
 {
@@ -587,7 +585,8 @@ void OptimisticTxn::commit()
                 // Without device flushes a group takes microseconds, about what
                 // sleeping and waking costs, so look a few times before sleeping.
                 lk.unlock();
-                for (unsigned i = 0; i < kSpins && !me.done.load(std::memory_order_acquire); ++i)
+                for (unsigned i = 0; i < e.occSpins && !me.done.load(std::memory_order_acquire);
+                     ++i)
                     std::this_thread::yield();
                 lk.lock();
                 if (!me.done.load(std::memory_order_relaxed) && mustWait())

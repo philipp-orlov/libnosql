@@ -777,6 +777,31 @@ TEST(optimisticScanConflictsInsideAGroup)
     CHECK(scanner == ErrorCode::Conflict);
 }
 
+TEST(optimisticCommitSpinsDoNotChangeOutcomes)
+{
+    // Zero spins sleep at once; a large count rarely sleeps. Either way every
+    // increment lands exactly once.
+    for (const unsigned spins : {0u, 4096u}) {
+        tst::Scratch s("optimistic");
+        Env e = Env::configure().sync(Durability::None).commitSpins(spins).open(s.file());
+        e.write([](Txn& t) { t.mainDb().put("n", "0"); });
+        std::vector<std::thread> workers;
+        for (int i = 0; i < 4; ++i) {
+            workers.emplace_back([&] {
+                for (int j = 0; j < 200; ++j) {
+                    optimistic(e, [](OptimisticTxn& t) {
+                        const std::string cur = *t.get("", "n");
+                        t.put("", "n", std::to_string(std::stoll(cur) + 1));
+                    });
+                }
+            });
+        }
+        for (auto& w : workers)
+            w.join();
+        CHECK(valueOf(e, "n") == std::optional<std::string>("800"));
+    }
+}
+
 int main()
 {
     return tst::runAll("optimistic");
