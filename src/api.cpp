@@ -335,8 +335,9 @@ EnvStats Env::stats() const
             s.capturedTxnid = e->ship->capturedTxnid();
         }
         // Pages a commit freed too late to list (the next writer records
-        // them), the free-list entry kept in the meta page, and the tree.
-        s.freePages = e->carryOver.size() + e->meta.inlineCount + e->freeTreePages;
+        // them), the free-list entry kept in the meta page, and the tree: all
+        // of the commit writers build on, a pipelined one not yet durable too.
+        s.freePages = e->carryOver.size() + e->writerMeta.inlineCount + e->freeTreePages;
     }
     return s;
 }
