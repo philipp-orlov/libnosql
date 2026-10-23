@@ -448,19 +448,6 @@ void emit(Page* p, unsigned at, const Entry& e, bool leaf) noexcept
 
 /// Pick a boundary so both halves fit, preferring a balanced split but
 /// honouring the append/prepend fast paths that keep bulk loads dense.
-/// The shortest key that can separate two adjacent children: any s with
-/// left < s <= right does, because keys routed left sort below s and keys routed
-/// right sort at or above it. A prefix of `right` is the shortest such key in
-/// byte order, and it is never empty.
-Slice shortestSeparator(Slice left, Slice right) noexcept
-{
-    const std::size_t n = std::min(left.size(), right.size());
-    std::size_t d = 0;
-    while (d < n && left.data()[d] == right.data()[d])
-        ++d;
-    return Slice(right.data(), std::min(right.size(), d + 1));
-}
-
 unsigned chooseSplit(const Entry* e, unsigned n, unsigned newindx, bool leaf, std::size_t usable,
                      Arena& scratch)
 {
@@ -571,6 +558,7 @@ void splitPage(CursorImpl& c, int level, unsigned newindx, const Entry& ne)
         level = 1;
     }
 
+    const bool shortSeparators = leaf && comparatorFor(tr.flags) == &cmpLexicographic;
     const unsigned split = chooseSplit(ents, count, newindx, leaf, usable, t->scratch());
 
     const PageNo sn = t->allocPages(1);
@@ -595,7 +583,7 @@ void splitPage(CursorImpl& c, int level, unsigned newindx, const Entry& ne)
     // that still sorts after the left leaf's last key. Other orders keep the
     // whole key: a prefix is not a separator under them.
     Slice sep = ents[split].key;
-    if (leaf && comparatorFor(tr.flags) == &cmpLexicographic)
+    if (shortSeparators)
         sep = shortestSeparator(ents[split - 1].key, ents[split].key);
     branchInsert(c, level - 1, sep, sn, rightCount);
 
@@ -626,6 +614,8 @@ void rebalance(CursorImpl& c)
 
     Page* p = c.pg[c.top];
     const bool leaf = isLeaf(p);
+    // Byte-ordered leaves take the shortest separator when a shift moves one.
+    const bool shortSeparators = leaf && comparatorFor(tr.flags) == &cmpLexicographic;
     const unsigned minkeys = leaf ? 1u : 2u;
     if (p->nkeys >= minkeys && pageUsed(p, ps) >= minFill)
         return;
@@ -735,8 +725,11 @@ void rebalance(CursorImpl& c)
             e.key = rsep;
         if (pageRoom(left) < entryCost(e, leaf))
             return;
-        // The new separator is right's slot 1 key, already a valid lower bound.
-        const Slice nk = nodeKey(right, 1);
+        // The new separator is right's slot 1 key, already a valid lower bound;
+        // in byte order, enough of it to sort after the entry moving left.
+        Slice nk = nodeKey(right, 1);
+        if (shortSeparators)
+            nk = shortestSeparator(e.key, nk);
         std::byte* nkbuf = t->scratch().alloc(nk.size() ? nk.size() : 1);
         std::memcpy(nkbuf, nk.data(), nk.size());
         const Slice newsep(nkbuf, nk.size());
@@ -768,7 +761,12 @@ void rebalance(CursorImpl& c)
         const std::ptrdiff_t need = std::ptrdiff_t(entryCost(e, leaf)) + sepDelta;
         if (std::ptrdiff_t(pageRoom(right)) < need)
             return;
-        if (pageRoom(parent) + nodeSize(parent, ridx) < branchNodeSize(movedKey.size()))
+        // The moved key becomes right's lower bound; in byte order, only enough
+        // of it to sort after what is left behind as left's last key.
+        const Slice sep = shortSeparators
+                              ? shortestSeparator(nodeKey(left, left->nkeys - 2), movedKey)
+                              : movedKey;
+        if (pageRoom(parent) + nodeSize(parent, ridx) < branchNodeSize(sep.size()))
             return;
         if (!leaf && !branchSetKey(right, 0, rsep))
             return;
@@ -779,7 +777,7 @@ void rebalance(CursorImpl& c)
         const std::uint64_t moved = leaf ? 1 : e.count;
         setBranchCount(parent, ridx - 1, branchCount(parent, ridx - 1) - moved);
         setBranchCount(parent, ridx, branchCount(parent, ridx) + moved);
-        branchSetKey(parent, ridx, movedKey);
+        branchSetKey(parent, ridx, sep);
     }
     t->markDirty(c.dbi);
 }

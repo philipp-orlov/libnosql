@@ -11,6 +11,7 @@
 #include <map>
 #include <random>
 #include <string>
+#include <vector>
 
 #include "nosql/nosql.hpp"
 #include "tests/test_util.hpp"
@@ -182,6 +183,92 @@ TEST(separatorsForReverseAndIntegerKeysStayCorrect)
             const auto got = ints.get(Slice::ref(i * 7919u));
             CHECK(got.has_value());
         }
+    });
+}
+
+TEST(separatorsSurviveDeleteHeavyRebalancing)
+{
+    // Deletes leave pages underfull, and rebalancing shifts single entries
+    // between siblings, writing a new separator each time. Waves of random and
+    // contiguous deletes drive many shifts in both directions.
+    tst::Scratch s("separators");
+    Env e = Env::configure().sync(Durability::None).open(s.file());
+    std::mt19937_64 rng(55);
+    Model model;
+    const std::string prefix(60, 'r');
+    for (unsigned i = 0; i < 30000; ++i)
+        model[randomKey(rng, 10, "0123456789", prefix)] = std::to_string(i);
+    e.write([&](Txn& t) {
+        Db d = t.mainDb();
+        for (const auto& [k, v] : model)
+            d.put(k, v);
+    });
+    for (int wave = 0; wave < 6; ++wave) {
+        std::vector<std::string> doomed;
+        if (wave % 2 == 0) {
+            for (const auto& [k, v] : model)
+                if (rng() % 3 == 0)
+                    doomed.push_back(k);
+        } else {
+            // A contiguous run from a random start, so neighbours empty together.
+            auto it = std::next(model.begin(), std::ptrdiff_t(rng() % model.size()));
+            for (std::size_t n = model.size() / 4; n && it != model.end(); --n, ++it)
+                doomed.push_back(it->first);
+        }
+        e.write([&](Txn& t) {
+            Db d = t.mainDb();
+            for (const auto& k : doomed) {
+                d.erase(k);
+                model.erase(k);
+            }
+        });
+        e.read([&](Txn& t) {
+            Db d = t.mainDb();
+            checkAgainstModel(d, model, rng);
+            checkIntegrity(t);
+        });
+    }
+}
+
+TEST(separatorsInCompactedStores)
+{
+    // compact() rebuilds every tree through the bulk builder, which shortens
+    // separators itself: byte-ordered trees only, the others keep whole keys.
+    tst::Scratch s("separators");
+    std::mt19937_64 rng(66);
+    Model main, named, reversed;
+    {
+        Env e = Env::configure().sync(Durability::None).open(s.file());
+        e.write([&](Txn& t) {
+            Db d = t.mainDb();
+            Db n = t.db("names", DbFlags::Create);
+            Db r = t.db("rev", DbFlags::Create | DbFlags::ReverseKey);
+            for (unsigned i = 0; i < 20000; ++i) {
+                const std::string a = randomKey(rng, 12, "0123456789abcdef", std::string(80, 'm'));
+                const std::string b = randomKey(rng, 14, "ab", "");
+                const std::string c = randomKey(rng, 12, "ab", std::string(30, 'z'));
+                d.put(a, "m");
+                main[a] = "m";
+                n.put(b, "n");
+                named[b] = "n";
+                r.put(c, "r");
+                reversed[c] = "r";
+            }
+        });
+        e.close();
+    }
+    compact(s.file(), s.file("compacted.db"));
+    Env e = Env::configure().open(s.file("compacted.db"));
+    e.read([&](Txn& t) {
+        checkIntegrity(t);
+        Db d = t.mainDb();
+        checkAgainstModel(d, main, rng);
+        Db n = t.db("names");
+        checkAgainstModel(n, named, rng);
+        Db r = t.db("rev");
+        CHECK_EQ(r.count(), std::uint64_t(reversed.size()));
+        for (const auto& [k, v] : reversed)
+            CHECK(r.get(k).has_value());
     });
 }
 
