@@ -243,6 +243,9 @@ struct EnvImpl
     std::mutex occMtx;
     std::vector<OccPending*> occQueue;
     std::atomic<unsigned> occWaiting{0};  ///< occQueue.size(), readable without occMtx
+    /// How many times a waiting optimistic committer yields before it sleeps
+    /// (Options::commitSpins). Set at open.
+    unsigned occSpins = 256;
     bool occLeader = false;
     /// The transaction holding back every other optimistic commit, after losing
     /// too many conflicts (see OptimisticTxn); null when there is none. Commits

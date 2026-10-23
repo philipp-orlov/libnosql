@@ -480,6 +480,18 @@ public:
         /// commit meanwhile, and a stream of commits costs one device flush
         /// each instead of two. A commit that no other writer follows soon
         /// flushes its own meta. Ignored under the other durability modes.
+        /// How many times an optimistic commit waiting for its group yields
+        /// the processor before it sleeps. Without device flushes a group
+        /// takes microseconds, about what a sleep and a wake cost, so a few
+        /// hundred yields usually see the commit done; zero sleeps at once,
+        /// which suits a host with fewer cores than committing threads. On a
+        /// 4-core host 256 beat 16 and 64, and beat a budget adapted to how
+        /// long waits turned out. Default 256.
+        Options& commitSpins(unsigned yields)
+        {
+            commitSpins_ = yields;
+            return *this;
+        }
         Options& pipelineCommits(bool on = true)
         {
             pipelineCommits_ = on;
@@ -571,6 +583,7 @@ public:
         bool allowNetworkFilesystem_ = false;
         Durability durability_ = Durability::Safe;
         bool pipelineCommits_ = NOSQL_PIPELINE_COMMITS_DEFAULT;
+        unsigned commitSpins_ = 256;
         std::chrono::milliseconds syncInterval_{1000};
         bool cacheReadChecksums_ = false;
         std::chrono::milliseconds revalidateAfter_{60000};

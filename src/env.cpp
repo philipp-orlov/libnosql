@@ -370,6 +370,7 @@ Env Env::Options::open(const std::filesystem::path& path) const
     e->readOnly = readOnly_;
     e->dura = durability_;
     e->pipelined = pipelineCommits_ && durability_ == Durability::Safe;
+    e->occSpins = commitSpins_;
     e->syncIntervalNs = std::chrono::nanoseconds(syncInterval_).count();
     e->lastSyncNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now().time_since_epoch())
