@@ -97,6 +97,7 @@ struct Checker
         const Page* p = t->getPage(pgno, true);
         if (p->pgno != pgno)
             bad("page header carries the wrong page number", pgno);
+        validateNodes(p, ps);
         checkPageHeader(p, tr);
 
         // Branch slot 0 is the -infinity child and must carry no key at all;
@@ -135,7 +136,7 @@ struct Checker
                 }
                 if (n->flags & N_BIGDATA) {
                     const PageNo ov = bigPgno(n);
-                    const Page* op = t->getPage(ov, true);
+                    const Page* op = t->getPage(ov, true, TxnImpl::PageKind::Overflow);
                     if (op->flags != P_OVERFLOW || op->pgno != ov)
                         bad("large value does not point at an overflow page", ov);
                     const unsigned run = ovPages(op);

@@ -233,6 +233,15 @@ bool reclaimable(const TxnImpl* t, TxnId key, std::uint64_t chunk) noexcept
            exemptEpochOf(chunk) == t->exemptEpoch;
 }
 
+/// `p`, read from the free list, checked before the allocator may hand it out:
+/// a writer that took a damaged number would write outside the file it maps.
+PageNo freePageNumber(const TxnImpl* t, PageNo p)
+{
+    if (p < 2 || p > t->lastPgno)
+        throw Error(ErrorCode::Corrupted, "free list names a page outside the store");
+    return p;
+}
+
 /// Absorb the next GC entry into the reclaim list. Only entries retired by a
 /// transaction no live snapshot can still see are eligible.
 bool reclaimMore(TxnImpl* t)
@@ -247,7 +256,7 @@ bool reclaimMore(TxnImpl* t)
         const std::size_t joined = t->reclaim.size();
         t->reclaim.resize(joined + n);
         for (std::size_t i = 0; i < n; ++i)
-            t->reclaim[joined + i] = t->meta.deferredPages[d + i];
+            t->reclaim[joined + i] = freePageNumber(t, t->meta.deferredPages[d + i]);
         std::sort(t->reclaim.begin() + std::ptrdiff_t(joined), t->reclaim.end());
         mergeReclaimed(t, joined);
         t->inlineAbsorbed = true;
@@ -290,7 +299,8 @@ bool reclaimMore(TxnImpl* t)
     const std::size_t joined = t->reclaim.size();
     t->reclaim.resize(joined + n);
     for (std::size_t index = 0; index < n; ++index)
-        t->reclaim[joined + index] = readLittle<PageNo>(v.data() + index * sizeof(PageNo));
+        t->reclaim[joined + index] =
+            freePageNumber(t, readLittle<PageNo>(v.data() + index * sizeof(PageNo)));
     // Keep the unspent part fully ordered, not just the new tail: allocating a
     // multi-page overflow run scans it for a contiguous stretch.
     std::sort(t->reclaim.begin() + std::ptrdiff_t(joined), t->reclaim.end());
@@ -1357,7 +1367,7 @@ Page* TxnImpl::unspill(PageNo p)
     if (!buf)
         return nullptr;
     // Checked like any page read back from the file.
-    const Page* written = getPage(p, true);
+    const Page* written = getPage(p, true, PageKind::Either);
     const unsigned n = isOverflow(written) ? ovPages(written) : 1u;
     const std::size_t held = env->buffers.allocationSize(n);
     chargeDirty(env, held);

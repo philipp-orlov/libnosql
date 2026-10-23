@@ -12,6 +12,7 @@ option(NOSQL_ENABLE_ASAN "Build with address+undefined sanitizers" OFF)
 option(NOSQL_ENABLE_TSAN "Build with the thread sanitizer" OFF)
 option(NOSQL_PIPELINE_COMMITS_DEFAULT
        "Make Env::Options::pipelineCommits() default to on (the suite runs this way in CI)" OFF)
+option(NOSQL_BUILD_FUZZERS "Build the libFuzzer targets in fuzz/ (clang only)" OFF)
 option(NOSQL_PREFIX_KEYS_DEFAULT
        "Give every new byte-ordered tree, the main one included, DbFlags::PrefixKeys (the suite runs this way in CI)" OFF)
 # Subsystems layered on the key-value store. A consumer that uses only the KV
@@ -73,7 +74,10 @@ find_package(Threads REQUIRED)
 target_link_libraries(nosql PUBLIC Threads::Threads)
 
 if(NOSQL_ENABLE_ASAN AND NOT MSVC)
-    target_compile_options(nosql PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer -g)
+    # Undefined behaviour stops the test like an ASan report would, rather than
+    # printing a line a passing run can hide.
+    target_compile_options(nosql PUBLIC -fsanitize=address,undefined -fno-sanitize-recover=undefined
+                           -fno-omit-frame-pointer -g)
     target_link_options(nosql PUBLIC -fsanitize=address,undefined)
 endif()
 if(NOSQL_PIPELINE_COMMITS_DEFAULT)
@@ -126,6 +130,17 @@ elseif(NOSQL_BUILD_EXAMPLES OR NOSQL_BUILD_TOOLS)
 endif()
 if(NOSQL_BUILD_BENCHMARKS)
     add_subdirectory(benchmarks)
+endif()
+if(NOSQL_BUILD_FUZZERS)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "NOSQL_BUILD_FUZZERS needs clang (libFuzzer)")
+    endif()
+    # The library is instrumented for coverage and checked by both sanitizers,
+    # every report fatal, so the fuzzer sees what it reaches and stops on it.
+    target_compile_options(nosql PUBLIC -fsanitize=fuzzer-no-link,address,undefined
+                           -fno-sanitize-recover=all -g)
+    target_link_options(nosql PUBLIC -fsanitize=address,undefined)
+    add_subdirectory(fuzz)
 endif()
 
 install(TARGETS nosql EXPORT nosql-targets
