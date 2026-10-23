@@ -383,6 +383,9 @@ void loadMeta(EnvImpl& e)
     e.durableSlot = bestSlot;
     if (std::uint64_t(e.meta.deferredCount) + e.meta.inlineCount > e.meta.deferredPages.size())
         throw Error(ErrorCode::Corrupted, "invalid deferred free-page count");
+    for (std::size_t i = 0; i < std::size_t(e.meta.deferredCount) + e.meta.inlineCount; ++i)
+        if (e.meta.deferredPages[i] < 2 || e.meta.deferredPages[i] > e.meta.lastPgno)
+            throw Error(ErrorCode::Corrupted, "meta names a free page outside the store");
     e.carryOver.assign(e.meta.deferredPages.begin(),
                       e.meta.deferredPages.begin() + std::ptrdiff_t(e.meta.deferredCount));
     e.commitGen.store(e.meta.txnid, std::memory_order_release);

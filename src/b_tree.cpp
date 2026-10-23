@@ -181,12 +181,13 @@ struct FnCmp
 
 /// Largest slot whose key is <= `key`; slot 0 is -infinity.
 template <class Cmp>
-unsigned branchSearchWith(const Page* p, Slice key, Cmp cmp) noexcept
+unsigned branchSearchWith(const Page* p, Slice key, Cmp cmp, std::size_t ps)
 {
+    const std::size_t top = nodeTop(p, ps);
     unsigned lo = 1, hi = p->nkeys, best = 0;
     while (lo < hi) {
         const unsigned mid = lo + (hi - lo) / 2;
-        if (cmp(nodeKey(p, mid), key) <= 0) {
+        if (cmp(checkedKey(p, mid, top), key) <= 0) {
             best = mid;
             lo = mid + 1;
         } else {
@@ -196,22 +197,23 @@ unsigned branchSearchWith(const Page* p, Slice key, Cmp cmp) noexcept
     return best;
 }
 
-unsigned branchSearch(const Page* p, Slice key, CompareFn cmp) noexcept
+unsigned branchSearch(const Page* p, Slice key, CompareFn cmp, std::size_t ps)
 {
     if (cmp == &cmpLexicographic)
-        return branchSearchWith(p, key, LexCmp{});
-    return branchSearchWith(p, key, FnCmp{cmp});
+        return branchSearchWith(p, key, LexCmp{}, ps);
+    return branchSearchWith(p, key, FnCmp{cmp}, ps);
 }
 
 /// First slot whose key is >= `key` (may equal nkeys).
 template <class Cmp>
-unsigned leafLowerBoundWith(const Page* p, Slice key, Cmp cmp, bool* exact) noexcept
+unsigned leafLowerBoundWith(const Page* p, Slice key, Cmp cmp, bool* exact, std::size_t ps)
 {
+    const std::size_t top = nodeTop(p, ps);
     unsigned lo = 0, hi = p->nkeys;
     *exact = false;
     while (lo < hi) {
         const unsigned mid = lo + (hi - lo) / 2;
-        const int c = cmp(nodeKey(p, mid), key);
+        const int c = cmp(checkedKey(p, mid, top), key);
         if (c == 0) {
             *exact = true;
             return mid;
@@ -224,8 +226,7 @@ unsigned leafLowerBoundWith(const Page* p, Slice key, Cmp cmp, bool* exact) noex
     return lo;
 }
 
-unsigned leafLowerBound(const Page* p, Slice key, CompareFn cmp, bool* exact,
-                        std::size_t ps) noexcept
+unsigned leafLowerBound(const Page* p, Slice key, CompareFn cmp, bool* exact, std::size_t ps)
 {
     if (p->flags & P_PREFIX) {
         // Byte order only: the page's keys all start with its prefix, so the
@@ -236,21 +237,22 @@ unsigned leafLowerBound(const Page* p, Slice key, CompareFn cmp, bool* exact,
             *exact = false;
             return side < 0 ? 0u : unsigned(p->nkeys);
         }
-        return leafLowerBoundWith(p, rest, LexCmp{}, exact);
+        return leafLowerBoundWith(p, rest, LexCmp{}, exact, ps);
     }
     if (cmp == &cmpLexicographic)
-        return leafLowerBoundWith(p, key, LexCmp{}, exact);
-    return leafLowerBoundWith(p, key, FnCmp{cmp}, exact);
+        return leafLowerBoundWith(p, key, LexCmp{}, exact, ps);
+    return leafLowerBoundWith(p, key, FnCmp{cmp}, exact, ps);
 }
 
 /// `key` against leaf `p`'s key `i`, prefix included.
-int againstLeafKey(const Page* p, unsigned i, Slice key, CompareFn cmp, std::size_t ps) noexcept
+int againstLeafKey(const Page* p, unsigned i, Slice key, CompareFn cmp, std::size_t ps)
 {
+    const Slice stored = checkedKey(p, i, nodeTop(p, ps));
     if (!(p->flags & P_PREFIX))
-        return cmp(key, nodeKey(p, i));
+        return cmp(key, stored);
     Slice rest;
     const int side = againstPrefix(leafPrefix(p, ps), key, &rest);
-    return side ? side : rest.compare(nodeKey(p, i));
+    return side ? side : rest.compare(stored);
 }
 
 /// The keys a descent knows lie around the page it enters: its parent's
@@ -333,26 +335,30 @@ unsigned searchFrom(unsigned lo, unsigned hi, unsigned guess, Before before) noe
 /// branchSearch and leafLowerBound for a descent that knows the page's
 /// bounds: the binary search's chain of dependent cache misses becomes one
 /// or two probes near the interpolated slot.
-unsigned branchSearchIn(const Page* p, Slice key, CompareFn cmp, const Bounds& b) noexcept
+unsigned branchSearchIn(const Page* p, Slice key, CompareFn cmp, const Bounds& b, std::size_t ps)
 {
     const unsigned n = p->nkeys;
     if (cmp != &cmpLexicographic || !b.known() || n < 8)
-        return branchSearch(p, key, cmp);
+        return branchSearch(p, key, cmp, ps);
     const LexCmp lex;
+    const std::size_t top = nodeTop(p, ps);
     const unsigned guess = 1 + guessSlot(b, key, n - 1);
-    return searchFrom(1, n, guess, [&](unsigned i) { return lex(nodeKey(p, i), key) <= 0; }) - 1;
+    return searchFrom(1, n, guess,
+                      [&](unsigned i) { return lex(checkedKey(p, i, top), key) <= 0; }) -
+           1;
 }
 
 unsigned leafLowerBoundIn(const Page* p, Slice key, CompareFn cmp, const Bounds& b, bool* exact,
-                          std::size_t ps) noexcept
+                          std::size_t ps)
 {
     const unsigned n = p->nkeys;
     if (cmp != &cmpLexicographic || !b.known() || n < 8 || (p->flags & P_PREFIX))
         return leafLowerBound(p, key, cmp, exact, ps);
     const LexCmp lex;
+    const std::size_t top = nodeTop(p, ps);
     const unsigned i = searchFrom(0, n, guessSlot(b, key, n),
-                                  [&](unsigned j) { return lex(nodeKey(p, j), key) < 0; });
-    *exact = i < n && lex(nodeKey(p, i), key) == 0;
+                                  [&](unsigned j) { return lex(checkedKey(p, j, top), key) < 0; });
+    *exact = i < n && lex(checkedKey(p, i, top), key) == 0;
     return i;
 }
 
@@ -383,7 +389,7 @@ std::byte* overflowCreate(TxnImpl* t, std::size_t vsize, PageNo* out)
 
 void overflowRelease(TxnImpl* t, Tree& tr, PageNo p0)
 {
-    const unsigned n = ovPages(t->getPage(p0));
+    const unsigned n = ovPages(t->getPage(p0, false, TxnImpl::PageKind::Overflow));
     t->freePage(p0, n);
     tr.overflowPages -= n;
 }
@@ -401,6 +407,8 @@ Page* touchLevel(CursorImpl& c, int lvl)
         c.pg[lvl] = back;  // the same page number: the parent needs no update
         return back;
     }
+    // Every node, before a writer edits the copy by the sizes they claim.
+    validateNodes(p, t->pageSize());
     const PageNo np = t->allocPages(1);
     Page* d = t->allocBuffer(np, p->flags, 1);
     std::memcpy(d, p, t->pageSize());
@@ -861,6 +869,7 @@ void rebalance(CursorImpl& c)
     if (Page* back = t->isOwnDirty(spgno) ? nullptr : t->unspill(spgno)) {
         sib = back;
     } else if (!t->isOwnDirty(spgno)) {
+        validateNodes(sib, ps);
         const PageNo np = t->allocPages(1);
         Page* d = t->allocBuffer(np, sib->flags, 1);
         std::memcpy(d, sib, ps);
@@ -999,7 +1008,8 @@ bool descendFirst(CursorImpl& c)
     while (isBranch(c.pg[c.top])) {
         if (c.idx[c.top] >= c.pg[c.top]->nkeys)
             return false;
-        c.pg[c.top + 1] = c.txn->getPage(branchChild(c.pg[c.top], c.idx[c.top]));
+        c.pg[c.top + 1] =
+            c.txn->getPage(checkedChild(c.pg[c.top], c.idx[c.top], c.txn->pageSize()));
         ++c.top;
         c.idx[c.top] = 0;
     }
@@ -1011,7 +1021,8 @@ bool descendLast(CursorImpl& c)
     while (isBranch(c.pg[c.top])) {
         if (c.idx[c.top] >= c.pg[c.top]->nkeys)
             return false;
-        c.pg[c.top + 1] = c.txn->getPage(branchChild(c.pg[c.top], c.idx[c.top]));
+        c.pg[c.top + 1] =
+            c.txn->getPage(checkedChild(c.pg[c.top], c.idx[c.top], c.txn->pageSize()));
         ++c.top;
         const unsigned n = c.pg[c.top]->nkeys;
         c.idx[c.top] = std::uint16_t(n ? n - 1 : 0);
@@ -1027,6 +1038,7 @@ void setAnchor(CursorImpl& c)
     if (c.txn->readOnly || !c.track)
         return;
     const Page* p = c.pg[c.top];
+    checkNode(p, c.idx[c.top], c.txn->pageSize());
     if (p->flags & P_PREFIX) {
         c.anchor.clear();
         appendLeafKey(p, c.idx[c.top], c.txn->pageSize(), c.anchor);
@@ -1129,7 +1141,7 @@ Slice leafValueOverflow(TxnImpl* t, const Page* p, unsigned i)
     const auto* body = reinterpret_cast<const std::byte*>(n) + sizeof(LeafNode) + n->ksize;
     if (!(n->flags & N_BIGDATA))
         return Slice(body, n->vsize);
-    Page* ov = t->getPage(bigPgno(n));
+    Page* ov = t->getOverflow(bigPgno(n), n->vsize);
     return Slice(reinterpret_cast<const std::byte*>(ov) + kPageHdr, n->vsize);
 }
 
@@ -1154,16 +1166,18 @@ bool treeSearch(CursorImpl& c, Slice key, bool* exact)
         const Page* p = c.pg[c.top];
         if (p->nkeys == 0)
             throw Error(ErrorCode::Corrupted, "empty branch page");
-        const unsigned i = branchSearchIn(p, key, cmp, b);
+        const std::size_t ps = c.txn->pageSize();
+        const unsigned i = branchSearchIn(p, key, cmp, b, ps);
         c.idx[c.top] = std::uint16_t(i);
         if (c.top + 1 >= kMaxDepth)
             throw Error(ErrorCode::Corrupted, "b-tree exceeded maximum depth");
         // The child's keys lie between the separators either side of it.
+        const std::size_t top = nodeTop(p, ps);
         if (i > 0)
-            b.low = nodeKey(p, i);
+            b.low = checkedKey(p, i, top);
         if (i + 1u < p->nkeys)
-            b.high = nodeKey(p, i + 1);
-        c.pg[c.top + 1] = c.txn->getPage(branchChild(p, i));
+            b.high = checkedKey(p, i + 1, top);
+        c.pg[c.top + 1] = c.txn->getPage(checkedChild(p, i, ps));
         ++c.top;
     }
     c.idx[c.top] =
@@ -1199,10 +1213,11 @@ std::uint64_t treeRank(CursorImpl& c, Slice key)
         if (depth + 1 >= kMaxDepth)
             throw Error(ErrorCode::Corrupted, "b-tree exceeded maximum depth");
         // Every subtree left of the one `key` belongs in sorts before it.
-        const unsigned i = branchSearch(p, key, cmp);
+        const std::size_t ps = c.txn->pageSize();
+        const unsigned i = branchSearch(p, key, cmp, ps);
         for (unsigned j = 0; j < i; ++j)
-            rank += branchCount(p, j);
-        p = c.txn->getPage(branchChild(p, i));
+            rank += checkedCount(p, j, ps);
+        p = c.txn->getPage(checkedChild(p, i, ps));
     }
     bool exact = false;
     return rank + leafLowerBound(p, key, cmp, &exact, c.txn->pageSize());
@@ -1222,7 +1237,7 @@ bool treeSelect(CursorImpl& c, std::uint64_t rank)
         const Page* p = c.pg[c.top];
         unsigned j = 0;
         for (; j < p->nkeys; ++j) {
-            const std::uint64_t n = branchCount(p, j);
+            const std::uint64_t n = checkedCount(p, j, c.txn->pageSize());
             if (rank < n)
                 break;
             rank -= n;
@@ -1232,7 +1247,7 @@ bool treeSelect(CursorImpl& c, std::uint64_t rank)
         if (c.top + 1 >= kMaxDepth)
             throw Error(ErrorCode::Corrupted, "b-tree exceeded maximum depth");
         c.idx[c.top] = std::uint16_t(j);
-        c.pg[c.top + 1] = c.txn->getPage(branchChild(p, j));
+        c.pg[c.top + 1] = c.txn->getPage(checkedChild(p, j, c.txn->pageSize()));
         ++c.top;
     }
     if (rank >= c.pg[c.top]->nkeys)
@@ -1251,7 +1266,7 @@ std::uint64_t cursorRank(CursorImpl& c)
     std::uint64_t rank = c.idx[c.top];
     for (int lvl = 0; lvl < c.top; ++lvl) {
         for (unsigned j = 0; j < c.idx[lvl]; ++j)
-            rank += branchCount(c.pg[lvl], j);
+            rank += checkedCount(c.pg[lvl], j, c.txn->pageSize());
     }
     return rank;
 }
@@ -1387,6 +1402,7 @@ Slice cursorKey(CursorImpl& c)
 
 Slice leafKeyAt(CursorImpl& c, const Page* p, unsigned i)
 {
+    checkNode(p, i, c.txn->pageSize());
     if (!(p->flags & P_PREFIX))
         return nodeKey(p, i);
     c.keyBuf.clear();
@@ -1489,7 +1505,7 @@ bool treePut(CursorImpl& c, Slice key, Slice value, PutMode mode, WritableSlice*
         }
         if (oldbig && big) {
             const PageNo oldp = bigPgno(n);
-            Page* ovp = t->getPage(oldp);
+            Page* ovp = t->getOverflow(oldp, n->vsize);
             const bool fits = ovPages(ovp) == overflowRun(ps, value.size());
             if (fits && !t->isOwnDirty(oldp))
                 if (Page* back = t->unspill(oldp))
@@ -1522,7 +1538,8 @@ bool treePut(CursorImpl& c, Slice key, Slice value, PutMode mode, WritableSlice*
             std::memcpy(copy, s.data(), s.size());
             s = Slice(copy, s.size());
         };
-        const Page* oldRun = oldbig ? t->getPage(bigPgno(n)) : nullptr;
+        const Page* oldRun =
+            oldbig ? t->getPage(bigPgno(n), false, TxnImpl::PageKind::Overflow) : nullptr;
         const std::size_t runBytes = oldRun ? std::size_t(ovPages(oldRun)) * ps : 0;
         if (inside(key, p, ps) || (oldRun && inside(key, oldRun, runBytes)))
             keep(key);
@@ -1598,7 +1615,7 @@ bool treePut(CursorImpl& c, Slice key, Slice value, PutMode mode, WritableSlice*
     setAnchor(c);
     if (out) {
         if (big) {
-            Page* ov = t->getPage(ovp);
+            Page* ov = t->getPage(ovp, false, TxnImpl::PageKind::Overflow);
             payload = reinterpret_cast<std::byte*>(ov) + kPageHdr;
         }
         *out = WritableSlice(payload, value.size());
@@ -1812,6 +1829,7 @@ std::vector<std::string> treeListSubdbs(TxnImpl* t)
     c.dbi = kCatalogDbi;
     c.allowSubdb = true;
     for (bool ok = cursorFirst(c); ok; ok = cursorNext(c)) {
+        checkNode(c.pg[c.top], c.idx[c.top], t->pageSize());
         if (lnode(c.pg[c.top], c.idx[c.top])->flags & N_SUBDB)
             out.push_back(cursorKey(c).string());
     }
@@ -1820,19 +1838,23 @@ std::vector<std::string> treeListSubdbs(TxnImpl* t)
 
 namespace {
 
-void freeSubtree(TxnImpl* t, Tree& tr, PageNo pn)
+void freeSubtree(TxnImpl* t, Tree& tr, PageNo pn, int depth = 0)
 {
+    // A damaged child pointer can make a cycle, which must not recurse forever.
+    if (depth >= kMaxDepth)
+        throw Error(ErrorCode::Corrupted, "b-tree exceeded maximum depth");
     Page* p = t->getPage(pn);
+    validateNodes(p, t->pageSize());
     if (isBranch(p)) {
         for (unsigned i = 0; i < p->nkeys; ++i)
-            freeSubtree(t, tr, branchChild(p, i));
+            freeSubtree(t, tr, branchChild(p, i), depth + 1);
         --tr.branchPages;
     } else {
         for (unsigned i = 0; i < p->nkeys; ++i) {
             const LeafNode* n = lnode(p, i);
             if (n->flags & N_BIGDATA) {
                 const PageNo ov = bigPgno(n);
-                const unsigned run = ovPages(t->getPage(ov));
+                const unsigned run = ovPages(t->getPage(ov, false, TxnImpl::PageKind::Overflow));
                 t->freePage(ov, run);
                 tr.overflowPages -= run;
             }
