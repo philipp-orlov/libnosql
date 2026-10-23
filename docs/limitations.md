@@ -157,7 +157,9 @@ strike against it; libsql adds one on top), the storage-engine-level gaps are re
   one store commit, and one pair of device flushes under `Safe`, for the group.
   Application work overlaps across threads, and fsync-bound commits share their
   flushes. Pages are still written by one writer at a time, and two threads
-  whose commits strictly alternate gain nothing. Range scans are not validated.
+  whose commits strictly alternate gain nothing. A scan is validated as a read
+  of its whole sub-database, so any later write there, in range or not, makes
+  it conflict.
   A plain `writeTxn` records its keys while optimistic transactions exist; one
   that began before any did, or that clears or drops a sub-database, names no
   keys and conflicts with every optimistic transaction that began before it.

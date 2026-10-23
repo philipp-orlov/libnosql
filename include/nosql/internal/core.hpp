@@ -397,6 +397,7 @@ struct TxnImpl
     bool occTrack = false;
     bool occUnknown = false;
     std::vector<std::uint64_t> occWritten;
+    unsigned occLastDbi = ~0u;  // sub-database whose occDbKey was recorded last
     static constexpr std::size_t kOccTrackLimit = 1u << 20;
 
     /// Bumped by every structural mutation; cursors use it to detect that they

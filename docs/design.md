@@ -167,6 +167,15 @@ The message queue's blocking receive is built on this.
 buffers its writes: an op list over one byte arena, with a hash index for
 read-your-writes once a transaction has 32 writes. Each thread keeps one spare
 set of buffers, so a warm stream of small transactions allocates nothing.
+`scan()` merges the transaction's writes in range, sorted in the
+sub-database's order, over a snapshot cursor; writing to the transaction during
+a scan is refused, since it could move the bytes the scan is handing out.
+
+Validation works on 64-bit hashes of (sub-database, key) (`occKey`). Every
+write also records its sub-database's `occDbKey`, the hash with an empty key,
+which no real key has; a scan records that instead of keys. So a point read or
+write conflicts only with later writes of its key, and a scan with any later
+write to its sub-database.
 
 At commit the transaction gives back its reader slot, which would otherwise pin
 page reclamation while it waits, and pins only its snapshot id
