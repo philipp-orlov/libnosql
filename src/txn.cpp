@@ -795,13 +795,17 @@ void flushOwnMeta(EnvImpl& e, TxnId id)
     std::lock_guard<std::mutex> sl(e.syncMtx);
     if (e.unflushedTxn != id || e.failed.load())
         return;
-    std::shared_ptr<MappedRegion> keep;
+    // The mapping by value, under mtx: a writer growing the file updates the
+    // region's mapping in place, under mtx, while this runs without it.
+    std::shared_ptr<MappedRegion> keep;  // where the mapping can move, this one stays mapped
+    os::Mapping view;
     {
         std::lock_guard<std::mutex> lk(e.mtx);
         keep = e.region;
+        view = e.region->m;
     }
     try {
-        os::flushRange(e.fd, keep->m, std::size_t(e.unflushedSlot) * e.pageSize, e.pageSize);
+        os::flushRange(e.fd, view, std::size_t(e.unflushedSlot) * e.pageSize, e.pageSize);
     } catch (...) {
         // The kernel may drop the page after a failed flush; see Failure.
         e.failed.store(true);
