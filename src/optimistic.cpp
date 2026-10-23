@@ -295,17 +295,23 @@ OptimisticTxn::OptimisticTxn(Env& env, unsigned attempt)
     t->env = env.impl_;
     t->attempt = attempt;
     impl_ = std::move(t);  // from here on finish() undoes whatever was taken
-    if (attempt >= kExclusiveAfter) {
-        // Wait for any other exclusive transaction, claim the turn, then let
-        // the commits already queued drain; new ones wait for this to finish.
-        std::unique_lock<std::mutex> lk(e.occMtx);
-        e.occTurn.wait(lk, [&] { return e.occExclusive == nullptr; });
-        e.occExclusive = impl_.get();
-        impl_->exclusive = true;
-        e.occTurn.wait(lk, [&] { return e.occQueue.empty() && !e.occLeader; });
+    e.occActive.fetch_add(1, std::memory_order_relaxed);  // before the snapshot below
+    try {
+        if (attempt >= kExclusiveAfter) {
+            // Wait for any other exclusive transaction, claim the turn, then let
+            // the commits already queued drain; new ones wait for this to finish.
+            std::unique_lock<std::mutex> lk(e.occMtx);
+            e.occTurn.wait(lk, [&] { return e.occExclusive == nullptr; });
+            e.occExclusive = impl_.get();
+            impl_->exclusive = true;
+            e.occTurn.wait(lk, [&] { return e.occQueue.empty() && !e.occLeader; });
+        }
+        impl_->snapshot = env.readTxn();
+        impl_->snapshotId = impl_->snapshot.id();
+    } catch (...) {
+        finish();  // a constructor that throws gets no destructor
+        throw;
     }
-    impl_->snapshot = env.readTxn();
-    impl_->snapshotId = impl_->snapshot.id();
 }
 
 OptimisticTxn::~OptimisticTxn()
@@ -335,6 +341,7 @@ void OptimisticTxn::finish() noexcept
 {
     if (!impl_)
         return;
+    impl_->env->occActive.fetch_sub(1, std::memory_order_relaxed);
     if (impl_->exclusive) {
         EnvImpl& e = *impl_->env;
         std::lock_guard<std::mutex> lk(e.occMtx);
@@ -435,14 +442,10 @@ void OptimisticTxn::applyBatch(EnvImpl& e) noexcept
             }
             if (!wrote)
                 return;  // nothing to publish; the writer aborts
-            // Publish records the keys this group wrote, not "unknown".
-            e.occNext = &e.occBatchWritten;
-            try {
-                w.commit();
-            } catch (...) {
-                e.occNext = nullptr;
-                throw;
-            }
+            // The writer recorded the keys it replayed, which is what the log
+            // keeps for this group (an optimistic transaction is alive, this
+            // one, so it was tracking).
+            w.commit();
             return;
         } catch (const RetryWithout&) {
         } catch (...) {

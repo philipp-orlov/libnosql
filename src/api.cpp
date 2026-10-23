@@ -108,8 +108,31 @@ void releaseCursor(CursorImpl* c) noexcept
         cursorPool().give(c);
 }
 
+/// Records a key a write transaction wrote, while optimistic transactions need
+/// to know (see TxnImpl::occTrack).
+void noteWrite(TxnImpl* t, unsigned dbi, Slice key)
+{
+    if (!t->occTrack || t->occUnknown)
+        return;
+    if (t->occWritten.size() >= TxnImpl::kOccTrackLimit) {
+        t->occUnknown = true;  // too many to list: conflict like an untracked commit
+        t->occWritten.clear();
+        return;
+    }
+    t->occWritten.push_back(occKey(t->dbs[dbi].name, key.view()));
+}
+
+/// A write that removes keys nobody listed: the commit conflicts with every
+/// optimistic transaction that began before it.
+void noteUnknown(TxnImpl* t) noexcept
+{
+    if (t->occTrack)
+        t->occUnknown = true;
+}
+
 void dropNamed(TxnImpl* t, unsigned dbi)
 {
+    noteUnknown(t);
     const std::string name = t->dbs[dbi].name;
     treeDrop(t, dbi);
     treeDelSubdb(t, Slice(name));
@@ -181,6 +204,8 @@ Txn Env::beginWriter()
             t->env = e;
             t->readOnly = false;
             t->loadSnapshot(e->meta, e->region);
+            // Under mtx, which every optimistic snapshot is taken under too.
+            t->occTrack = e->occActive.load(std::memory_order_relaxed) != 0;
             t->oldest = e->oldestSnapshot();
             t->readersOldest = t->oldest;
             t->exemptEpoch = 0;
@@ -358,6 +383,7 @@ Txn Txn::nested()
     t->oldest = p->oldest;
     t->lastPgno = p->lastPgno;
     t->namedDbs = p->namedDbs;
+    t->occTrack = p->occTrack;
     t->copyDbs(p->dbs);
     for (DbSlot& d : t->dbs)
         d.dirty = 0;
@@ -542,7 +568,9 @@ bool Db::put(Slice key, Slice value, PutMode mode) const
 {
     TxnImpl* t = writable(txn_.get());
     CursorImpl c = probe(t, dbi_);
-    return treePut(c, key, value, mode, nullptr);
+    const bool placed = treePut(c, key, value, mode, nullptr);
+    noteWrite(t, dbi_, key);
+    return placed;
 }
 
 WritableSlice Db::reserve(Slice key, std::size_t size, PutMode mode) const
@@ -553,6 +581,7 @@ WritableSlice Db::reserve(Slice key, std::size_t size, PutMode mode) const
     if (!treePut(c, key, Slice(nullptr, size), mode, &w))
         throw Error(mode == PutMode::InsertUnique ? ErrorCode::KeyExists : ErrorCode::NotFound,
                     "reserve did not place a value");
+    noteWrite(t, dbi_, key);
     return w;
 }
 
@@ -560,12 +589,15 @@ bool Db::erase(Slice key) const
 {
     TxnImpl* t = writable(txn_.get());
     CursorImpl c = probe(t, dbi_);
-    return treeDel(c, key);
+    const bool erased = treeDel(c, key);
+    noteWrite(t, dbi_, key);
+    return erased;
 }
 
 void Db::clear() const
 {
     TxnImpl* t = writable(txn_.get());
+    noteUnknown(t);
     treeDrop(t, dbi_);
 }
 
@@ -793,7 +825,10 @@ bool Cursor::seekExact(Slice k)
 
 bool Cursor::put(Slice k, Slice v, PutMode mode)
 {
-    return treePut(attached(impl_, true), k, v, mode, nullptr);
+    CursorImpl& c = attached(impl_, true);
+    const bool placed = treePut(c, k, v, mode, nullptr);
+    noteWrite(c.txn, c.dbi, k);
+    return placed;
 }
 
 bool Cursor::erase()
@@ -805,6 +840,7 @@ bool Cursor::erase()
     const Slice k = cursorKey(c);
     std::vector<std::byte>& saved = c.erasedKey;
     saved.assign(k.data(), k.data() + k.size());
+    noteWrite(c.txn, c.dbi, k);
     treeDelCurrent(c);
     // The key is gone, so seeking to it lands on whatever came next.
     return cursorSeek(c, Slice(saved.data(), saved.size()));

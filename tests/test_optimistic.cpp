@@ -5,6 +5,7 @@
 // later commits touched, replayed under the writer slot.
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <string>
@@ -119,17 +120,113 @@ TEST(optimisticReadOnlyUseIsValidated)
     CHECK_THROWS([&] { reader.commit(); }(), ErrorCode::Conflict);
 }
 
-TEST(optimisticConflictsWithPlainWriterOnAnyKey)
+TEST(optimisticPlainWriterConflictsOnlyOnItsKeys)
 {
-    // A plain write names no keys, so it conservatively conflicts with every
-    // optimistic transaction that began before it.
+    // While an optimistic transaction is alive, plain write transactions record
+    // the keys they write, so they conflict with it only on those.
     tst::Scratch s("optimistic");
     Env e = Env::configure().open(s.file());
+    e.write([](Txn& w) { w.mainDb().put("read", "0"); });
     OptimisticTxn t(e);
+    t.get("", "read");
     t.put("", "mine", "1");
     e.write([](Txn& w) { w.mainDb().put("unrelated", "x"); });
-    CHECK_THROWS([&] { t.commit(); }(), ErrorCode::Conflict);
-    CHECK(!valueOf(e, "mine").has_value());
+    t.commit();
+    CHECK(valueOf(e, "mine") == std::optional<std::string>("1"));
+
+    OptimisticTxn u(e);
+    u.get("", "read");
+    u.put("", "mine", "2");
+    e.write([](Txn& w) { w.mainDb().put("read", "changed"); });
+    CHECK_THROWS(u.commit(), ErrorCode::Conflict);
+    CHECK(valueOf(e, "mine") == std::optional<std::string>("1"));
+}
+
+TEST(optimisticPlainWriterFromBeforeAnyOptimisticIsUnknown)
+{
+    // A write transaction that began while no optimistic one existed did not
+    // record its keys, so it conflicts with every optimistic snapshot it follows.
+    tst::Scratch s("optimistic");
+    Env e = Env::configure().open(s.file());
+    Txn w = e.writeTxn();
+    OptimisticTxn t(e);
+    t.put("", "mine", "1");
+    w.mainDb().put("unrelated", "x");
+    w.commit();
+    CHECK_THROWS(t.commit(), ErrorCode::Conflict);
+}
+
+TEST(optimisticPlainClearIsUnknown)
+{
+    tst::Scratch s("optimistic");
+    Env e = Env::configure().open(s.file());
+    e.write([](Txn& w) { w.db("other", DbFlags::Create).put("k", "v"); });
+    OptimisticTxn t(e);
+    t.put("", "mine", "1");
+    e.write([](Txn& w) { w.db("other").clear(); });  // names no keys
+    CHECK_THROWS(t.commit(), ErrorCode::Conflict);
+    OptimisticTxn u(e);
+    u.put("", "mine", "1");
+    e.write([](Txn& w) { w.dropDb("other"); });
+    CHECK_THROWS(u.commit(), ErrorCode::Conflict);
+}
+
+TEST(optimisticPlainNestedAbortDropsItsKeys)
+{
+    tst::Scratch s("optimistic");
+    Env e = Env::configure().open(s.file());
+    e.write([](Txn& w) { w.mainDb().put("x", "0"); });
+    OptimisticTxn t(e);
+    t.get("", "x");
+    t.put("", "mine", "1");
+    e.write([](Txn& w) {
+        Txn n = w.nested();
+        n.mainDb().put("x", "discarded");
+        n.abort();
+        w.mainDb().put("y", "1");
+    });
+    t.commit();  // the write to x never happened
+
+    OptimisticTxn u(e);
+    u.get("", "x");
+    u.put("", "mine", "2");
+    e.write([](Txn& w) {
+        Txn n = w.nested();
+        n.mainDb().put("x", "kept");
+        n.commit();
+    });
+    CHECK_THROWS(u.commit(), ErrorCode::Conflict);
+}
+
+TEST(optimisticPlainCursorAndReserveWritesAreTracked)
+{
+    tst::Scratch s("optimistic");
+    Env e = Env::configure().open(s.file());
+    e.write([](Txn& w) {
+        w.mainDb().put("a", "0");
+        w.mainDb().put("b", "0");
+    });
+    OptimisticTxn t(e);
+    t.get("", "a");
+    t.put("", "mine", "1");
+    e.write([](Txn& w) {
+        Cursor c = w.mainDb().cursor();
+        CHECK(c.seekExact("a"));
+        c.erase();
+    });
+    CHECK_THROWS(t.commit(), ErrorCode::Conflict);
+
+    OptimisticTxn u(e);
+    u.get("", "b");
+    u.put("", "mine", "2");
+    e.write([](Txn& w) { std::memcpy(w.mainDb().reserve("b", 1).data(), "R", 1); });
+    CHECK_THROWS(u.commit(), ErrorCode::Conflict);
+
+    OptimisticTxn v(e);
+    v.get("", "c");
+    v.put("", "mine", "3");
+    e.write([](Txn& w) { w.mainDb().cursor().put("c", "new"); });
+    CHECK_THROWS(v.commit(), ErrorCode::Conflict);
 }
 
 TEST(optimisticFinishedTxnRejectsUse)
