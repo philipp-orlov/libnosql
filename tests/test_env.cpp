@@ -183,8 +183,10 @@ TEST(lazyDurabilitySyncsOncePerInterval)
         CHECK_EQ(e.stats().durableTxn, e.stats().lastTxn);
     }
     {
+        // Five commits must fit inside the interval, so it is generous: a
+        // slow machine, a sanitizer, must not see one sync early.
         Env e =
-            Env::configure().sync(Durability::Lazy).syncInterval(milliseconds(200)).open(s.file());
+            Env::configure().sync(Durability::Lazy).syncInterval(milliseconds(1000)).open(s.file());
         const std::uint64_t durable = e.stats().durableTxn;
         CHECK(barriersOf([&] {
                   for (int i = 1; i < 6; ++i)
@@ -194,7 +196,7 @@ TEST(lazyDurabilitySyncsOncePerInterval)
         CHECK_EQ(e.stats().lastTxn, durable + 5);
         // Readers see every commit, durable or not.
         e.read([](Txn& t) { CHECK_EQ(t.mainDb().count(), std::uint64_t(6)); });
-        std::this_thread::sleep_for(milliseconds(250));
+        std::this_thread::sleep_for(milliseconds(1050));
         CHECK(barriersOf([&] { put(e, 6); }) == std::make_pair(1u, 1u));
         CHECK_EQ(e.stats().durableTxn, e.stats().lastTxn);
         put(e, 7);

@@ -323,6 +323,8 @@ EnvStats Env::stats() const
         s.oldestReader = e->readers.empty() ? 0 : e->readers.front().first;
         s.bufferBytes = e->buffers.retainedBytes();
         s.dirtyBytes = e->dirtyBytes.load();
+        s.optimisticCommits = e->occInCommit.load(std::memory_order_relaxed);
+        s.optimisticQueued = e->occWaiting.load(std::memory_order_relaxed);
         s.durableTxn = std::min<std::uint64_t>(e->durableTxn, e->meta.txnid);
         if (e->ship) {
             s.captureFailures = e->ship->failures();

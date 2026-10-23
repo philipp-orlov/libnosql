@@ -168,7 +168,7 @@ TEST(readChecksumCacheExpiresAfterTheRevalidationInterval)
     tst::Scratch scratch("checksum-cache-ttl");
     Env env = Env::configure()
                   .cacheReadChecksums()
-                  .revalidateAfter(std::chrono::milliseconds(20))
+                  .revalidateAfter(std::chrono::milliseconds(500))
                   .open(scratch.file());
     env.write([](Txn& txn) { txn.mainDb().put("key", "value"); });
     const auto root = readMeta(scratch.file()).mainTree.root;
@@ -176,7 +176,7 @@ TEST(readChecksumCacheExpiresAfterTheRevalidationInterval)
     flipByte(scratch.file(), root * 4096 + internal::kPageHdr + 40);
     // Still trusted right away ...
     env.read([](Txn& txn) { (void)txn.mainDb().get("key"); });
-    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    std::this_thread::sleep_for(std::chrono::milliseconds(550));
     // ... and verified again once the interval has passed.
     env.read([](Txn& txn) { CHECK_THROWS(txn.mainDb().get("key"), ErrorCode::Corrupted); });
 }

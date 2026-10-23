@@ -143,6 +143,10 @@ struct EnvStats
     std::uint64_t capturedTxnid = 0;
     std::uint64_t dirtyBytes = 0;
     std::uint64_t durableTxn = 0;  ///< newest commit known to be on stable storage
+    /// OptimisticTxn::commit() calls in progress, and how many of them wait
+    /// in the queue behind the group being applied.
+    std::uint32_t optimisticCommits = 0;
+    std::uint32_t optimisticQueued = 0;
 };
 
 // ------------------------------------------------------------------ db ----

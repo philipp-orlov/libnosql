@@ -169,14 +169,16 @@ TEST(expiredMessagesAreNeverDelivered)
 {
     tst::Scratch s("mq");
     // The TTL has to cover the fresh message's own commit. Under Safe that is
-    // two device flushes, which on a slow disk outlast 20 ms and expire it
+    // two device flushes, which on a slow disk outlast a short TTL and expire it
     // too; this tests expiry, not durability, so its commits flush nothing.
     Env e = Env::configure().sync(Durability::None).open(s.file());
-    MessageQueue q = MessageQueue::open(e, "orders", MessageQueue::Options().messageTtl(20ms));
+    // The fresh message must still be fresh when received, however slowly
+    // this runs: a TTL long against a send and a receive, short to wait out.
+    MessageQueue q = MessageQueue::open(e, "orders", MessageQueue::Options().messageTtl(300ms));
 
     q.send("stale-1");
     q.send("stale-2");
-    std::this_thread::sleep_for(60ms);
+    std::this_thread::sleep_for(400ms);
     q.send("fresh");
 
     Receipt r = q.tryReceive();
@@ -188,10 +190,11 @@ TEST(expiredMessagesAreNeverDelivered)
 TEST(anAbandonedLeaseComesBackAfterItExpires)
 {
     tst::Scratch s("mq");
-    // As above: the 30 ms lease has to outlast the receive's own commit, so
+    // As above: the lease has to outlast the receive's own commit, so
     // that commit flushes nothing.
     Env e = Env::configure().sync(Durability::None).open(s.file());
-    MessageQueue q = MessageQueue::open(e, "orders", fastLease(30ms));
+    // Long enough that "not due yet" holds on a slow machine.
+    MessageQueue q = MessageQueue::open(e, "orders", fastLease(300ms));
 
     q.send("work");
     {
@@ -201,7 +204,7 @@ TEST(anAbandonedLeaseComesBackAfterItExpires)
     CHECK_EQ(q.readyCount(), std::uint64_t(0));
     CHECK_EQ(q.sweep(), std::uint64_t(0));  // not due yet
 
-    std::this_thread::sleep_for(60ms);
+    std::this_thread::sleep_for(400ms);
     CHECK_EQ(q.sweep(), std::uint64_t(1));
     CHECK_EQ(q.readyCount(), std::uint64_t(1));
     CHECK_EQ(q.leasedCount(), std::uint64_t(0));
