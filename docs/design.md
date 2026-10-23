@@ -251,10 +251,14 @@ runs it before it returns, so a busy store makes two device flushes per
 interval whatever its commit rate (group commit). `Env::sync()` runs one under
 either mode, and so does the store closing (the last handle and transaction
 going away; that sync cannot report a failure, so call `Env::sync()` first to see
-one). There is no timer thread: a `Lazy` store that stops committing keeps its
-newest commits in memory until one of those happens, so a caller that needs the
-interval bound while idle calls `Env::sync()` from a timer of its own. `None`
-never syncs on its own. A crash of either kind, process or power, reopens the
+one). By default there is no timer thread: a `Lazy` store that stops committing
+keeps its newest commits in memory until one of those happens. With
+`Options::backgroundSync()` the store starts one thread that wakes once an
+interval and, if commits are waiting and none has synced within the interval,
+runs the same sync `Env::sync()` would, so an idle store's commits reach the
+device within about two intervals. A failure there poisons the store like any
+failed sync; the thread stops and joins before the closing sync. `None` never
+syncs on its own. A crash of either kind, process or power, reopens the
 store on the last sync.
 
 Reclamation is pinned at the newest durable commit (below), which is what keeps

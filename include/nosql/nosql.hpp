@@ -499,12 +499,24 @@ public:
         }
         /// Under Durability::Lazy, the first commit at least this long after
         /// the last sync runs the next one. Only commits (and Env::sync())
-        /// sync: there is no timer thread, so a store that stops committing
-        /// keeps its newest commits in memory until Env::sync() or close.
-        /// Zero syncs every commit. Default one second.
+        /// sync unless backgroundSync() is on, so a store that stops
+        /// committing keeps its newest commits in memory until Env::sync() or
+        /// close. Zero syncs every commit. Default one second.
         Options& syncInterval(std::chrono::milliseconds interval)
         {
             syncInterval_ = interval;
+            return *this;
+        }
+        /// Under Durability::Lazy, also sync from a thread of the store's own:
+        /// once each syncInterval, if commits are waiting and none has synced
+        /// within the interval. An idle store's newest commits then reach the
+        /// device within about two intervals, as a busy one's do within one.
+        /// A failed sync poisons the store, as a failed Env::sync() does; the
+        /// next transaction reports it. Off by default, when the store starts
+        /// no threads; ignored under the other modes and with a zero interval.
+        Options& backgroundSync(bool on = true)
+        {
+            backgroundSync_ = on;
             return *this;
         }
         /// Let read transactions trust a page checksum this process has
@@ -585,6 +597,7 @@ public:
         bool pipelineCommits_ = NOSQL_PIPELINE_COMMITS_DEFAULT;
         unsigned commitSpins_ = 256;
         std::chrono::milliseconds syncInterval_{1000};
+        bool backgroundSync_ = false;
         bool cacheReadChecksums_ = false;
         std::chrono::milliseconds revalidateAfter_{60000};
         std::size_t bufferCache_ = 32u << 20;

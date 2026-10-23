@@ -5,6 +5,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <filesystem>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -206,6 +207,59 @@ TEST(lazyDurabilitySyncsOncePerInterval)
     // Closing synced the last commit.
     Env e = Env::configure().readOnly().open(s.file());
     e.read([](Txn& t) { CHECK_EQ(t.mainDb().count(), std::uint64_t(9)); });
+}
+
+TEST(lazyBackgroundSyncBoundsAnIdleStoresLoss)
+{
+    tst::Scratch s("env");
+    using std::chrono::milliseconds;
+    const auto put = [](Env& e, int i) {
+        e.write([&](Txn& t) { t.mainDb().put(tst::keyOf(i), "v"); });
+    };
+    {
+        // Without it, a store that stops committing keeps its newest commit in
+        // memory however long it waits.
+        Env e = Env::configure()
+                    .sync(Durability::Lazy)
+                    .syncInterval(milliseconds(30))
+                    .open(s.file("plain.db"));
+        put(e, 0);
+        std::this_thread::sleep_for(milliseconds(150));
+        CHECK(e.stats().durableTxn < e.stats().lastTxn);
+    }
+    {
+        Env e = Env::configure()
+                    .sync(Durability::Lazy)
+                    .syncInterval(milliseconds(30))
+                    .backgroundSync()
+                    .open(s.file("background.db"));
+        put(e, 1);
+        const std::uint64_t last = e.stats().lastTxn;
+        const auto t0 = std::chrono::steady_clock::now();
+        while (e.stats().durableTxn < last &&
+               std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5))
+            std::this_thread::sleep_for(milliseconds(5));
+        CHECK_EQ(e.stats().durableTxn, last);
+        // The file holds it now, as a power cut would find it.
+        std::filesystem::copy_file(s.file("background.db"), s.file("cut.db"));
+        Env cut = Env::configure().readOnly().open(s.file("cut.db"));
+        cut.read([](Txn& t) { CHECK(t.mainDb().contains(tst::keyOf(1))); });
+    }
+    {
+        // Closing does not wait out the interval the thread is sleeping on.
+        const auto t0 = std::chrono::steady_clock::now();
+        {
+            Env e = Env::configure()
+                        .sync(Durability::Lazy)
+                        .syncInterval(std::chrono::seconds(10))
+                        .backgroundSync()
+                        .open(s.file("long.db"));
+            put(e, 2);
+        }
+        CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(2));
+        Env e = Env::configure().readOnly().open(s.file("long.db"));
+        e.read([](Txn& t) { CHECK(t.mainDb().contains(tst::keyOf(2))); });  // the closing sync
+    }
 }
 
 TEST(durableTxnFollowsTheMode)
