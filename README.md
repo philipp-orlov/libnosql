@@ -153,6 +153,7 @@ is built):
 | `allocbudget` | zero heap allocations per warm transaction, a flat heap across churn rounds, slices that survive a growth |
 | `mvcc` | snapshot isolation, readers versus writer, reader pinning, waiting writers served within a bounded number of commits |
 | `torture` | randomized operation mixes checked against a `std::map` oracle (open-ended: `fuzz/fuzz_ops.cpp`, every tree flavour, nested and optimistic transactions, spills, shrinks, reopens and compactions) |
+| `stress` | everything at once, for the thread sanitizer: a spilling writer, optimistic group commits and `shrink()` while readers check every snapshot and hold slices into it |
 | `optimistic` | `OptimisticTxn`: conflict detection, retries, group commit, escalation |
 | `separators` | shortest branch separators at splits, rebalances and bulk loads |
 | `pipeline` | pipelined `Safe` commits: visibility only once durable, failure handling |
