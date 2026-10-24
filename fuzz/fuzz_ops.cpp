@@ -350,7 +350,13 @@ private:
             }
             case 12: {  // a cursor that erases and overwrites as it goes
                 const std::string k = key(s);
-                write([&] { cursorWrites(db(writer(), tree), model(tree), s, k); });
+                // The writer must open before the model is read: a new level
+                // is copied from the committed model, and the argument order
+                // of one call is unspecified.
+                write([&] {
+                    nosql::Db d = db(writer(), tree);
+                    cursorWrites(d, model(tree), s, k);
+                });
                 break;
             }
             case 13: {  // countRange
