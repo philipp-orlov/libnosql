@@ -26,7 +26,7 @@ All maintained `.hpp` files live beneath `include/`:
 |---|---|
 | `include/nosql/` | Installed public API headers |
 | `include/nosql/internal/` | Private engine, OS, format, queue and shipping headers |
-| `include/tests/` | Test harness header |
+| `include/tests/` | Test harness and the power-cut device model |
 | `include/examples/` | Example scratch-directory helper |
 | `src/internal/` | OS and checksum implementations |
 | `src/` | Engine and optional-layer implementations |
@@ -523,7 +523,12 @@ then placed nodes under, are fixed and replayed by the suite. Its sibling `fuzz/
 puts, erases, cursor walks that write as they go, nested and optimistic
 transactions, older snapshots, shrinks, reopens and compactions, over every tree
 flavour and page size and a dirty budget small enough to spill, each read checked
-against a `std::map`. CI runs both briefly on every push.
+against a `std::map`. `fuzz/fuzz_power.cpp` lets the input pick the workload of
+the `power` suite: transactions with nested children and aborts, values up to
+four pages, syncs and shrinks, in any durability mode, pipelined or spilling, and
+every image of every power cut along its record must open on a committed snapshot
+no older than the last one reported durable. CI runs all three briefly on every
+push.
 
 Every committed-page access validates by default. Dirty private pages are sealed
 only before publication. Overflow bounds are checked before hashing a run.
@@ -694,7 +699,7 @@ every read, cost 25-50% on lookups; checking only the nodes visited is what rema
 The dependency-free CTest suite covers database behavior, geometry, cursors,
 named/nested transactions, overflow/reclamation, snapshot concurrency, long-run
 workloads, queues, replication, fault injection, format and checksum fixtures,
-and tar storage. `include/tests/test_util.hpp` supplies the test harness.
+and tar storage. `include/tests/test_util.hpp` supplies the test harness, and `include/tests/power_model.hpp` the write recorder and device model the `power` suite and `fuzz/fuzz_power.cpp` share.
 
 For reconstruction, implement and test primitives in dependency order:
 

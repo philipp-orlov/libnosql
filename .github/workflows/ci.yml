@@ -143,10 +143,12 @@ jobs:
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
           -DCMAKE_CXX_COMPILER=clang++-18 -DNOSQL_BUILD_FUZZERS=ON
       - name: Build
-        run: cmake --build build --target fuzz_ops fuzz_pages
+        run: cmake --build build --target fuzz_ops fuzz_pages fuzz_power
       - name: Model fuzzing
         run: build/fuzz/fuzz_ops -max_total_time=120 -max_len=8192
       - name: Page fuzzing
         run: |
           build/fuzz/fuzz_pages -max_total_time=60
           FUZZ_SUFFIXES=1 build/fuzz/fuzz_pages -max_total_time=60
+      - name: Power-cut fuzzing
+        run: build/fuzz/fuzz_power -max_total_time=90
