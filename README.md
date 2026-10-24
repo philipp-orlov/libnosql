@@ -164,7 +164,7 @@ is built):
 | `mq` | queue semantics: FIFO, leases, redelivery, dead-lettering |
 | `mqsteady` | queues under sustained send/receive: no unbounded growth |
 | `replication` | checkpoints, base images, bundle format, apply, divergence |
-| `replicationtorture` | randomized workloads: a replica must match the primary exactly |
+| `replicationtorture` | randomized workloads: a replica must match the primary exactly (open-ended: `fuzz/fuzz_replication.cpp`, segments and bundles damaged, swapped and applied out of order) |
 | `fault` | deterministic I/O and partial-write failures around commit/apply/compaction; power cuts at each step of a `NoMetaSync` commit and of a `Lazy`/`None` sync |
 | `format` | little-endian bytes, 64-bit page/run hashes, catalog separation, compaction and unsupported-format rejection |
 | `checksum` | golden digests, independent reference equality, streaming splits, alignment and concurrency |

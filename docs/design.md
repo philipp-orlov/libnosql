@@ -531,8 +531,13 @@ against a `std::map`. `fuzz/fuzz_power.cpp` lets the input pick the workload of
 the `power` suite: transactions with nested children and aborts, values up to
 four pages, syncs and shrinks, in any durability mode, pipelined or spilling, and
 every image of every power cut along its record must open on a committed snapshot
-no older than the last one reported durable. CI runs all three briefly on every
-push.
+no older than the last one reported durable. `fuzz/fuzz_replication.cpp` ships
+from a primary whose segments roll every few KiB while the input commits, shrinks,
+extracts bundles from any checkpoint, flips, truncates, extends, deletes and swaps
+segment, index and bundle files, prunes, and applies any bundle it made to the
+replica in any order: a failed apply must leave the replica where it was, and a
+successful one whole on a checkpoint the primary committed, holding exactly what
+it held there. CI runs all four briefly on every push.
 
 Every committed-page access validates by default. Dirty private pages are sealed
 only before publication. Overflow bounds are checked before hashing a run.
