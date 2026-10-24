@@ -23,9 +23,14 @@ namespace nosql::internal {
 /// page buffers never come from the heap at all: they are carved from slabs
 /// the pool maps from the OS itself.
 ///
-/// Buckets are powers of two in pages; a request is served from the bucket
-/// that fits, so every buffer in a bucket is exactly the same size and slots
-/// straight back in on release. A slab (1 MiB, or 64 pages if that is more)
+/// Buckets are sizes in pages: 1 to 4 exactly, then four steps to each
+/// doubling (5, 6, 7, 8, 10, 12, 14, 16, 20, ...), so a buffer is never a
+/// quarter larger than the run it holds; whole powers of two would make a
+/// five-page run take eight, and with it the dirty budget and the cache. A
+/// request is served from the bucket that fits, so every buffer in a bucket
+/// is exactly the same size and slots straight back in on release; there are
+/// few enough buckets that their slabs bound what fragments. A slab (1 MiB,
+/// or 64 pages if that is more)
 /// holds buffers of one bucket only; a bucket larger than that gets a slab
 /// of its own. Up to the configured budget, released buffers stay resident
 /// on a free list that holds its links in the idle buffers themselves. Past
@@ -36,7 +41,8 @@ namespace nosql::internal {
 class BufferPool
 {
 public:
-    static constexpr unsigned kClasses = std::numeric_limits<unsigned>::digits;
+    /// 1 to 4 pages, then four per doubling up to 2^digits pages.
+    static constexpr unsigned kClasses = 4 + 4 * (std::numeric_limits<unsigned>::digits - 2);
 
     BufferPool() = default;
     BufferPool(const BufferPool&) = delete;
@@ -69,16 +75,27 @@ private:
 
     static int classOf(unsigned npages) noexcept
     {
+        if (npages <= 4)
+            return npages ? int(npages) - 1 : 0;
+        // Past 4: m = npages - 1 lies in [2^e, 2^(e+1)), and its two bits
+        // below the top one pick the quarter step.
+        const unsigned m = npages - 1;
 #if defined(__GNUC__) || defined(__clang__)
-        const unsigned bucket = npages <= 1 ? 0 : kClasses - __builtin_clz(npages - 1);
+        const unsigned e = unsigned(std::numeric_limits<unsigned>::digits) - 1 - unsigned(__builtin_clz(m));
 #else
-        unsigned bucket = 0;
-        for (unsigned remaining = npages > 1 ? npages - 1 : 0; remaining; remaining >>= 1)
-            ++bucket;
+        unsigned e = 0;
+        for (unsigned rest = m; rest > 1; rest >>= 1)
+            ++e;
 #endif
-        return bucket < kClasses ? static_cast<int>(bucket) : -1;
+        return int(4 + 4 * (e - 2) + ((m >> (e - 2)) & 3u));
     }
-    static std::size_t classPages(int c) noexcept { return std::size_t(1) << c; }
+    static std::size_t classPages(int c) noexcept
+    {
+        if (c < 4)
+            return std::size_t(c) + 1;
+        const unsigned e = unsigned(c - 4) / 4 + 2, step = unsigned(c - 4) % 4 + 1;
+        return (std::size_t(1) << e) + (std::size_t(step) << (e - 2));
+    }
 
     // Callers hold mtx_.
     Page* carve(int c);

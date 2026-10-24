@@ -768,7 +768,8 @@ taskset -c 0 ./build/examples/bench 500000 100 4096 transaction
 ## Running for a long time
 
 Page buffers never touch the heap: they are carved from 1 MiB slabs the pool maps
-from the OS, one power-of-two class of pages per slab, with the slab's
+from the OS, one size class of pages per slab (1 to 4 pages, then four steps
+to each doubling, so a buffer is never a quarter larger than its run), with the slab's
 bookkeeping in its own first page. Idle buffers within `bufferCache` stay
 resident and hold their own free-list links, so returning one never allocates;
 past the budget a buffer's memory goes back to the OS and an empty slab is
@@ -801,7 +802,7 @@ that every workload or the whole process is allocation-free.
 
 `Env::Options::dirtyLimit(bytes)` defaults to 256 MiB of active dirty buffers
 (zero disables the limit); `bufferCache(bytes)` separately limits idle buffer
-payload bytes, excluding slab headers and power-of-two class rounding.
+payload bytes, excluding slab headers and the rounding of each buffer up to its size class.
 Compaction uses a streaming page builder, retaining one page per active level
 and chunking large values instead of buffering a destination transaction.
 Source snapshot state, catalog names, and the integrity bitmap remain additional
