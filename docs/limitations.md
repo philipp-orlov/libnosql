@@ -107,8 +107,8 @@ in the "Terminology" section of `docs/design.md`.
   transaction; excess capacity is discarded. Page buffers come from slabs mapped
   from the OS, never from the heap; past `bufferCache` their memory goes back to
   the OS and empty slabs are unmapped. Slab headers (one system page per slab)
-  and the power-of-two rounding of each buffer's class are outside the payload
-  budgets.
+  and the rounding of each buffer up to its size class (under a quarter) are
+  outside the payload budgets.
   Arena scratch, OS cache, and shipping segment/transaction descriptors still
   consume memory. External coalescing bounds its dirty buffers, not total RSS.
   Warm allocation-free core workloads are tested, but cold starts, changing

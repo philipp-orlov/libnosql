@@ -280,6 +280,30 @@ TEST(pageBufferRecyclingReusesEverySizeClass)
     }
 }
 
+/// Buffers come in 1 to 4 pages, then four steps to each doubling: never
+/// smaller than asked, never a quarter larger, and larger requests never get
+/// smaller buffers.
+TEST(pageBufferSizesStayWithinAQuarterOfTheRequest)
+{
+    internal::BufferPool buffers;
+    constexpr std::size_t pageSize = 4096;
+    buffers.configure(pageSize, 0);
+    std::size_t previous = 0, classes = 0;
+    for (unsigned pages = 1; pages <= 200000; ++pages) {
+        const std::size_t got = buffers.allocationSize(pages) / pageSize;
+        CHECK(got >= pages);
+        CHECK(pages <= 4 ? got == pages : 4 * got < 5 * pages + 4);
+        CHECK(got >= previous);
+        classes += got != previous;
+        previous = got;
+    }
+    CHECK_EQ(classes, std::size_t(4 + 4 * 15 + 3));  // up to 2^17, then 163840, 196608, 229376
+    for (unsigned pages : {5u, 6u, 7u, 8u, 9u, 10u, 11u, 17u, 33u, 65u})
+        CHECK_EQ(buffers.allocationSize(pages) / pageSize,
+                 std::size_t(pages <= 8 ? pages : pages <= 10 ? 10 : pages <= 12 ? 12 : pages <= 20 ? 20 : pages <= 40 ? 40 : 80));
+    CHECK_EQ(buffers.allocationSize(~0u) / pageSize, std::size_t(1) << 32);
+}
+
 TEST(pageBufferRecyclingHonorsExactCacheBoundaries)
 {
     internal::BufferPool buffers;
@@ -287,16 +311,16 @@ TEST(pageBufferRecyclingHonorsExactCacheBoundaries)
     buffers.configure(pageSize, 32 * pageSize);
     auto* cached = buffers.acquire(17);
     auto* excess = buffers.acquire(17);
-    CHECK_EQ(buffers.allocationSize(17), 32 * pageSize);
+    CHECK_EQ(buffers.allocationSize(17), 20 * pageSize);
     buffers.release(cached, 17);
     buffers.release(excess, 17);
-    CHECK_EQ(buffers.retainedBytes(), 32 * pageSize);
-    CHECK(buffers.acquire(31) == cached);
-    buffers.release(cached, 31);
+    CHECK_EQ(buffers.retainedBytes(), 20 * pageSize);  // a second does not fit
+    CHECK(buffers.acquire(20) == cached);
+    buffers.release(cached, 20);
     buffers.purge();
     // Larger runs round up to their bucket too; one that does not fit the
     // budget goes back to the OS on release.
-    CHECK_EQ(buffers.allocationSize(33), 64 * pageSize);
+    CHECK_EQ(buffers.allocationSize(33), 40 * pageSize);
     buffers.release(buffers.acquire(33), 33);
     CHECK_EQ(buffers.retainedBytes(), 0u);
 }

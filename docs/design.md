@@ -448,7 +448,11 @@ invalidated in the validation cache and captured for shipping. Past the budget
 with spilling off, or with nothing left to spill, a write fails with
 `ErrorCode::OutOfMemory`. `bufferCache` defaults to 32 MiB and bounds idle buffer
 payload bytes. Page buffers never come from the heap. Each request rounds up to
-a power-of-two class of pages, and each class is carved from slabs the pool maps
+a size class of pages: 1 to 4 exactly, then four steps to each doubling (5, 6, 7,
+8, 10, 12, 14, 16, 20, ...), so a buffer is never a quarter larger than the run it
+holds, where whole powers of two made a five-page run take eight pages of the
+dirty budget and the cache. There are 124 classes, few enough that their slabs
+bound what fragments, and each class is carved from slabs the pool maps
 from the OS itself (1 MiB, or 64 pages if that is more; a class larger than that
 gets a slab of its own). A slab's bookkeeping (two bitmaps) lives in its first
 system page. Up to `bufferCache` a released buffer stays resident on its class's
