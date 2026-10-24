@@ -159,7 +159,7 @@ is built):
 | `spill` | transactions many times `dirtyLimit`: same pages as unbounded, nested commit and abort, cursors and arguments across a spill, coldest pages first, trees of mostly branch pages, values of half the budget, commits whose free list passes it, `shrink()` under a budget |
 | `corrupt` | pages that pass their checksum but lie about their layout: opening, reading and writing must end in an `Error`, never a stray read or write (fuzzing: `NOSQL_BUILD_FUZZERS`, `fuzz/fuzz_pages.cpp`) |
 | `prefix` | `DbFlags::PrefixKeys`: the same contents as a plain tree in fewer leaves and branch pages, shared suffixes in reverse order, seeks and scans, nesting, compaction, the format version |
-| `power` | every write and flush recorded and replayed: at each point, images that keep any subset of the unflushed sectors must open whole on a committed snapshot no older than the last one reported durable, in every durability mode, spilling and shrinking commits included |
+| `power` | every write and flush recorded and replayed: at each point, images that keep any subset of the unflushed sectors must open whole on a committed snapshot no older than the last one reported durable, in every durability mode, spilling and shrinking commits included (open-ended: `fuzz/fuzz_power.cpp`, workloads the fuzzer picks) |
 | `mq` | queue semantics: FIFO, leases, redelivery, dead-lettering |
 | `mqsteady` | queues under sustained send/receive: no unbounded growth |
 | `replication` | checkpoints, base images, bundle format, apply, divergence |
