@@ -485,18 +485,21 @@ TEST(shrinkMovesWhatTheBudgetAllows)
             for (int i = 0; i < 240; ++i)
                 db.erase(tst::keyOf(i, "filler"));
         });
-        const std::uint64_t cut = env.shrink();
+        // The frontier, not the file: a mapped file cannot be cut on Windows.
+        (void)env.shrink();
+        const std::uint64_t used = env.stats().usedPages;
         CHECK_EQ(env.stats().dirtyBytes, 0u);
         env.read([&](Txn& txn) {
             checkIntegrity(txn);
             CHECK(contentsOf(txn) == expect);
         });
-        return cut;
+        return used;
     };
+    // 252 pages before, 192 after: the runs move down into the filler's.
     const std::uint64_t unbounded = shrunk(0, true);
-    CHECK(unbounded > 256u << 10);
+    CHECK(unbounded <= 200);
     CHECK_EQ(shrunk(64u << 10, true), unbounded);
-    CHECK(shrunk(64u << 10, false) <= unbounded);
+    CHECK(shrunk(64u << 10, false) >= unbounded);
 }
 
 /// With spilling off the budget is a hard limit, as before.
