@@ -144,13 +144,22 @@ jobs:
           -DCMAKE_CXX_COMPILER=clang++-18 -DNOSQL_BUILD_FUZZERS=ON
       - name: Build
         run: cmake --build build --target fuzz_ops fuzz_pages fuzz_power fuzz_replication
+      # Each starts from its seeds in fuzz/corpus and writes what it finds
+      # to a scratch directory, which a failing run uploads with the crash.
       - name: Model fuzzing
-        run: build/fuzz/fuzz_ops -max_total_time=120 -max_len=8192
+        run: mkdir -p out/ops && build/fuzz/fuzz_ops -max_total_time=120 -max_len=8192 -artifact_prefix=out/ out/ops fuzz/corpus/ops
       - name: Page fuzzing
         run: |
-          build/fuzz/fuzz_pages -max_total_time=60
-          FUZZ_SUFFIXES=1 build/fuzz/fuzz_pages -max_total_time=60
+          mkdir -p out/pages
+          build/fuzz/fuzz_pages -max_total_time=60 -artifact_prefix=out/ out/pages fuzz/corpus/pages
+          FUZZ_SUFFIXES=1 build/fuzz/fuzz_pages -max_total_time=60 -artifact_prefix=out/ out/pages fuzz/corpus/pages
       - name: Power-cut fuzzing
-        run: build/fuzz/fuzz_power -max_total_time=90
+        run: mkdir -p out/power && build/fuzz/fuzz_power -max_total_time=90 -artifact_prefix=out/ out/power fuzz/corpus/power
       - name: Replication fuzzing
-        run: build/fuzz/fuzz_replication -max_total_time=60 -max_len=4096
+        run: mkdir -p out/replication && build/fuzz/fuzz_replication -max_total_time=60 -max_len=4096 -artifact_prefix=out/ out/replication fuzz/corpus/replication
+      - name: Keep what a failing run found
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-findings
+          path: out/

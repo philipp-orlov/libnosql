@@ -537,7 +537,9 @@ extracts bundles from any checkpoint, flips, truncates, extends, deletes and swa
 segment, index and bundle files, prunes, and applies any bundle it made to the
 replica in any order: a failed apply must leave the replica where it was, and a
 successful one whole on a checkpoint the primary committed, holding exactly what
-it held there. CI runs all four briefly on every push.
+it held there. CI runs all four briefly on every push, each from its seeds in
+`fuzz/corpus/` (a set cover of what earlier campaigns found; `fuzz/README.md`
+says how to refresh them), and keeps what a failing run found.
 
 Every committed-page access validates by default. Dirty private pages are sealed
 only before publication. Overflow bounds are checked before hashing a run.
