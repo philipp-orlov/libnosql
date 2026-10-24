@@ -181,8 +181,9 @@ void freePage(void*) noexcept;
 /// ErrorCode::OutOfMemory. Never touches the process heap.
 void* mapMemory(std::size_t bytes);
 void unmapMemory(void* p, std::size_t bytes) noexcept;
-/// Gives the physical pages behind [p, p+bytes) back to the OS while keeping
-/// the address range; the next touch faults in fresh (unspecified) contents.
+/// Gives the physical pages wholly inside [p, p+bytes) back to the OS while
+/// keeping the address range; the next touch faults in fresh (unspecified)
+/// contents. A system page the range shares with other bytes stays.
 void discardMemory(void* p, std::size_t bytes) noexcept;
 
 }  // namespace nosql::internal::os

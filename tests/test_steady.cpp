@@ -13,6 +13,9 @@
 #include <thread>
 
 #include "nosql/nosql.hpp"
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
 #include "nosql/internal/buffer_pool.hpp"
 #include "tests/test_util.hpp"
 
@@ -297,6 +300,53 @@ TEST(pageBufferRecyclingHonorsExactCacheBoundaries)
     buffers.release(buffers.acquire(33), 33);
     CHECK_EQ(buffers.retainedBytes(), 0u);
 }
+
+#ifdef __linux__
+/// Buffers smaller than a system page share system pages: those the released
+/// ones cover whole go back to the OS, and none that still holds a buffer in
+/// use is touched.
+TEST(pageBufferDiscardKeepsToWholeSystemPages)
+{
+    const std::size_t sp = internal::os::systemPageSize();
+    constexpr std::size_t pageSize = 1024;
+    if (sp % pageSize || sp / pageSize < 2)
+        return;
+    const std::size_t perSystemPage = sp / pageSize;
+    internal::BufferPool buffers;
+    buffers.configure(pageSize, 0);  // nothing kept: released memory goes back
+    std::vector<internal::Page*> held;
+    for (std::size_t i = 0; i < 8 * perSystemPage; ++i) {
+        held.push_back(buffers.acquire(1));
+        std::memset(static_cast<void*>(held.back()), 0x5a, pageSize);
+    }
+    for (std::size_t i = 1; i < held.size(); ++i)
+        CHECK(reinterpret_cast<std::byte*>(held[i]) ==
+              reinterpret_cast<std::byte*>(held[0]) + i * pageSize);
+    auto resident = [&](std::size_t buffer) {
+        unsigned char v = 0;
+        const auto at = reinterpret_cast<std::uintptr_t>(held[buffer]) & ~std::uintptr_t(sp - 1);
+        CHECK_EQ(::mincore(reinterpret_cast<void*>(at), sp, &v), 0);
+        return (v & 1) != 0;
+    };
+    // A run from mid-page to mid-page: the whole system pages inside it go,
+    // the two it shares with buffers still held stay, contents and all.
+    const std::size_t from = perSystemPage / 2, to = from + 3 * perSystemPage;
+    const std::size_t firstWhole = (from + perSystemPage - 1) / perSystemPage * perSystemPage;
+    std::vector<std::pair<internal::Page*, unsigned>> run;
+    for (std::size_t i = from; i < to; ++i)
+        run.push_back({held[i], 1u});
+    buffers.release(run.data(), run.size());
+    CHECK(!resident(firstWhole));
+    CHECK(!resident(firstWhole + perSystemPage));
+    for (std::size_t i = 0; i < from; ++i)
+        CHECK_EQ(reinterpret_cast<unsigned char*>(held[i])[pageSize - 1], 0x5a);
+    for (std::size_t i = to; i < held.size(); ++i)
+        CHECK_EQ(reinterpret_cast<unsigned char*>(held[i])[0], 0x5a);
+    for (std::size_t i = 0; i < held.size(); ++i)
+        if (i < from || i >= to)
+            buffers.release(held[i], 1);
+}
+#endif
 
 TEST(pageBufferRecyclingSupportsConcurrentTeardown)
 {

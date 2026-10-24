@@ -156,10 +156,20 @@ void unmapMemory(void* p, std::size_t bytes) noexcept
 
 void discardMemory(void* p, std::size_t bytes) noexcept
 {
+    // Whole system pages inside the range only. madvise() refuses a start
+    // that is not page-aligned, and MEM_RESET widens the range to the pages
+    // it touches, which would throw away the neighbours' bytes: buffers of a
+    // store page smaller than the system's share system pages.
+    static const std::uintptr_t sp = systemPageSize();
+    const auto at = reinterpret_cast<std::uintptr_t>(p);
+    const std::uintptr_t first = (at + sp - 1) & ~(sp - 1);
+    const std::uintptr_t last = (at + bytes) & ~(sp - 1);
+    if (last <= first)
+        return;
 #ifdef _WIN32
-    (void)::VirtualAlloc(p, bytes, MEM_RESET, PAGE_READWRITE);
+    (void)::VirtualAlloc(reinterpret_cast<void*>(first), last - first, MEM_RESET, PAGE_READWRITE);
 #else
-    (void)::madvise(p, bytes, MADV_DONTNEED);
+    (void)::madvise(reinterpret_cast<void*>(first), last - first, MADV_DONTNEED);
 #endif
 }
 
