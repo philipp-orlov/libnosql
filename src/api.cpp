@@ -996,6 +996,7 @@ std::uint64_t Env::shrink()
     {
         Txn txn = writeTxn();
         TxnImpl* t = txn.impl_.get();
+        t->maintenance = true;
         const std::vector<unsigned> dbis = treesOf(txn);
         absorbFreeList(t);
         std::uint64_t slack = 64 + (std::uint64_t(t->lastPgno) + 1) / freeChunkPages(ps);
@@ -1013,6 +1014,7 @@ std::uint64_t Env::shrink()
         sync(true);
         Txn txn = writeTxn();
         TxnImpl* t = txn.impl_.get();
+        t->maintenance = true;
         absorbFreeList(t);
         const std::uint64_t cut = cutFreeTail(t);
         txn.commit();
@@ -1027,6 +1029,7 @@ std::uint64_t Env::shrink()
     {
         Txn txn = writeTxn();
         TxnImpl* t = txn.impl_.get();
+        t->maintenance = true;
 #ifndef _WIN32
         {
             std::lock_guard<std::mutex> lk(e->mtx);

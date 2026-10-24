@@ -518,6 +518,9 @@ struct TxnImpl
     /// It created a PrefixKeys sub-database: the commit raises the store to the
     /// format version that reads P_PREFIX leaves.
     bool prefixFormat = false;
+    /// One of Env::shrink()'s: nothing in it is the caller's to reduce, so
+    /// its commit may pass the dirty budget with spilling off too.
+    bool maintenance = false;
 
     /// Bumped by every structural mutation; cursors use it to detect that they
     /// must re-anchor before touching a page pointer again.

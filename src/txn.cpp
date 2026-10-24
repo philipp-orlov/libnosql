@@ -139,6 +139,7 @@ void TxnImpl::reset()
     occUnknown = false;
     occLastDbi = ~0u;
     prefixFormat = false;
+    maintenance = false;
     seq = 1;
 }
 
@@ -1226,7 +1227,7 @@ void txnCommit(TxnImpl* t, TxnId* awaitLater)
                             t->occWritten.end());
     }
     try {
-        e->commitOverBudget = e->spill;
+        e->commitOverBudget = e->spill || t->maintenance;
         flushNamedTrees(t);
         updateFreelist(t);
         e->commitOverBudget = false;
