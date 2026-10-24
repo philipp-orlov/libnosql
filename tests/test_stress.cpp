@@ -146,9 +146,12 @@ void stress(const Env::Options& options)
 
     // The plain writer: each round rewrites every stamped key, some of them
     // pages long, in one transaction many times the dirty limit, and every
-    // other round frees a tail of filler for the shrinker to cut.
+    // other round frees a tail of filler for the shrinker to cut. It keeps
+    // on while the optimistic writers do, up to a bound: where a flush is
+    // slow (NoMetaSync on Windows), rounds past it only cost time.
     try {
-        for (int gen = 1; !f.stop.load() && (gen <= 24 || optimistsLeft.load() > 0); ++gen) {
+        for (int gen = 1; !f.stop.load() && (gen <= 24 || (optimistsLeft.load() > 0 && gen <= 120));
+             ++gen) {
             env.write([&](Txn& t) {
                 Db db = t.mainDb();
                 for (int i = 0; i < kKeys; ++i)
