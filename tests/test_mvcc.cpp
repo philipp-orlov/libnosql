@@ -3,11 +3,13 @@
 
 // Snapshot isolation: readers see the store as of the commit they started on,
 // and keep seeing it while the writer moves on.
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <thread>
 #include <vector>
 
+#include "nosql/internal/writer_slot.hpp"
 #include "nosql/nosql.hpp"
 #include "tests/test_util.hpp"
 
@@ -158,6 +160,73 @@ TEST(writeTransactionsSerialise)
         CHECK_EQ(t.mainDb().at("counter").as<std::uint64_t>(),
                  std::uint64_t(kThreads * kPerThread));
     });
+}
+
+/// The writer slot goes to writers in the order they asked: one committing in
+/// a loop does not keep it from another that is waiting.
+TEST(writersTakeTurnsAtTheSlot)
+{
+    tst::Scratch s("mvcc");
+    // Commits that flush hold the slot long enough for the waiter to queue.
+    Env e = Env::configure().sync(Durability::NoMetaSync).open(s.file());
+    std::atomic<bool> stop{false};
+    std::atomic<int> greedy{0};
+    std::thread hog([&] {
+        while (!stop.load())
+            e.write([&](Txn& t) {
+                t.mainDb().put("hog", tst::blob(200, std::uint64_t(greedy.load())));
+                greedy.fetch_add(1);
+            });
+    });
+    while (greedy.load() == 0)
+        std::this_thread::yield();
+    int worst = 0;  // the most commits the other made while one waited
+    for (int i = 0; i < 50; ++i) {
+        const int before = greedy.load();
+        e.write([&](Txn& t) {
+            worst = std::max(worst, greedy.load() - before);
+            t.mainDb().put(tst::keyOf(i), "x");
+        });
+    }
+    stop.store(true);
+    hog.join();
+    // The one it held as this asked, one more if this was slow to queue, and
+    // the races this may lose before the slot is handed to it; the rest is
+    // room for a busy scheduler. A plain mutex lets it make hundreds.
+    CHECK(worst <= int(internal::WriterSlot::kPasses) + 8);
+}
+
+/// A writer that gives up waiting leaves the queue without holding up the
+/// ones behind it, and the slot still reaches each of them.
+TEST(aWriterThatGivesUpDoesNotStrandTheQueue)
+{
+    tst::Scratch s("mvcc");
+    Env e = Env::configure().sync(Durability::None).open(s.file());
+    for (int round = 0; round < 20; ++round) {
+        Txn held = e.writeTxn();
+        std::atomic<int> got{0}, gaveUp{0};
+        std::vector<std::thread> ws;
+        for (int i = 0; i < 4; ++i)
+            ws.emplace_back([&, i] {
+                try {
+                    // Short timeouts give up while the slot is held; long ones wait.
+                    Txn t = e.writeTxn(std::chrono::milliseconds(i % 2 ? 1 : 10000));
+                    t.mainDb().put(tst::keyOf(i), "x");
+                    t.commit();
+                    got.fetch_add(1);
+                } catch (const Error& err) {
+                    CHECK(err.code() == ErrorCode::Busy);
+                    gaveUp.fetch_add(1);
+                }
+            });
+        while (gaveUp.load() < 2)
+            std::this_thread::yield();
+        held.abort();
+        for (auto& w : ws)
+            w.join();
+        CHECK_EQ(got.load(), 2);
+    }
+    e.write([](Txn& t) { t.mainDb().put("after", "1"); });
 }
 
 static void checkReadersAcrossGrowth(bool cached)

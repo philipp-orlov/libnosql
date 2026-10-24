@@ -151,7 +151,7 @@ is built):
 | `steady` | long-run plateau: page count and file size stop moving |
 | `memory` | allocation-free warm reuse, slab page buffers, bounded scratch, mapping ownership and allocation failures |
 | `allocbudget` | zero heap allocations per warm transaction, a flat heap across churn rounds, slices that survive a growth |
-| `mvcc` | snapshot isolation, readers versus writer, reader pinning |
+| `mvcc` | snapshot isolation, readers versus writer, reader pinning, waiting writers served within a bounded number of commits |
 | `torture` | randomized operation mixes checked against a `std::map` oracle (open-ended: `fuzz/fuzz_ops.cpp`, every tree flavour, nested and optimistic transactions, spills, shrinks, reopens and compactions) |
 | `optimistic` | `OptimisticTxn`: conflict detection, retries, group commit, escalation |
 | `separators` | shortest branch separators at splits, rebalances and bulk loads |
@@ -269,7 +269,9 @@ hand you a move-only `Txn` that aborts in its destructor unless you
 
 Only one write transaction exists at a time; `writeTxn()` blocks until the
 current one finishes, and `writeTxn(timeout)` gives up with `ErrorCode::Busy`
-if the writer slot is still taken when the timeout runs out. `Txn::nested()` opens a child transaction — a savepoint.
+if the writer slot is still taken when the timeout runs out. A waiting writer
+gets the slot within a few commits of those queued ahead of it, so a thread
+committing in a loop cannot keep the others out. `Txn::nested()` opens a child transaction — a savepoint.
 The parent is frozen until the child commits (changes fold in) or aborts
 (changes vanish). Nesting is unlimited in depth.
 

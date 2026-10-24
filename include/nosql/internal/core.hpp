@@ -22,6 +22,7 @@
 #include "nosql/internal/os.hpp"
 #include "nosql/internal/page_table.hpp"
 #include "nosql/internal/validation_cache.hpp"
+#include "nosql/internal/writer_slot.hpp"
 #include "nosql/nosql.hpp"
 
 namespace nosql::internal {
@@ -243,9 +244,10 @@ struct EnvImpl
 
     /// Guards `meta`, `durableTxn`, `region`, `carryOver` and the reader table.
     mutable std::mutex mtx;
-    /// Serializes write transactions (one writer at a time, in-process).
-    /// Timed, so a writer can give up after Env::writeTxn(timeout).
-    std::timed_mutex writeMtx;
+    /// Serializes write transactions (one writer at a time, in-process), and
+    /// keeps any from waiting without bound. Timed, so a writer can give up
+    /// after Env::writeTxn(timeout).
+    WriterSlot writeMtx;
 
     /// Id of the newest published commit, mirrored out of `meta` so a waiter
     /// can sample it without taking `mtx`. Waiters block on `mtx`, never on
