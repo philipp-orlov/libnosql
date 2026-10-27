@@ -42,6 +42,7 @@ add_library(nosql
     src/api.cpp
     src/optimistic.cpp
     src/verify.cpp
+    src/inspect.cpp
 )
 if(NOSQL_WITH_BLOB)
     target_sources(nosql PRIVATE src/blob_storage.cpp)

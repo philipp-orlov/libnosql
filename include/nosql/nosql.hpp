@@ -50,6 +50,9 @@ struct CursorImpl;
 
 class Env;
 class Txn;
+namespace inspect {
+struct Access;
+}
 class Db;
 class Cursor;
 class OptimisticTxn;
@@ -392,6 +395,7 @@ private:
     friend class Env;
     friend class OptimisticTxn;  // commits a group without waiting for its flush
     friend void checkIntegrity(Txn&);
+    friend struct inspect::Access;
     friend void copySnapshot(Txn&, const std::filesystem::path&);
     /// commit(), except that a pipelined commit's wait for durability is left
     /// to the caller: its id goes to `*awaitLater` (zero when there is none).
