@@ -667,6 +667,30 @@ bootstrap, delta apply, retention gap, and fresh-base recovery walkthrough.
 coalescing, base-image options, divergence handling, and what was deliberately
 left unbuilt.
 
+## C# and other languages
+
+`-DNOSQL_BUILD_C_API=ON` builds `libnosql_c`, a C interface ([include/nosql/nosql_c.h](include/nosql/nosql_c.h)): opaque
+handles, a status for every call (`< 0` is `-ErrorCode`, text from `nosql_last_error()`), and reads that hand back pointers into
+the store with no copy. [bindings/csharp](bindings/csharp) wraps it for .NET (net10.0): `Env`, `Txn`, `Database`, `Cursor`,
+with `ReadOnlySpan<byte>` views of keys and values valid until the transaction ends (the cursor moves).
+
+```csharp
+using System.Text;
+using Nosql;
+
+using var env = Env.Open("data.nosql", new EnvOptions { Sync = Durability.Lazy });
+env.Write(t => { using var db = t.Db("users", DbFlags.Create); db.Put("ann", "31"); });
+using var read = env.ReadTxn();                       // a snapshot
+using var users = read.Db("users");
+if (users.TryGet("ann"u8, out var age)) Console.WriteLine(Encoding.UTF8.GetString(age));   // no copy
+using var cursor = users.Cursor();
+for (bool ok = cursor.First(); ok; ok = cursor.Next()) Console.WriteLine(Encoding.UTF8.GetString(cursor.Key));
+```
+
+Disposing a write transaction without `Commit()` aborts it; `Nested()` gives a child transaction. The loader finds
+`libnosql_c` next to the application or on the library path; `NOSQL_LIBRARY` names it explicitly. Tests:
+`dotnet run --project bindings/csharp/Nosql.Tests`, or `ctest -R csharp_binding` (built with the C API option and `dotnet` found).
+
 ## Design
 
 Shadow paging, as in LMDB. `docs/design.md` has the full write-up; the short

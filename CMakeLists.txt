@@ -12,6 +12,7 @@ option(NOSQL_ENABLE_ASAN "Build with address+undefined sanitizers" OFF)
 option(NOSQL_ENABLE_TSAN "Build with the thread sanitizer" OFF)
 option(NOSQL_PIPELINE_COMMITS_DEFAULT
        "Make Env::Options::pipelineCommits() default to on (the suite runs this way in CI)" OFF)
+option(NOSQL_BUILD_C_API "Build libnosql_c, the C interface (include/nosql/nosql_c.h) the C# binding loads" OFF)
 option(NOSQL_BUILD_FUZZERS "Build the libFuzzer targets in fuzz/ (clang only)" OFF)
 option(NOSQL_PREFIX_KEYS_DEFAULT
        "Give every new byte-ordered tree, the main one included, DbFlags::PrefixKeys (the suite runs this way in CI)" OFF)
@@ -93,6 +94,22 @@ if(NOSQL_ENABLE_TSAN AND NOT MSVC)
     endif()
     target_compile_options(nosql PUBLIC -fsanitize=thread -fno-omit-frame-pointer -g)
     target_link_options(nosql PUBLIC -fsanitize=thread)
+endif()
+
+if(NOSQL_BUILD_C_API)
+    set_target_properties(nosql PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    add_library(nosql_c SHARED src/c_api.cpp)
+    target_link_libraries(nosql_c PRIVATE nosql)
+    set_target_properties(nosql_c PROPERTIES CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON)
+    find_program(NOSQL_DOTNET dotnet HINTS $ENV{DOTNET_ROOT} $ENV{HOME}/.dotnet)
+    if(NOSQL_DOTNET AND NOSQL_BUILD_TESTS)
+        enable_testing()
+        add_test(NAME csharp_binding
+                 COMMAND ${NOSQL_DOTNET} run --project ${CMAKE_CURRENT_SOURCE_DIR}/bindings/csharp/Nosql.Tests -- ${CMAKE_CURRENT_BINARY_DIR}/csharp_work)
+        set_tests_properties(csharp_binding PROPERTIES TIMEOUT 300
+            ENVIRONMENT "NOSQL_LIBRARY=$<TARGET_FILE:nosql_c>;DOTNET_CLI_TELEMETRY_OPTOUT=1;DOTNET_NOLOGO=1;DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1")
+    endif()
+    install(TARGETS nosql_c LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
 set_target_properties(nosql PROPERTIES
