@@ -116,6 +116,46 @@ TEST(blobVerificationUsesAll64ChecksumBits)
     CHECK(blobs.at("key").hasChecksum());
 }
 
+TEST(forgedIndexRangesAreRejectedBeforeAnyBlobExists)
+{
+    tst::Scratch scratch("blob-range");
+    Env env = Env::configure().open(scratch.file());
+    auto blobs = BlobStorage::open(env, "images");
+    blobs.put("key", "member", "x");
+    blobs.put("empty", "empty-member", "");
+    const std::uint64_t end = blobs.archiveSize();
+    const auto forge = [&](const char* key, std::uint64_t offset, std::uint64_t size) {
+        env.write([&](Txn& txn) {
+            auto db = txn.db("images");
+            auto value = db.at(key).string();
+            for (int i = 0; i < 8; ++i) {
+                value[8 + i] = char(offset >> (8 * i));
+                value[16 + i] = char(size >> (8 * i));
+            }
+            db.put(key, value);
+        });
+    };
+    const std::uint64_t huge = UINT64_MAX - 511;
+    forge("key", huge, 513);  // offset + size wraps to one
+    CHECK_THROWS(blobs.at("key"), ErrorCode::Corrupted);
+    CHECK_THROWS(blobs.findMany({"key", "empty"}), ErrorCode::Corrupted);
+    forge("key", huge, 0);  // huge offset, nothing to read
+    CHECK_THROWS(blobs.at("key"), ErrorCode::Corrupted);
+    forge("key", 513, 1);  // not on a block boundary
+    CHECK_THROWS(blobs.at("key"), ErrorCode::Corrupted);
+    forge("key", 0, 1);  // inside the first header
+    CHECK_THROWS(blobs.at("key"), ErrorCode::Corrupted);
+    forge("key", (end + 8192) / 512 * 512, 1);  // beyond the end of the file
+    CHECK_THROWS(blobs.at("key"), ErrorCode::Corrupted);
+    forge("key", 512, 1);  // restored: the first member
+    CHECK_EQ(blobs.at("key").data().string(), std::string("x"));
+    CHECK(blobs.at("empty").valid());
+    CHECK_EQ(blobs.at("empty").size(), std::uint64_t(0));
+    // A truncated record is malformed too.
+    env.write([](Txn& txn) { txn.db("images").put("key", "short"); });
+    CHECK_THROWS(blobs.at("key"), ErrorCode::Corrupted);
+}
+
 TEST(archiveNameDerivesFromTheSubDatabase)
 {
     tst::Scratch s("tar");

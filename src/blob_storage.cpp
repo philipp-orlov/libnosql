@@ -315,10 +315,18 @@ struct BlobStorage::Impl
         if (!internal::decodeIndex(record, offset, size, checksum, name, known))
             throw Error(ErrorCode::Corrupted, "malformed archive index record");
 
+        // A payload follows its header block and starts on a block boundary. The
+        // operands are checked before the sum, which would otherwise wrap into a
+        // range the mapping seems to cover.
+        if (offset < kBlock || offset % kBlock != 0 || size > UINT64_MAX - offset)
+            throw Error(ErrorCode::Corrupted, "archive index record has an invalid range");
+
         Blob b;
         b.map_ = mapped(offset + size);
+        if (!b.map_ || offset > b.map_->m.size || size > b.map_->m.size - offset)
+            throw Error(ErrorCode::Corrupted, "archive index record lies outside the archive");
         // An empty member still exists; its anchor is the (non-null) offset.
-        b.data_ = b.map_ ? b.map_->m.base + offset : nullptr;
+        b.data_ = b.map_->m.base + offset;
         b.size_ = size;
         b.offset_ = offset;
         b.checksum_ = checksum;
