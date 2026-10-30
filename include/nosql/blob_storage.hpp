@@ -297,6 +297,11 @@ public:
     /// at all. Call Writer::commit() before committing `txn`; aborting `txn`
     /// leaves the bytes in the archive for the next catchUp(), exactly as an
     /// abandoned Writer does.
+    ///
+    /// An archive permits one live Writer, whether or not it joins a caller's
+    /// transaction: a second beginWrite() while one is alive throws
+    /// ErrorCode::Busy (it cannot block, since the holder may be the calling
+    /// thread). Different archives may share a transaction.
     Writer beginWrite(Txn& txn);
 
     /// Drops the index entry only. The member stays in the archive, so this

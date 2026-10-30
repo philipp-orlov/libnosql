@@ -597,6 +597,56 @@ TEST(writerJoinsACallerTransaction)
     CHECK_THROWS(tar.beginWrite(r), ErrorCode::InvalidArgument);
 }
 
+TEST(secondLiveWriterOnTheSameArchiveIsRefused)
+{
+    tst::Scratch s("tar-writers");
+    Env e = Env::configure().open(s.file());
+    auto tar = BlobStorage::open(e, "images");
+    auto other = BlobStorage::open(e, "other");
+
+    // The interleaving that used to zero the third member's payload.
+    {
+        Txn t = e.writeTxn();
+        auto first = tar.beginWrite(t);
+        CHECK_THROWS(tar.beginWrite(t), ErrorCode::Busy);
+        first.add("a", "a", "A");
+        first.add("c", "c", "C");
+        // Another archive may join the same transaction.
+        auto second = other.beginWrite(t);
+        second.add("b", "b", "B");
+        first.commit();
+        second.commit();
+        t.commit();
+    }
+    CHECK_EQ(tar.at("a").data().string(), std::string("A"));
+    CHECK_EQ(tar.at("c").data().string(), std::string("C"));
+    CHECK(tar.at("c").verify());
+    CHECK_EQ(other.at("b").data().string(), std::string("B"));
+
+    // The slot is free again after commit, abandonment and move-assignment,
+    // and after a failed construction.
+    {
+        Txn t = e.writeTxn();
+        auto w = tar.beginWrite(t);
+        w.add("d", "d", "D");
+        w.commit();
+        auto v = tar.beginWrite(t);
+        v.add("e", "e", "E");
+        v = BlobStorage::Writer();
+        auto u = tar.beginWrite(t);
+        u.add("f", "f", "F");
+        u.commit();
+        t.commit();
+    }
+    CHECK_EQ(tar.at("f").data().string(), std::string("F"));
+    {
+        Txn r = e.readTxn();
+        CHECK_THROWS(tar.beginWrite(r), ErrorCode::InvalidArgument);
+    }
+    tar.put("g", "g", "G");
+    CHECK_EQ(tar.at("g").data().string(), std::string("G"));
+}
+
 TEST(prefetchAndAccessHintsChangeNothingVisible)
 {
     tst::Scratch s("tar");

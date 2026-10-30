@@ -242,6 +242,11 @@ struct BlobStorage::Impl
     std::mutex remapMtx;
     std::mutex appendMtx;
 
+    /// Set while a Writer is alive. A Writer queues its members in one
+    /// contiguous buffer, so a second one appending to the same archive would
+    /// interleave offsets with the first and corrupt both.
+    std::atomic<bool> writerActive{false};
+
     /// Set when fsync of the archive failed: the kernel may have dropped the
     /// dirty pages while a retry reports success, so nothing more is appended
     /// or acknowledged until the archive is reopened and checked.
@@ -510,6 +515,14 @@ struct BlobStorage::Writer::State
     std::size_t capacity = 0;
     std::uint64_t bufStart = 0;  ///< archive offset of buf[0]
     bool wrote = false;
+    bool holdsSlot = false;  ///< owns Impl::writerActive
+
+    void claimSlot()
+    {
+        if (impl->writerActive.exchange(true))
+            throw Error(ErrorCode::Busy, "archive already has an active writer");
+        holdsSlot = true;
+    }
 
     /// Queued bytes still reach the archive when the Writer is dropped, so an
     /// abandoned batch is exactly what a crash mid-batch leaves: present,
@@ -521,6 +534,8 @@ struct BlobStorage::Writer::State
             flush();
         } catch (...) {
         }
+        if (holdsSlot)
+            impl->writerActive.store(false);
     }
 
     /// Writes whatever is queued, as one write.
@@ -555,6 +570,7 @@ BlobStorage::Writer BlobStorage::beginWrite()
     w.st_ = std::make_unique<Writer::State>();
     w.st_->impl = impl_.get();
     w.st_->owned = impl_->env->writeTxn();
+    w.st_->claimSlot();
     w.st_->txn = &w.st_->owned;
     w.st_->index = impl_->index(w.st_->owned);
     w.st_->capacity = impl_->writeBuffer;
@@ -573,6 +589,7 @@ BlobStorage::Writer BlobStorage::beginWrite(Txn& txn)
     Writer w;
     w.st_ = std::make_unique<Writer::State>();
     w.st_->impl = impl_.get();
+    w.st_->claimSlot();
     w.st_->txn = &txn;
     w.st_->index = impl_->index(txn);
     w.st_->capacity = impl_->writeBuffer;
