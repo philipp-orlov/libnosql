@@ -3,31 +3,17 @@
 
 #pragma once
 
-#include <array>
+// XXH3-64 lives in develop-core's libbase (moved unchanged from this library, with its golden vectors); the old
+// names stay.
 #include <cstddef>
 #include <cstdint>
 
+#include "base/xxh3.hpp"
+
 namespace nosql::internal {
 
-std::uint64_t checksum64(const void* data, std::size_t size) noexcept;
-const char* checksumBackend() noexcept;
-
-class Checksum64
-{
-public:
-    Checksum64() noexcept;
-    Checksum64(const Checksum64&) = delete;
-    Checksum64& operator=(const Checksum64&) = delete;
-    void reset() noexcept;
-    void update(const void* data, std::size_t size) noexcept;
-    std::uint64_t digest() const noexcept;
-
-private:
-    std::array<std::uint64_t, 8> accumulators_{};
-    std::array<std::byte, 256> buffer_{};
-    std::size_t bufferedBytes_ = 0;
-    std::size_t stripesInBlock_ = 0;
-    std::uint64_t length_ = 0;
-};
+inline std::uint64_t checksum64(const void* data, std::size_t size) noexcept { return base::xxh3_64(data, size); }
+inline const char* checksumBackend() noexcept { return base::xxh3Backend(); }
+using Checksum64 = base::Xxh3State;
 
 }  // namespace nosql::internal

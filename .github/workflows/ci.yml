@@ -15,10 +15,15 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: philipp-orlov/develop-core
+          path: develop-core
+          ref: main
       - name: Install tools
         run: sudo apt-get update && sudo apt-get install -y ninja-build
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+        run: cmake -DNOSQL_DEVELOP_CORE_DIR=$GITHUB_WORKSPACE/develop-core -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
       - name: Build
         run: cmake --build build
       - name: Test
@@ -28,11 +33,16 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: philipp-orlov/develop-core
+          path: develop-core
+          ref: main
       - name: Install tools
         run: sudo apt-get update && sudo apt-get install -y ninja-build
       - name: Configure
         run: >-
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake -DNOSQL_DEVELOP_CORE_DIR=$GITHUB_WORKSPACE/develop-core -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
           -DNOSQL_ENABLE_ASAN=ON
       - name: Build
         run: cmake --build build
@@ -49,6 +59,11 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: philipp-orlov/develop-core
+          path: develop-core
+          ref: main
       - name: Install tools
         run: sudo apt-get update && sudo apt-get install -y ninja-build clang-18 libclang-rt-18-dev
       - name: Fit the address space to the thread sanitizer
@@ -57,7 +72,7 @@ jobs:
         run: sudo sysctl vm.mmap_rnd_bits=28
       - name: Configure
         run: >-
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake -DNOSQL_DEVELOP_CORE_DIR=$GITHUB_WORKSPACE/develop-core -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
           -DCMAKE_CXX_COMPILER=clang++-18 -DNOSQL_ENABLE_TSAN=ON
       - name: Build
         run: cmake --build build
@@ -71,11 +86,16 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: philipp-orlov/develop-core
+          path: develop-core
+          ref: main
       - name: Install tools
         run: sudo apt-get update && sudo apt-get install -y ninja-build
       - name: Configure
         run: >-
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake -DNOSQL_DEVELOP_CORE_DIR=$GITHUB_WORKSPACE/develop-core -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           -DNOSQL_PIPELINE_COMMITS_DEFAULT=ON
       - name: Build
         run: cmake --build build
@@ -86,11 +106,16 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: philipp-orlov/develop-core
+          path: develop-core
+          ref: main
       - name: Install tools
         run: sudo apt-get update && sudo apt-get install -y ninja-build
       - name: Configure
         run: >-
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake -DNOSQL_DEVELOP_CORE_DIR=$GITHUB_WORKSPACE/develop-core -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           -DNOSQL_PREFIX_KEYS_DEFAULT=ON
       - name: Build
         run: cmake --build build
@@ -101,8 +126,13 @@ jobs:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: philipp-orlov/develop-core
+          path: develop-core
+          ref: main
       - name: Configure
-        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+        run: cmake -DNOSQL_DEVELOP_CORE_DIR=$GITHUB_WORKSPACE/develop-core -S . -B build -G "Visual Studio 17 2022" -A x64
       - name: Build
         run: cmake --build build --config Release --parallel
       - name: Test
@@ -112,13 +142,18 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: philipp-orlov/develop-core
+          path: develop-core
+          ref: main
       - name: Install tools
         run: sudo apt-get update && sudo apt-get install -y ninja-build clang-18 libclang-rt-18-dev
       - name: Fit the address space to the thread sanitizer
         run: sudo sysctl vm.mmap_rnd_bits=28
       - name: Configure
         run: >-
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake -DNOSQL_DEVELOP_CORE_DIR=$GITHUB_WORKSPACE/develop-core -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
           -DCMAKE_CXX_COMPILER=clang++-18 -DNOSQL_ENABLE_TSAN=ON
           -DNOSQL_PIPELINE_COMMITS_DEFAULT=ON
       - name: Build
@@ -134,13 +169,18 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: philipp-orlov/develop-core
+          path: develop-core
+          ref: main
       - name: Install tools
         run: sudo apt-get update && sudo apt-get install -y ninja-build clang-18 libclang-rt-18-dev
       - name: Fit the address space to the address sanitizer
         run: sudo sysctl vm.mmap_rnd_bits=28
       - name: Configure
         run: >-
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake -DNOSQL_DEVELOP_CORE_DIR=$GITHUB_WORKSPACE/develop-core -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
           -DCMAKE_CXX_COMPILER=clang++-18 -DNOSQL_BUILD_FUZZERS=ON
       - name: Build
         run: cmake --build build --target fuzz_ops fuzz_pages fuzz_power fuzz_replication

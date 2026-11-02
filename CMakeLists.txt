@@ -33,10 +33,17 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
+# develop-core supplies libbase (XXH3-64): a sibling checkout by default, ignored when the including project already
+# provides the target.
+set(NOSQL_DEVELOP_CORE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../develop-core" CACHE PATH "Path to a develop-core checkout")
+if(NOT TARGET develop::base)
+    set(DEVELOP_BUILD_TESTS OFF CACHE BOOL "")
+    add_subdirectory("${NOSQL_DEVELOP_CORE_DIR}" develop-core)
+endif()
+
 add_library(nosql
     src/internal/os.cpp
     src/internal/buffer_pool.cpp
-    src/internal/checksum.cpp
     src/env.cpp
     src/txn.cpp
     src/b_tree.cpp
@@ -58,6 +65,8 @@ else()
     target_compile_definitions(nosql PUBLIC NOSQL_NO_REPLICATION=1)
 endif()
 add_library(nosql::nosql ALIAS nosql)
+# Not exported yet: develop-core has no install rules, so an installed libnosql needs develop-core installed beside it.
+target_link_libraries(nosql PUBLIC $<BUILD_INTERFACE:develop::base>)
 
 target_include_directories(nosql
     PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
