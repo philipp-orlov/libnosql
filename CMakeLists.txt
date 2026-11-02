@@ -66,7 +66,7 @@ else()
 endif()
 add_library(nosql::nosql ALIAS nosql)
 # Not exported yet: develop-core has no install rules, so an installed libnosql needs develop-core installed beside it.
-target_link_libraries(nosql PUBLIC $<BUILD_INTERFACE:develop::base>)
+target_link_libraries(nosql PUBLIC $<BUILD_INTERFACE:develop::sys> $<BUILD_INTERFACE:develop::base>)
 
 target_include_directories(nosql
     PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
