@@ -103,8 +103,15 @@ private:
     Slab* slabOf(const Page* buf) const noexcept;
     void giveBack(Page* buf, int c) noexcept;
     void toSlab(Page* buf, int c) noexcept;
-    void settle() noexcept;
     void unlinkOpen(Slab* s) noexcept;
+    void linkOpen(Slab* s) noexcept;
+    // Returning memory to the OS (BUG-M4: never under mtx_). collect() claims, under the lock, the slabs to unmap
+    // and the dirty free buffers to discard (claimed buffers leave the free bitmap so nobody can carve them);
+    // the syscalls run unlocked; restore() puts the claimed buffers back. settle() loops until nothing is left.
+    struct SettleBatch;
+    bool collect(SettleBatch& batch) noexcept;
+    void restore(const SettleBatch& batch) noexcept;
+    void settle() noexcept;   // caller must NOT hold mtx_
 
     mutable std::mutex mtx_;
     Page* free_[kClasses]{};    ///< kept buffers, linked through their first bytes

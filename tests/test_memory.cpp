@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <array>
+#include <atomic>
+#include <thread>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -187,6 +189,50 @@ TEST(disabledBufferCacheReturnsBackingStorageImmediately)
     CHECK_EQ(measured.backing, 2u);
     CHECK_EQ(measured.releases, 2u);
 #endif
+}
+
+TEST(concurrentReleaseNeverHandsOutABufferBeingDiscarded)
+{
+    // BUG-M4: settling runs madvise/munmap without the mutex. Buffers being discarded are claimed first, so another
+    // thread can never receive one mid-discard (its contents would vanish under it). Each thread writes a tag over
+    // its buffer and checks it is intact before releasing; a small budget sends most releases to settle().
+    internal::BufferPool buffers;
+    buffers.configure(4096, 16 * 4096);
+    std::atomic<int> bad{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 4; ++t)
+        threads.emplace_back([&, t] {
+            std::uint32_t seed = 1234u + std::uint32_t(t);
+            internal::Page* held[8] = {};
+            unsigned heldPages[8] = {};
+            for (int i = 0; i < 20000; ++i) {
+                seed = seed * 1664525u + 1013904223u;
+                const unsigned k = (seed >> 8) & 7u;
+                if (held[k]) {
+                    const auto* bytes = reinterpret_cast<const unsigned char*>(held[k]);
+                    const std::size_t n = std::size_t(heldPages[k]) * 4096;
+                    for (std::size_t off = 0; off < n; off += 512)
+                        if (bytes[off] != (unsigned char)(t + 1))
+                            ++bad;
+                    buffers.release(held[k], heldPages[k]);
+                    held[k] = nullptr;
+                } else {
+                    heldPages[k] = 1u + ((seed >> 16) % 6u);
+                    held[k] = buffers.acquire(heldPages[k]);
+                    auto* bytes = reinterpret_cast<unsigned char*>(held[k]);
+                    for (std::size_t off = 0; off < std::size_t(heldPages[k]) * 4096; off += 512)
+                        bytes[off] = (unsigned char)(t + 1);
+                }
+            }
+            for (unsigned k = 0; k < 8; ++k)
+                if (held[k])
+                    buffers.release(held[k], heldPages[k]);
+        });
+    for (auto& th : threads)
+        th.join();
+    CHECK_EQ(bad.load(), 0);
+    buffers.purge();
+    CHECK_EQ(buffers.retainedBytes(), 0u);
 }
 
 TEST(pageBuffersComeFromSlabsAndEmptySlabsAreUnmapped)

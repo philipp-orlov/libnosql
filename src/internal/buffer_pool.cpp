@@ -45,6 +45,7 @@ struct BufferPool::Slab
     Slab* prevOpen = nullptr;
     Slab* nextOpen = nullptr;
     Slab* nextTouched = nullptr;
+    std::uint32_t claims = 0;  ///< runs taken out by a settle() in progress; the slab is not unmapped meanwhile
     bool isOpen = false;
     bool isTouched = false;
 
@@ -90,31 +91,43 @@ Page* BufferPool::acquire(unsigned npages)
 
 void BufferPool::release(Page* buf, unsigned npages) noexcept
 {
-    std::lock_guard<std::mutex> lk(mtx_);
-    giveBack(buf, classOf(npages));
-    settle();
+    bool touched;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        giveBack(buf, classOf(npages));
+        touched = touched_ != nullptr;
+    }
+    if (touched)
+        settle();
 }
 
 void BufferPool::release(const std::pair<Page*, unsigned>* items, std::size_t count) noexcept
 {
-    std::lock_guard<std::mutex> lk(mtx_);
-    for (std::size_t i = 0; i < count; ++i)
-        giveBack(items[i].first, classOf(items[i].second));
-    settle();
+    bool touched;
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        for (std::size_t i = 0; i < count; ++i)
+            giveBack(items[i].first, classOf(items[i].second));
+        touched = touched_ != nullptr;
+    }
+    if (touched)
+        settle();
 }
 
 void BufferPool::purge() noexcept
 {
-    std::lock_guard<std::mutex> lk(mtx_);
-    for (unsigned c = 0; c < kClasses; ++c) {
-        while (Page* p = free_[c]) {
-            Page* next;
-            std::memcpy(&next, static_cast<void*>(p), sizeof next);
-            free_[c] = next;
-            toSlab(p, int(c));
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        for (unsigned c = 0; c < kClasses; ++c) {
+            while (Page* p = free_[c]) {
+                Page* next;
+                std::memcpy(&next, static_cast<void*>(p), sizeof next);
+                free_[c] = next;
+                toSlab(p, int(c));
+            }
         }
+        retained_ = 0;
     }
-    retained_ = 0;
     settle();
 }
 
@@ -209,14 +222,7 @@ void BufferPool::toSlab(Page* buf, int c) noexcept
     s->dirtyBits()[index / 64] |= mask;
     --s->live;
     ++s->freeCount;
-    if (!s->isOpen) {
-        s->isOpen = true;
-        s->prevOpen = nullptr;
-        s->nextOpen = open_[c];
-        if (open_[c])
-            open_[c]->prevOpen = s;
-        open_[c] = s;
-    }
+    linkOpen(s);
     if (!s->isTouched) {
         s->isTouched = true;
         s->nextTouched = touched_;
@@ -224,50 +230,135 @@ void BufferPool::toSlab(Page* buf, int c) noexcept
     }
 }
 
+/// What one settle round hands to the OS, gathered under the lock and executed without it.
+struct BufferPool::SettleBatch
+{
+    static constexpr std::size_t kRuns = 64, kUnmaps = 16;
+    struct Run
+    {
+        Slab* slab;
+        std::uint32_t start, length;
+    };
+    Run runs[kRuns];
+    Slab* unmaps[kUnmaps];
+    std::size_t runCount = 0, unmapCount = 0;
+};
+
 /// Gives the memory of buffers that went back to their slab to the OS:
 /// a slab nothing uses any more is unmapped whole, and in the others each
-/// stretch of adjacent buffers is discarded with one call.
+/// stretch of adjacent free buffers is discarded with one call. The calls run
+/// with the mutex released (BUG-M4); while they run, the buffers being
+/// discarded are out of the free bitmap and their slab cannot be unmapped.
 void BufferPool::settle() noexcept
 {
+    SettleBatch batch;
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            if (!collect(batch))
+                return;
+        }
+        for (std::size_t i = 0; i < batch.unmapCount; ++i)
+            os::unmapMemory(batch.unmaps[i], batch.unmaps[i]->mapBytes);
+        for (std::size_t i = 0; i < batch.runCount; ++i) {
+            const SettleBatch::Run& r = batch.runs[i];
+            os::discardMemory(r.slab->buffers + std::size_t(r.start) * r.slab->bufferBytes,
+                              std::size_t(r.length) * r.slab->bufferBytes);
+        }
+        if (batch.runCount) {
+            std::lock_guard<std::mutex> lk(mtx_);
+            restore(batch);
+        }
+    }
+}
+
+bool BufferPool::collect(SettleBatch& batch) noexcept
+{
+    batch.runCount = batch.unmapCount = 0;
     while (Slab* s = touched_) {
-        touched_ = s->nextTouched;
-        s->isTouched = false;
         if (!s->live) {
+            if (s->claims)   // a settle in another thread still discards in it; its restore() re-touches it
+            {
+                touched_ = s->nextTouched;
+                s->isTouched = false;
+                continue;
+            }
+            if (batch.unmapCount == SettleBatch::kUnmaps)
+                break;
+            touched_ = s->nextTouched;
+            s->isTouched = false;
             unlinkOpen(s);
             const auto it = std::lower_bound(slabs_.begin(), slabs_.end(), s);
             if (it != slabs_.end() && *it == s)
                 slabs_.erase(it);
-            os::unmapMemory(s, s->mapBytes);
+            batch.unmaps[batch.unmapCount++] = s;
             continue;
         }
         std::uint64_t* dirty = s->dirtyBits();
-        const std::size_t words = s->words();
-        std::size_t runStart = 0, runLength = 0;
-        const auto flush = [&] {
-            if (runLength)
-                os::discardMemory(s->buffers + runStart * s->bufferBytes,
-                                  runLength * s->bufferBytes);
-            runLength = 0;
-        };
-        for (std::size_t w = 0; w < words; ++w) {
-            if (!dirty[w]) {
-                flush();
+        std::uint64_t* free = s->freeBits();
+        const std::size_t count = s->count;
+        bool full = false;
+        for (std::size_t i = 0; i < count;) {
+            if (!((dirty[i / 64] >> (i % 64)) & 1u)) {
+                ++i;
                 continue;
             }
-            for (unsigned bit = 0; bit < 64; ++bit) {
-                if (!((dirty[w] >> bit) & 1u)) {
-                    flush();
-                    continue;
-                }
-                if (!runLength)
-                    runStart = w * 64 + bit;
-                ++runLength;
+            if (batch.runCount == SettleBatch::kRuns) {
+                full = true;
+                break;
             }
+            std::size_t j = i;
+            while (j < count && ((dirty[j / 64] >> (j % 64)) & 1u)) {
+                const std::uint64_t mask = std::uint64_t(1) << (j % 64);
+                dirty[j / 64] &= ~mask;
+                free[j / 64] &= ~mask;   // claimed: carve() cannot hand it out while it is discarded
+                ++j;
+            }
+            const std::uint32_t length = std::uint32_t(j - i);
+            s->freeCount -= length;
+            ++s->claims;
+            batch.runs[batch.runCount++] = {s, std::uint32_t(i), length};
+            i = j;
         }
-        flush();
-        for (std::size_t w = 0; w < words; ++w)
-            dirty[w] = 0;
+        if (!s->freeCount)
+            unlinkOpen(s);
+        if (full)
+            break;   // the slab stays touched: its remaining dirty buffers go in the next round
+        touched_ = s->nextTouched;
+        s->isTouched = false;
     }
+    return batch.runCount || batch.unmapCount;
+}
+
+void BufferPool::restore(const SettleBatch& batch) noexcept
+{
+    for (std::size_t i = 0; i < batch.runCount; ++i) {
+        const SettleBatch::Run& r = batch.runs[i];
+        Slab* s = r.slab;
+        std::uint64_t* free = s->freeBits();
+        for (std::size_t k = r.start; k < std::size_t(r.start) + r.length; ++k)
+            free[k / 64] |= std::uint64_t(1) << (k % 64);
+        s->freeCount += r.length;
+        --s->claims;
+        linkOpen(s);
+        if (!s->live && !s->claims && !s->isTouched) {   // emptied while we discarded: unmap it next round
+            s->isTouched = true;
+            s->nextTouched = touched_;
+            touched_ = s;
+        }
+    }
+}
+
+void BufferPool::linkOpen(Slab* s) noexcept
+{
+    if (s->isOpen || !s->freeCount)
+        return;
+    s->isOpen = true;
+    s->prevOpen = nullptr;
+    s->nextOpen = open_[s->cls];
+    if (open_[s->cls])
+        open_[s->cls]->prevOpen = s;
+    open_[s->cls] = s;
 }
 
 void BufferPool::unlinkOpen(Slab* s) noexcept
