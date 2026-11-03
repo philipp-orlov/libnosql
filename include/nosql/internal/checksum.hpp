@@ -3,7 +3,7 @@
 
 #pragma once
 
-// XXH3-64 lives in develop-core's libbase (moved unchanged from this library, with its golden vectors); the old
+// XXH3-64 lives in libcore's libbase (moved unchanged from this library, with its golden vectors); the old
 // names stay.
 #include <cstddef>
 #include <cstdint>

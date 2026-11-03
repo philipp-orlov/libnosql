@@ -3,7 +3,7 @@
 
 #pragma once
 
-// libnosql's OS layer. The implementation moved to develop-core's libsys (sys/file.hpp, sys/vm.hpp); the functions
+// libnosql's OS layer. The implementation moved to libcore's libsys (sys/file.hpp, sys/vm.hpp); the functions
 // here call it and re-throw its base::Error as nosql::Error, so the store's catch sites and error codes are
 // unchanged. Types are shared with libsys (one WriteRecorder, one Mapping).
 
