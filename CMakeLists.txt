@@ -36,7 +36,7 @@ endif()
 # libcore supplies libbase (XXH3-64): a sibling checkout by default, ignored when the including project already
 # provides the target.
 set(NOSQL_LIBCORE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../libcore" CACHE PATH "Path to a libcore checkout")
-if(NOT TARGET develop::base)
+if(NOT TARGET core::base)
     set(DEVELOP_BUILD_TESTS OFF CACHE BOOL "")
     add_subdirectory("${NOSQL_LIBCORE_DIR}" libcore)
 endif()
@@ -66,7 +66,7 @@ else()
 endif()
 add_library(nosql::nosql ALIAS nosql)
 # Not exported yet: libcore has no install rules, so an installed libnosql needs libcore installed beside it.
-target_link_libraries(nosql PUBLIC $<BUILD_INTERFACE:develop::sys> $<BUILD_INTERFACE:develop::base>)
+target_link_libraries(nosql PUBLIC $<BUILD_INTERFACE:core::sys> $<BUILD_INTERFACE:core::base>)
 
 target_include_directories(nosql
     PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
