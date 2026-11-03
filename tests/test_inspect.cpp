@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Philipp Orlov
 // SPDX-License-Identifier: Apache-2.0
 
+#include <algorithm>
 #include <cstdio>
 #include <map>
 #include <set>
