@@ -251,9 +251,29 @@ void EnvImpl::growLocked(std::uint64_t needed)
         want = needed;
 
     const std::uint64_t oldSize = region->m.size;
-    os::resizeFile(fd, want);
-    if (preallocate)
-        os::reserveSpace(fd, oldSize, want - oldSize);
+    const auto extend = [&](std::uint64_t target) {
+        try {
+            os::resizeFile(fd, target);
+            if (preallocate)
+                os::reserveSpace(fd, oldSize, target - oldSize);
+        } catch (...) {
+            // Never leave a tail no block backs: a later open would map it, and a write there on a full disk is SIGBUS.
+            try { os::resizeFile(fd, oldSize); } catch (...) {}
+            throw;
+        }
+    };
+    const std::uint64_t exact = (needed + pageSize - 1) / pageSize * pageSize;
+    // The generous step may not fit on the disk while what this commit needs does: halve down to the exact size.
+    for (;;) {
+        try {
+            extend(want);
+            break;
+        } catch (const std::exception&) {
+            if (want <= exact)
+                throw;
+            want = std::max(exact, (oldSize + (want - oldSize) / 2) / pageSize * pageSize);
+        }
+    }
 
     // Inside the address range reserved at open, the new extent is mapped in
     // place: every pointer handed out so far stays valid and the pages
@@ -532,6 +552,18 @@ Env Env::Options::open(const std::filesystem::path& path) const
     else
         loadMeta(*e);
     e->freeTreePages = countFreeTreePages(*e);
+    // A tail left by a growth that failed, or by a build without this check, may have no blocks behind it.
+    if (!fresh && !readOnly_ && preallocate_) {
+        const std::uint64_t used = (e->meta.lastPgno + 1) * std::uint64_t(ps);
+        if (mapped > used) {
+            try {
+                os::reserveSpace(e->fd, used, mapped - used);
+            } catch (const std::exception&) {
+                std::lock_guard<std::mutex> lk(e->mtx);
+                e->shrinkLocked(used);   // growth then asks the disk again, and fails cleanly
+            }
+        }
+    }
 
 #ifdef NOSQL_NO_REPLICATION
     if (!ship_.empty())

@@ -5,7 +5,7 @@ A single-file, embedded, ACID key/value store in C++17.
 **Format 7:** little-endian metadata, in-tree XXH3-64 page/run checksums, a separate database catalog,
 persistent identities, deferred free-page state, a free list kept in leaf-sized chunks, entry counts
 in every branch slot, and a meta page that carries a small free-list entry and the roots of recently
-written sub-databases. Pages are 1 KiB to 64 KiB. Only format 7 is supported; an older file is rejected
+written sub-databases. Pages are 1 KiB to 64 KiB. Formats 7 and 8 are supported (a store moves to format 8 when it first uses `PrefixKeys`); any other file is rejected
 as incompatible rather than misread (replication bundles and segments moved to version 6 with it).
 `nosql compact source.db compacted.db` builds a separate compacted store;
 archives must be handled separately and physical replication restarts from a new base.
@@ -847,6 +847,18 @@ readback and integrity.
 This reserve can require extra free-list work on small commits against an
 already-populated free tree; benchmark that workload separately from bulk
 inserts. It favors bounded long-run storage over skipping that bookkeeping.
+
+### Settings for a small device
+
+These values are starting points for a small device. They were not tuned on real hardware, so adjust them to the device; the defaults suit a large machine.
+
+```cpp
+auto store = nosql::Env::configure()
+    .maxSize(1ull << 30)                        // default 64 GiB
+    .bufferCache(4u << 20)                      // default 32 MiB
+    .dirtyLimit(32u << 20)                      // default 256 MiB
+    .open(path);
+```
 
 ## Scope
 

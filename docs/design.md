@@ -4,8 +4,8 @@
 
 libnosql is a C++17 embedded, single-file, copy-on-write B+tree with one writer,
 many snapshot readers, named databases, and nested write transactions. It uses
-no WAL and no third-party libraries or vendored code. Only format 7 is supported;
-opening an unsupported format fails, including through compaction.
+no WAL and no third-party libraries or vendored code. Formats 7 and 8 are supported (a store
+reaches format 8 when it first uses `PrefixKeys`); opening any other format fails, including through compaction.
 
 See [format.md](format.md) for persisted bytes, [mq.md](mq.md) for queues,
 [replication.md](replication.md) for shipping, and [limitations.md](limitations.md)

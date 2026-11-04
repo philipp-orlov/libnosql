@@ -49,7 +49,7 @@ in the "Terminology" section of `docs/design.md`.
 * **Little-endian metadata, opaque user bytes.** Format 7 fields are explicitly
   little-endian. User values and integer keys written as native object bytes are
   not automatically converted. Big-endian runtime is not yet validated.
-  Only store format 7 is supported.
+  Store formats 7 and 8 are supported (format 8 once a store uses `PrefixKeys`).
 * **Keys are capped** at roughly a quarter page (1004 bytes at 4 KiB); see
   `Env::maxKeySize()`. Values are capped at 4 GiB. Empty keys are rejected.
 * **64-bit only.** The design maps the whole file and, on POSIX, reserves
