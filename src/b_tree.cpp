@@ -143,8 +143,9 @@ inline std::uint64_t memoryOrder(std::uint64_t x) noexcept
 #else
         return __builtin_bswap64(x);
 #endif
+    } else {
+        return x;
     }
-    return x;
 }
 
 /// Byte-wise ordering, as a functor the compiler can inline. Keys are short,

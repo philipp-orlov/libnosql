@@ -36,13 +36,16 @@ template<class T> struct Little
     constexpr Little& operator&=(T value) noexcept { return *this = T(*this) & value; }
     static constexpr T convert(T value) noexcept
     {
-        if constexpr (kLittleEndian) return value;
-        T result = 0;
-        for (unsigned index = 0; index < sizeof(T); ++index) {
-            result = T((result << 8) | (value & 255));
-            value >>= 8;
+        if constexpr (kLittleEndian) {
+            return value;
+        } else {
+            T result = 0;
+            for (unsigned index = 0; index < sizeof(T); ++index) {
+                result = T((result << 8) | (value & 255));
+                value >>= 8;
+            }
+            return result;
         }
-        return result;
     }
 };
 template<class T> T readLittle(const void* source) noexcept
