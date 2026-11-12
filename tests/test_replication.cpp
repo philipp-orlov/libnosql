@@ -685,3 +685,30 @@ TEST(bundleAcrossAShrinkApplies)
     // (The replica's file is the size the target meta records, which is the primary's mapping
     // size, not its truncated length; so no equality of file sizes is asserted.)
 }
+
+#ifndef _WIN32
+TEST(interruptedSnapshotCopyLeavesNoBase)
+{
+    tst::Scratch dir("repl-crash");
+    const fs::path store = dir.file(), copy = dir.file("copy.db");
+    {
+        Env e = Env::configure().open(store);
+        put(e, 0, 20000);
+    }
+    const pid_t child = ::fork();
+    if (child == 0) {
+        Env e = Env::configure().open(store);
+        internal::os::ScopedIoObserver die([n = 0](internal::os::IoEvent ev, std::size_t) mutable {
+            if (ev == internal::os::IoEvent::Write && ++n == 2)
+                ::_exit(9);
+        });
+        Txn rt = e.readTxn();
+        copySnapshot(rt, copy);
+        ::_exit(0);
+    }
+    int status = 0;
+    ::waitpid(child, &status, 0);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 9);
+    CHECK(!fs::exists(copy));
+}
+#endif

@@ -190,8 +190,13 @@ void copySnapshot(Txn& txn, const std::filesystem::path& dst)
     // anything above them.
     const std::uint64_t pages = std::max<std::uint64_t>(m.lastPgno + 1, 2);
 
-    os::File file(os::openFile(dst, false, true, /*exclusiveCreate=*/true));
-    try {
+    if (std::filesystem::exists(dst))
+        throw Error(ErrorCode::InvalidArgument, "copySnapshot destination already exists");
+    // Built under a temporary name and renamed into place once complete: a crash part-way must
+    // never leave a file under `dst` that carries valid meta pages over missing data.
+    internal::AtomicFile out(dst);
+    const os::FileHandle file = out.fd();
+    {
         // The file is grown to exactly what the snapshot recorded, not to
         // what its pages need: the meta is copied verbatim so its checksum
         // still matches, and fileSize is one of the fields it covers.
@@ -215,13 +220,8 @@ void copySnapshot(Txn& txn, const std::filesystem::path& dst)
         // already establishes that two identical slots are a valid store.
         for (unsigned slot = 0; slot < 2; ++slot)
             os::writeAt(file, std::uint64_t(slot) * ps + kPageHdr, &m, sizeof m);
-        os::syncFile(file, true);
-    } catch (...) {
-        file.close();
-        std::error_code ignored;
-        std::filesystem::remove(dst, ignored);
-        throw;
     }
+    out.publish(/*replace=*/false);
 }
 
 // ----------------------------------------------------------------- bundles ---
