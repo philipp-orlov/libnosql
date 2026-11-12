@@ -567,3 +567,18 @@ TEST(staleReceiptFromAnAbortedReceiveSettlesNothing)
     q.nack(std::move(b));
     CHECK_EQ(q.readyCount(), std::uint64_t(1));
 }
+
+TEST(waitingForEverDoesNotOverflowTheDeadline)
+{
+    tst::Scratch s("mq");
+    Env e = Env::configure().open(s.file());
+    MessageQueue q = MessageQueue::open(e, "orders");
+    std::thread sender([&] {
+        std::this_thread::sleep_for(50ms);
+        q.send("late");
+    });
+    Receipt r = q.receive(std::chrono::milliseconds::max());
+    CHECK(r.valid());
+    CHECK_EQ(r.message().body, std::string("late"));
+    sender.join();
+}

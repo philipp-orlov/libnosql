@@ -3,9 +3,22 @@
 
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
+
+namespace nosql::internal {
+/// now + d, with d capped at a year: "wait for ever" arguments such as milliseconds::max() must not
+/// overflow the clock and return at once.
+template <class Duration>
+inline std::chrono::steady_clock::time_point deadlineAfter(Duration d)
+{
+    const auto cap = std::chrono::hours(24 * 365);
+    return std::chrono::steady_clock::now() +
+           std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::min<Duration>(d, std::chrono::duration_cast<Duration>(cap)));
+}
+}  // namespace nosql::internal
 
 namespace nosql::internal {
 
@@ -49,7 +62,7 @@ public:
     template <class Rep, class Period>
     bool try_lock_for(const std::chrono::duration<Rep, Period>& timeout)
     {
-        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        const auto deadline = deadlineAfter(timeout);
         std::unique_lock<std::mutex> lk(mtx_);
         if (!held_) {
             held_ = true;

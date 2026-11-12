@@ -162,7 +162,7 @@ int nosql_compact(const char* src, const char* dst)
 int nosql_txn_begin_write(nosql_env* env, int64_t timeout_ms, nosql_txn** out)
 {
     return guarded([&] {
-        *out = new nosql_txn{timeout_ms < 0 ? env->env.writeTxn() : env->env.writeTxn(std::chrono::milliseconds(timeout_ms))};
+        *out = new nosql_txn{timeout_ms < 0 ? env->env.writeTxn() : env->env.writeTxn(std::chrono::milliseconds(std::min<int64_t>(timeout_ms, int64_t(24) * 3600 * 1000 * 365)))};
         return 0;
     });
 }

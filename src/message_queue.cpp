@@ -16,6 +16,7 @@
 #include "nosql/internal/mq_record.hpp"
 #include "nosql/internal/mq_writer.hpp"
 #include "nosql/message_queue.hpp"
+#include "nosql/internal/writer_slot.hpp"
 #include "nosql/internal/format.hpp"
 
 namespace nosql {
@@ -482,7 +483,7 @@ Receipt MessageQueue::receive(Txn& txn)
 Receipt MessageQueue::receive(std::chrono::milliseconds timeout)
 {
     Impl& im = *impl_;
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    const auto deadline = internal::deadlineAfter(timeout);
     for (;;) {
         // Sampled before the attempt, so a send landing between the two does
         // not get slept through.
@@ -504,7 +505,7 @@ std::vector<Receipt> MessageQueue::receiveBatch(std::size_t max, std::chrono::mi
     if (max == 0)
         return out;
 
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    const auto deadline = internal::deadlineAfter(timeout);
     for (;;) {
         const std::uint64_t seen = im.env->commitGeneration();
         if (readyCount() != 0) {
