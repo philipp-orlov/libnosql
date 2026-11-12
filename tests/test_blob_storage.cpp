@@ -835,3 +835,28 @@ TEST(secondWriterOnTheSameThreadIsBusyNotAHang)
     }
     CHECK(outcome.get());
 }
+
+TEST(damagedHeaderInsideTheIndexedRangeIsNotTruncatedAway)
+{
+    tst::Scratch s("tar");
+    Env e = Env::configure().open(s.file());
+    std::filesystem::path archive;
+    std::uint64_t size = 0;
+    {
+        auto tar = BlobStorage::open(e, "images", BlobStorage::Options().syncOnAppend(true));
+        for (int i = 0; i < 3; ++i)
+            tar.put("k" + std::to_string(i), "m" + std::to_string(i), std::string(600, char('1' + i)));
+        archive = tar.archivePath();
+    }
+    size = std::filesystem::file_size(archive);
+    {
+        // Flip a byte in the second member's header (it starts after 512 + 1024 bytes).
+        std::FILE* f = std::fopen(archive.string().c_str(), "r+b");
+        CHECK(f != nullptr);
+        std::fseek(f, 1536 + 10, SEEK_SET);
+        std::fputc('Z', f);
+        std::fclose(f);
+    }
+    CHECK_THROWS(BlobStorage::open(e, "images"), ErrorCode::Corrupted);
+    CHECK_EQ(std::filesystem::file_size(archive), size);
+}

@@ -473,6 +473,15 @@ BlobStorage BlobStorage::open(Env& env, Slice indexDb, const Options& options)
             im->haveMeta = t.hasDb(im->metaDb);
         });
     } else {
+        // A header that stopped the scan below the indexed end is damage to a member the index
+        // vouches for, not a torn append: truncating there would drop committed blobs and leave
+        // their index entries naming other blobs' bytes.
+        const std::uint64_t indexed = env.read([&](Txn& t) -> std::uint64_t {
+            return t.hasDb(im->metaDb) ? im->readIndexedUpTo(t) : 0;
+        });
+        if (im->appendAt < indexed)
+            throw Error(ErrorCode::Corrupted,
+                        "blob archive is damaged before its indexed end; run rebuildIndex()");
         const std::uint64_t have = internal::os::fileSize(im->fd);
         if (have != im->appendAt + kMarker)
             im->writeMarker();  // normalise a torn or unterminated archive
