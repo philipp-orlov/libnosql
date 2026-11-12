@@ -406,3 +406,38 @@ int main()
 {
     return tst::runAll("steady");
 }
+
+TEST(heldReaderIsReportedWhileTheFileGrows)
+{
+    tst::Scratch s("steady");
+    std::atomic<int> reports{0};
+    std::atomic<std::uint64_t> pinned{0};
+    Env e = Env::configure()
+                .sync(Durability::None)
+                .onReaderLag(std::chrono::milliseconds(1), std::chrono::milliseconds(1),
+                             [&](const ReaderLag& lag) {
+                                 ++reports;
+                                 pinned = lag.pinnedPages;
+                             })
+                .open(s.file());
+    e.write([](Txn& t) {
+        for (int i = 0; i < 2000; ++i)
+            t.mainDb().put(tst::keyOf(i), "v");
+    });
+    Txn reader = e.readTxn();
+    for (int c = 0; c < 2000; ++c) {
+        e.write([&](Txn& t) {
+            for (int i = 0; i < 5; ++i)
+                t.mainDb().put(tst::keyOf((c * 7 + i * 131) % 2000), "w" + std::to_string(c));
+        });
+        if (c == 20)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    const EnvStats st = e.stats();
+    CHECK(st.oldestReaderAgeMs > 0 || st.readers == 1);
+    CHECK(st.pinnedPages > 1000);
+    CHECK(reports.load() >= 1);
+    CHECK(pinned.load() > 0);
+    reader.abort();
+    CHECK_EQ(e.stats().pinnedPages, std::uint64_t(0));
+}

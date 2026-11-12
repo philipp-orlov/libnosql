@@ -156,6 +156,20 @@ struct EnvStats
     /// environment opened, and how many of them a write read back.
     std::uint64_t spilledPages = 0;
     std::uint64_t unspilledPages = 0;
+    /// How long the oldest live read snapshot has been open, in milliseconds (0 without readers).
+    std::uint64_t oldestReaderAgeMs = 0;
+    /// Free pages while a reader older than the newest commit is open: an upper bound of what
+    /// readers hold back from reuse (0 without such a reader).
+    std::uint64_t pinnedPages = 0;
+};
+
+/// What Env::Options::onReaderLag() reports.
+struct ReaderLag
+{
+    std::uint64_t snapshot = 0;     ///< transaction id of the oldest live snapshot
+    std::uint64_t ageMs = 0;        ///< how long it has been open
+    std::uint64_t pinnedPages = 0;  ///< see EnvStats::pinnedPages
+    std::uint64_t fileSize = 0;
 };
 
 // ------------------------------------------------------------------ db ----
@@ -535,6 +549,19 @@ public:
             syncInterval_ = interval;
             return *this;
         }
+        /// Called by a committing writer, at most once per `interval`, while the oldest reader has
+        /// been open longer than `age`: a forgotten read transaction keeps every page retired after
+        /// it, and the file grows by about a commit's worth of pages per commit until it ends. Runs
+        /// on the writer's thread after the commit is published and outside every lock; it must not
+        /// start a transaction on this Env.
+        Options& onReaderLag(std::chrono::milliseconds age, std::chrono::milliseconds interval,
+                             std::function<void(const ReaderLag&)> callback)
+        {
+            lagAge_ = age;
+            lagInterval_ = interval;
+            lagCallback_ = std::move(callback);
+            return *this;
+        }
         /// Under Durability::Lazy, also sync from a thread of the store's own:
         /// once each syncInterval, if commits are waiting and none has synced
         /// within the interval. An idle store's newest commits then reach the
@@ -637,6 +664,8 @@ public:
         bool pipelineCommits_ = NOSQL_PIPELINE_COMMITS_DEFAULT;
         unsigned commitSpins_ = 256;
         std::chrono::milliseconds syncInterval_{1000};
+        std::chrono::milliseconds lagAge_{0}, lagInterval_{0};
+        std::function<void(const ReaderLag&)> lagCallback_;
         bool backgroundSync_ = false;
         bool cacheReadChecksums_ = false;
         std::chrono::milliseconds revalidateAfter_{60000};

@@ -337,6 +337,9 @@ EnvStats Env::stats() const
         s.lastTxn = e->meta.txnid;
         s.readers = e->readerCount();
         s.oldestReader = e->readers.empty() ? 0 : e->readers.front().first;
+        if (!e->readerSince.empty()) {
+            s.oldestReaderAgeMs = std::uint64_t(std::max<std::int64_t>(0, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() - e->readerSince.front().second) / 1000000);
+        }
         s.bufferBytes = e->buffers.retainedBytes();
         s.dirtyBytes = e->dirtyBytes.load();
         s.optimisticCommits = e->occInCommit.load(std::memory_order_relaxed);
@@ -352,6 +355,8 @@ EnvStats Env::stats() const
         // them), the free-list entry kept in the meta page, and the tree: all
         // of the commit writers build on, a pipelined one not yet durable too.
         s.freePages = e->carryOver.size() + e->writerMeta.inlineCount + e->freeTreePages;
+        if (!e->readers.empty() && e->readers.front().first < e->meta.txnid)
+            s.pinnedPages = s.freePages;
     }
     return s;
 }

@@ -1289,11 +1289,38 @@ void txnCommit(TxnImpl* t, TxnId* awaitLater)
         throw;
     }
     finishWriter(t);  // the next writer may start while this one's meta waits
+    if (e->lagAgeNs > 0 && e->lagCallback)
+        reportReaderLag(*e);
     if (pending) {
         if (awaitLater)
             *awaitLater = pending;
         else
             awaitDurable(*e, pending);
+    }
+}
+
+/// Calls Options::onReaderLag() when the oldest reader is older than its limit, at most once per interval.
+void reportReaderLag(EnvImpl& e)
+{
+    const std::int64_t now = steadyNs();
+    ReaderLag lag;
+    {
+        std::lock_guard<std::mutex> lk(e.mtx);
+        if (e.readerSince.empty() || e.readers.empty() || e.readers.front().first >= e.meta.txnid)
+            return;
+        if (now - e.readerSince.front().second < e.lagAgeNs)
+            return;
+        if (now - e.lagLastNs.load(std::memory_order_relaxed) < e.lagIntervalNs)
+            return;
+        lag.snapshot = e.readers.front().first;
+        lag.ageMs = std::uint64_t((now - e.readerSince.front().second) / 1000000);
+        lag.pinnedPages = e.carryOver.size() + e.writerMeta.inlineCount + e.freeTreePages;
+        lag.fileSize = e.region->m.size;
+        e.lagLastNs.store(now, std::memory_order_relaxed);
+    }
+    try {
+        e.lagCallback(lag);
+    } catch (...) {
     }
 }
 

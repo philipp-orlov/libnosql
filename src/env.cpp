@@ -213,11 +213,23 @@ void countRelease(SnapshotCounts& counts, TxnId id) noexcept
 void EnvImpl::readerAcquire(TxnId id)
 {
     countAcquire(readers, id);
+    const auto it = std::lower_bound(readerSince.begin(), readerSince.end(), id,
+                                     [](const std::pair<TxnId, std::int64_t>& e, TxnId v) { return e.first < v; });
+    if (it == readerSince.end() || it->first != id)
+        readerSince.insert(it, {id, steadyNowNs()});
 }
 
 void EnvImpl::readerRelease(TxnId id) noexcept
 {
     countRelease(readers, id);
+    const auto still = std::lower_bound(readers.begin(), readers.end(), id,
+                                        [](const std::pair<TxnId, unsigned>& e, TxnId v) { return e.first < v; });
+    if (still != readers.end() && still->first == id)
+        return;
+    const auto it = std::lower_bound(readerSince.begin(), readerSince.end(), id,
+                                     [](const std::pair<TxnId, std::int64_t>& e, TxnId v) { return e.first < v; });
+    if (it != readerSince.end() && it->first == id)
+        readerSince.erase(it);
 }
 
 void EnvImpl::occPinAcquire(TxnId id)
@@ -482,6 +494,9 @@ Env Env::Options::open(const std::filesystem::path& path) const
     e->pipelined = pipelineCommits_ && durability_ == Durability::Safe;
     e->occSpins = commitSpins_;
     e->syncIntervalNs = std::chrono::nanoseconds(syncInterval_).count();
+    e->lagAgeNs = std::chrono::nanoseconds(lagAge_).count();
+    e->lagIntervalNs = std::chrono::nanoseconds(lagInterval_).count();
+    e->lagCallback = lagCallback_;
     e->lastSyncNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now().time_since_epoch())
                             .count(),

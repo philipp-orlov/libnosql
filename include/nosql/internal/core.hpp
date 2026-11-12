@@ -310,6 +310,13 @@ struct EnvImpl
     /// because there are only ever a handful of distinct snapshots, and this
     /// way the table stops allocating after the first few transactions.
     std::vector<std::pair<TxnId, unsigned>> readers;
+    /// When the first reader of each snapshot in `readers` registered (steady clock, ns); sorted by
+    /// snapshot id like `readers`. Guarded by mtx.
+    std::vector<std::pair<TxnId, std::int64_t>> readerSince;
+    /// Env::Options::onReaderLag(): zero age disables it.
+    std::int64_t lagAgeNs = 0, lagIntervalNs = 0;
+    std::atomic<std::int64_t> lagLastNs{0};
+    std::function<void(const ReaderLag&)> lagCallback;
     void readerAcquire(TxnId id);           // caller holds mtx
     void readerRelease(TxnId id) noexcept;  // caller holds mtx
     /// Snapshots that optimistic commits still validate against after giving
@@ -378,6 +385,7 @@ void txnCommit(TxnImpl* t, TxnId* awaitLater = nullptr);
 /// Returns once commit `id` is durable: carried to the device by a later
 /// commit's data flush when one follows soon, or flushed here.
 void awaitDurable(EnvImpl& e, TxnId id);
+void reportReaderLag(EnvImpl& e);
 
 /// The environment behind a public handle, or ErrorCode::InvalidArgument once
 /// it has been closed.
