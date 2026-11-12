@@ -50,6 +50,20 @@ void ShipWriter::closeSegment() noexcept
 void ShipWriter::openSegment(TxnId firstTxnid)
 {
     const std::filesystem::path p = dir_ / segmentName(firstTxnid);
+    // Anything at or past this id belongs to a history that was lost (a crash under Lazy or None
+    // reopens on an older commit); left alone, it could be read as a continuation of this one.
+    try {
+        std::error_code ec;
+        for (const auto& e : std::filesystem::directory_iterator(dir_, ec)) {
+            const std::string name = e.path().filename().string();
+            const std::size_t dot = name.find(".seg");
+            if (dot == std::string::npos || dot == 0 || name.find_first_not_of("0123456789") != dot)
+                continue;
+            if (std::stoull(name.substr(0, dot)) >= firstTxnid)
+                std::filesystem::remove(e.path(), ec);
+        }
+    } catch (...) {
+    }
     fd_ = os::openFile(p, false, true, false, /*lock=*/false);
     os::resizeFile(fd_, 0);  // a file with this name can only be a leftover
 
@@ -189,6 +203,8 @@ struct Segment
     std::vector<Entry> entries;
     TxnId first = 0;
     TxnId last = 0;
+    Meta firstMeta{};  ///< the meta of the first commit, for ancestry across segments
+    Meta lastMeta{};   ///< and of the last
 };
 
 const char* kNotShipDir = "not a shipping directory: ";
@@ -239,6 +255,8 @@ bool parseSegment(const std::filesystem::path& path, std::uint32_t& pageSize, Se
             out.entries.push_back({row.meta.txnid, expected + sizeof(SegmentEntry), row.pageCount,
                                    expected + sizeof(SegmentEntry) + row.pageCount * (sizeof(PageRecord) + pageSize),
                                    row.frameChecksum});
+            if (out.entries.size() == 1)
+                out.firstMeta = row.meta;
             prior = row.meta;
             expected += length;
         }
@@ -248,6 +266,7 @@ bool parseSegment(const std::filesystem::path& path, std::uint32_t& pageSize, Se
             out.file = std::move(f);
             out.first = out.entries.front().txnid;
             out.last = out.entries.back().txnid;
+            out.lastMeta = prior;
             return true;
         }
         out.entries.clear();
@@ -292,6 +311,8 @@ bool parseSegment(const std::filesystem::path& path, std::uint32_t& pageSize, Se
         if (!out.entries.empty() && e.txnid != out.entries.back().txnid + 1)
             break;
         out.entries.push_back({e.txnid, off + sizeof e, e.pageCount, metaAt, recorded});
+        if (out.entries.size() == 1)
+            out.firstMeta = m;
         previous = m;
         off += sizeof e + e.byteLength;
     }
@@ -301,6 +322,7 @@ bool parseSegment(const std::filesystem::path& path, std::uint32_t& pageSize, Se
     out.file = std::move(f);
     out.first = out.entries.front().txnid;
     out.last = out.entries.back().txnid;
+    out.lastMeta = previous;
     return true;
 }
 
@@ -328,7 +350,14 @@ std::vector<Segment> scanDirectory(const std::filesystem::path& dir, std::uint32
     }
     if (contiguousOnly) {
         std::size_t start = segs.size();
-        while (start > 0 && (start == segs.size() || segs[start].first == segs[start - 1].last + 1))
+        // Joined by ancestry, not by transaction id alone: a segment of a lost history can end one
+        // below a live segment's first id and must not be read as part of it.
+        auto follows = [&](const Segment& prev, const Segment& next) {
+            return next.first == prev.last + 1 && next.firstMeta.parentId == prev.lastMeta.commitId &&
+                   next.firstMeta.parentChecksum == prev.lastMeta.checksum &&
+                   next.firstMeta.storeId == prev.lastMeta.storeId;
+        };
+        while (start > 0 && (start == segs.size() || follows(segs[start - 1], segs[start])))
             --start;
         segs.erase(segs.begin(), segs.begin() + std::ptrdiff_t(start));
     }

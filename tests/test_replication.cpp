@@ -601,3 +601,57 @@ int main()
 {
     return tst::runAll("replication");
 }
+
+#ifndef _WIN32
+#include <sys/wait.h>
+#include <unistd.h>
+
+/// A primary that crashes under Durability::None leaves shipped segments of commits it lost. After it
+/// reopens, those must never be joined onto the new history.
+TEST(staleSegmentsOfALostHistoryAreNeverShipped)
+{
+    tst::Scratch dir("stale");
+    const fs::path store = dir.file(), ship = dir.file("ship");
+    auto options = [&] {
+        return Env::configure().sync(Durability::None).shipTo(ship).shipSegmentSize(4096);
+    };
+    const pid_t child = ::fork();
+    if (child == 0) {
+        Env e = options().open(store);
+        for (int i = 0; i < 4; ++i)
+            put(e, i * 10, i * 10 + 10);
+        e.sync();
+        for (int i = 4; i < 14; ++i)
+            put(e, i * 10, i * 10 + 10, "lost");
+        ::_exit(0);
+    }
+    int status = 0;
+    ::waitpid(child, &status, 0);
+    CHECK(WIFEXITED(status));
+
+    Env e = options().open(store);
+    for (int round = 0; round < 12; ++round) {
+        put(e, 1000 + round * 5, 1005 + round * 5, "live");
+        const fs::path base = dir.file(("base" + std::to_string(round) + ".db").c_str());
+        {
+            Txn rt = e.readTxn();
+            copySnapshot(rt, base);
+        }
+        put(e, 2000 + round, 2001 + round, "live");
+        const fs::path bundle = dir.file(("bundle" + std::to_string(round)).c_str());
+        ShipStatus st = ShipStatus::NeedBase;
+        try {
+            st = ShipLog(ship).extract(checkpointOf(base), bundle);
+        } catch (const Error& err) {
+            CHECK(err.code() != ErrorCode::Incompatible);
+        }
+        if (st == ShipStatus::Ok) {
+            applyBundle(base, bundle);
+            CHECK_EQ(checkpointOf(base).txnid, e.stats().lastTxn);
+            CHECK(dumpFile(base).size() <= dumpEnv(e).size());
+            for (const auto& kv : dumpFile(base))
+                CHECK(kv.second != "lost");
+        }
+    }
+}
+#endif
