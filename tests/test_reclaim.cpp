@@ -480,3 +480,16 @@ TEST(concurrentShrinksNeverCutBelowTheDurableFrontier)
     CHECK_EQ(violations.load(), 0u);
 }
 #endif
+
+TEST(shrinkWithATimeoutGivesUpWhileAWriterHoldsTheSlot)
+{
+    tst::Scratch s("shrink-timeout");
+    Env e = Env::configure().pageSize(4096).open(s.file());
+    e.write([](Txn& t) { t.mainDb().put("k", "v"); });
+    Txn held = e.writeTxn();
+    const auto started = std::chrono::steady_clock::now();
+    CHECK_THROWS(e.shrink(std::chrono::milliseconds(100)), ErrorCode::Busy);
+    CHECK(std::chrono::steady_clock::now() - started < std::chrono::seconds(5));
+    held.abort();
+    e.shrink(std::chrono::milliseconds(1000));  // free now
+}

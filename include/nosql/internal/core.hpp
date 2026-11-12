@@ -173,7 +173,7 @@ struct EnvImpl
     TxnId syncTarget = 0;
     /// Held for the whole of Env::shrink(): its truncation size comes from the newest commit and
     /// assumes no other shrink lowered the frontier since its own sync.
-    std::mutex shrinkMtx;
+    std::timed_mutex shrinkMtx;
     unsigned durableSlot = 0;
     /// NoMetaSync and pipelined Safe: a meta written into the mapping but not
     /// flushed. The next data flush carries it to the device; a pipelined one
@@ -386,6 +386,8 @@ void txnCommit(TxnImpl* t, TxnId* awaitLater = nullptr);
 /// commit's data flush when one follows soon, or flushed here.
 void awaitDurable(EnvImpl& e, TxnId id);
 void reportReaderLag(EnvImpl& e);
+/// The steady clock in nanoseconds.
+std::int64_t steadyNowNs() noexcept;
 
 /// The environment behind a public handle, or ErrorCode::InvalidArgument once
 /// it has been closed.

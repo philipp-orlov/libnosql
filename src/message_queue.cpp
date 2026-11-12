@@ -21,6 +21,19 @@
 
 namespace nosql {
 
+namespace {
+/// Process-wide floor for delivery tokens: queues in different Envs share it, so it only ever rises.
+std::atomic<std::uint64_t> lastIssuedToken{0};
+
+/// Raises `a` to at least `v`; never lowers it.
+void raiseTo(std::atomic<std::uint64_t>& a, std::uint64_t v) noexcept
+{
+    std::uint64_t cur = a.load(std::memory_order_relaxed);
+    while (cur < v && !a.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {
+    }
+}
+}  // namespace
+
 using internal::kMqDeadHdr;
 using internal::kMqExternalBody;
 using internal::kMqLeaseHdr;
@@ -208,12 +221,11 @@ struct MessageQueue::Impl
             // The counter lives in the transaction that issues the lease, so an abort rolls it back
             // and the next delivery would reuse the token of a receipt the caller still holds.
             // This process-wide floor survives the rollback.
-            static std::atomic<std::uint64_t> lastIssuedToken{0};
             const std::uint64_t token =
                 std::max(scalar(tr.meta, kNextToken, 1), lastIssuedToken.load() + 1);
             if (token == UINT64_MAX)
                 throw Error(ErrorCode::MapFull, "queue delivery token space exhausted");
-            lastIssuedToken.store(token);
+            raiseTo(lastIssuedToken, token);
             setScalar(tr.meta, kNextToken, token + 1);
             tr.lease.put(Slice::ref(seqKey(seq)), mqWrapLease(now + leaseNanos(), token, rec));
             tr.ready.erase(Slice::ref(seqKey(seq)));

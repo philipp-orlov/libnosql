@@ -835,12 +835,7 @@ void writePages(TxnImpl* t)
         writeSpans();
 }
 
-std::int64_t steadyNs() noexcept
-{
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-               std::chrono::steady_clock::now().time_since_epoch())
-        .count();
-}
+std::int64_t steadyNs() noexcept { return steadyNowNs(); }
 
 /// Writes `m` into the meta slot that does not hold the newest durable meta,
 /// so a torn write leaves that one in charge. Caller holds syncMtx.

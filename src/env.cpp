@@ -94,14 +94,14 @@ EnvImpl::~EnvImpl()
         os::closeFile(fd);
 }
 
-namespace {
-
 std::int64_t steadyNowNs() noexcept
 {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
 }
+
+namespace {
 
 /// One background sync, if commits are waiting and none synced lately. Never
 /// throws: a failure poisons the store, which its next transaction reports.
@@ -212,11 +212,22 @@ void countRelease(SnapshotCounts& counts, TxnId id) noexcept
 
 void EnvImpl::readerAcquire(TxnId id)
 {
-    countAcquire(readers, id);
-    const auto it = std::lower_bound(readerSince.begin(), readerSince.end(), id,
-                                     [](const std::pair<TxnId, std::int64_t>& e, TxnId v) { return e.first < v; });
-    if (it == readerSince.end() || it->first != id)
+    // The step that can throw (an allocation) goes first and is undone if the second one throws, so the two
+    // tables never disagree about which snapshots are live.
+    const auto since = [](const std::pair<TxnId, std::int64_t>& e, TxnId v) { return e.first < v; };
+    const auto it = std::lower_bound(readerSince.begin(), readerSince.end(), id, since);
+    bool inserted = false;
+    if (it == readerSince.end() || it->first != id) {
         readerSince.insert(it, {id, steadyNowNs()});
+        inserted = true;
+    }
+    try {
+        countAcquire(readers, id);
+    } catch (...) {
+        if (inserted)
+            readerSince.erase(std::lower_bound(readerSince.begin(), readerSince.end(), id, since));
+        throw;
+    }
 }
 
 void EnvImpl::readerRelease(TxnId id) noexcept

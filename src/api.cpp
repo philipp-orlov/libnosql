@@ -338,7 +338,7 @@ EnvStats Env::stats() const
         s.readers = e->readerCount();
         s.oldestReader = e->readers.empty() ? 0 : e->readers.front().first;
         if (!e->readerSince.empty()) {
-            s.oldestReaderAgeMs = std::uint64_t(std::max<std::int64_t>(0, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() - e->readerSince.front().second) / 1000000);
+            s.oldestReaderAgeMs = std::uint64_t(std::max<std::int64_t>(0, steadyNowNs() - e->readerSince.front().second) / 1000000);
         }
         s.bufferBytes = e->buffers.retainedBytes();
         s.dirtyBytes = e->dirtyBytes.load();
@@ -999,10 +999,28 @@ Db::Range::Entry Db::Range::current() const
 
 std::uint64_t Env::shrink()
 {
+    return shrinkWith(nullptr);
+}
+
+std::uint64_t Env::shrink(std::chrono::milliseconds timeout)
+{
+    return shrinkWith(&timeout);
+}
+
+std::uint64_t Env::shrinkWith(const std::chrono::milliseconds* timeout)
+{
     EnvImpl* e = &openEnv(impl_);
     if (e->readOnly)
         throw Error(ErrorCode::ReadOnly, "store was opened read-only");
-    std::lock_guard<std::mutex> oneShrink(e->shrinkMtx);
+    // One shrink at a time; with a timeout, waiting for the other (or for a writer) is bounded.
+    std::unique_lock<std::timed_mutex> oneShrink(e->shrinkMtx, std::defer_lock);
+    if (timeout) {
+        if (!oneShrink.try_lock_for(*timeout))
+            throw Error(ErrorCode::Busy, "another shrink is running");
+    } else {
+        oneShrink.lock();
+    }
+    const auto takeWriter = [&] { return timeout ? writeTxn(*timeout) : writeTxn(); };
     const std::uint64_t before = os::fileSize(e->fd);
     const std::size_t ps = e->pageSize;
     auto treesOf = [](Txn& txn) {
@@ -1017,7 +1035,7 @@ std::uint64_t Env::shrink()
     // their pages too: the limit keeps room for every copied path's branch
     // pages and for the commit's free-list chunks.
     {
-        Txn txn = writeTxn();
+        Txn txn = takeWriter();
         TxnImpl* t = txn.impl_.get();
         t->maintenance = true;
         const std::vector<unsigned> dbis = treesOf(txn);
@@ -1035,7 +1053,7 @@ std::uint64_t Env::shrink()
     // snapshot. A round's own writes may free more of the tail: a few rounds.
     for (int round = 0; round < 4; ++round) {
         sync(true);
-        Txn txn = writeTxn();
+        Txn txn = takeWriter();
         TxnImpl* t = txn.impl_.get();
         t->maintenance = true;
         absorbFreeList(t);
@@ -1050,7 +1068,7 @@ std::uint64_t Env::shrink()
     // that readers check the size under.
     sync(true);
     {
-        Txn txn = writeTxn();
+        Txn txn = takeWriter();
         TxnImpl* t = txn.impl_.get();
         t->maintenance = true;
 #ifndef _WIN32

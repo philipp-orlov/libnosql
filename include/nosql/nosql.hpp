@@ -744,6 +744,9 @@ public:
     /// file cannot be cut, the store stops using the tail but the file keeps
     /// its size, and it returns 0.
     std::uint64_t shrink();
+    /// As shrink(), but gives up with ErrorCode::Busy when the write slot (or another shrink) is not
+    /// free within `timeout`, for each step that needs it.
+    std::uint64_t shrink(std::chrono::milliseconds timeout);
 
     /// Make every commit so far durable now. Under Lazy and None this is the
     /// sync described at Durability: flush the data, write the newest meta,
@@ -786,6 +789,7 @@ public:
 
 private:
     Txn beginWriter();  // the writer slot is held
+    std::uint64_t shrinkWith(const std::chrono::milliseconds* timeout);
     friend class Options;
     friend class Txn;
     friend class OptimisticTxn;  // commit publishes the keys it wrote

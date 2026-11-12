@@ -604,3 +604,38 @@ TEST(oneInvalidMessageDoesNotFailTheOthers)
     CHECK_EQ(failures.load(), 1);
     CHECK_EQ(q.readyCount(), std::uint64_t(8));
 }
+
+TEST(staleReceiptsStaySafeWhileQueuesInOtherEnvsRaiseTheTokenFloor)
+{
+    tst::Scratch sa("mq-a"), sb("mq-b");
+    Env ea = Env::configure().open(sa.file());
+    Env eb = Env::configure().open(sb.file());
+    MessageQueue qa = MessageQueue::open(ea, "orders");
+    MessageQueue qb = MessageQueue::open(eb, "orders");
+    std::atomic<bool> stop{false};
+    std::thread noise([&] {
+        while (!stop.load()) {
+            qb.send("x");
+            Receipt r = qb.tryReceive();
+            if (r.valid())
+                qb.ack(std::move(r));
+        }
+    });
+    for (int i = 0; i < 300; ++i) {
+        qa.send("work");
+        Receipt stale;
+        {
+            Txn t = ea.writeTxn();
+            stale = qa.receive(t);
+            t.abort();
+        }
+        Receipt current = qa.tryReceive();
+        CHECK(current.valid());
+        qa.ack(std::move(stale));  // must not settle the lease `current` holds
+        CHECK_EQ(qa.leasedCount(), std::uint64_t(1));
+        qa.ack(std::move(current));
+        CHECK_EQ(qa.leasedCount(), std::uint64_t(0));
+    }
+    stop = true;
+    noise.join();
+}
