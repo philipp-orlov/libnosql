@@ -426,6 +426,7 @@ Txn Txn::nested()
     auto t = p->env->acquireTxn();
     t->env = p->env;
     t->parent = p;
+    t->savedRoots = p->root()->meta.roots;
     t->readOnly = false;
     t->dirty.reserve(32);
     t->pool.reserve(8);

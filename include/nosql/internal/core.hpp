@@ -392,6 +392,9 @@ struct TxnImpl
     EnvImpl* env = nullptr;
     TxnImpl* parent = nullptr;
     TxnImpl* child = nullptr;
+    /// Nested only: the root's named-tree slots when this transaction began; an abort
+    /// puts them back (treeDelSubdb clears a slot in the root's meta).
+    std::array<RootSlot, 6> savedRoots{};
     bool readOnly = false;
     bool finished = false;
 

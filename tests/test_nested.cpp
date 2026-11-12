@@ -255,3 +255,51 @@ TEST(deepNestedCommitsReleaseCopiedPages)
     });
     e.read([](Txn& t) { checkIntegrity(t); });
 }
+
+TEST(abortedNestedDropLeavesTheSubDatabase)
+{
+    tst::Scratch s("nested");
+    Env e = Env::configure().open(s.file());
+    e.write([](Txn& t) {
+        Db u = t.db("users", DbFlags::Create);
+        u.put("k0", "v");
+    });
+    for (int i = 1; i <= 200; ++i)
+        e.write([&](Txn& t) { t.db("users", DbFlags::Create).put("k" + std::to_string(i), "v"); });
+    e.write([](Txn& t) {
+        {
+            Txn n = t.nested();
+            n.dropDb("users");
+            n.abort();
+        }
+        checkIntegrity(t);
+    });
+    e.read([](Txn& t) {
+        CHECK(t.db("users").count() == 201);
+        checkIntegrity(t);
+    });
+}
+
+TEST(abortedNestedDropInGrandchildLeavesTheSubDatabase)
+{
+    tst::Scratch s("nested");
+    Env e = Env::configure().open(s.file());
+    for (int i = 0; i < 50; ++i)
+        e.write([&](Txn& t) { t.db("users", DbFlags::Create).put("k" + std::to_string(i), "v"); });
+    e.write([](Txn& t) {
+        {
+            Txn c = t.nested();
+            {
+                Txn g = c.nested();
+                g.dropDb("users");
+                g.commit();
+            }
+            c.mainDb().put("x", "y");
+            c.abort();
+        }
+    });
+    e.read([](Txn& t) {
+        CHECK(t.db("users").count() == 50);
+        checkIntegrity(t);
+    });
+}

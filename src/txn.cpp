@@ -1158,6 +1158,7 @@ void finishWriter(TxnImpl* t)
 void abortNested(TxnImpl* t)
 {
     TxnImpl* p = t->parent;
+    p->root()->meta.roots = t->savedRoots;
 
     // Hand the buffers up rather than releasing them: a cursor belonging to the
     // parent may still hold a pointer into one until it next re-anchors. They
