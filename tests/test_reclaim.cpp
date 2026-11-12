@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // The free list is what keeps a copy-on-write store from growing for ever.
+#include <atomic>
+#include <fcntl.h>
 #include <random>
+#include <thread>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <vector>
 
 #include "nosql/nosql.hpp"
@@ -406,3 +411,72 @@ int main()
 {
     return tst::runAll("reclaim");
 }
+
+#ifndef _WIN32
+#include "nosql/internal/format.hpp"
+
+/// Two shrink() calls at once must never cut the file below what the newest durable meta names.
+/// A monitor reads both meta pages from the file and checks the newest valid one against the size.
+TEST(concurrentShrinksNeverCutBelowTheDurableFrontier)
+{
+    using namespace nosql::internal;
+    tst::Scratch s("shrink2");
+    const std::size_t ps = 4096;
+    Env e = Env::configure().pageSize(ps).sync(Durability::None).open(s.file());
+    const int fd = ::open(s.file().c_str(), O_RDONLY);
+    CHECK(fd >= 0);
+    std::atomic<bool> stop{false};
+    std::atomic<unsigned> violations{0};
+    std::thread monitor([&] {
+        std::vector<char> buf(ps);
+        while (!stop.load()) {
+            std::uint64_t bestTxn = 0, bestLast = 0;
+            bool any = false;
+            for (unsigned slot = 0; slot < 2; ++slot) {
+                if (::pread(fd, buf.data(), ps, off_t(slot * ps)) != ssize_t(ps))
+                    continue;
+                const auto* p = reinterpret_cast<const Page*>(buf.data());
+                if (p->flags != P_META)
+                    continue;
+                const Meta* m = metaOf(p);
+                if (!metaValid(*m, ps))
+                    continue;
+                if (!any || m->txnid > bestTxn) {
+                    any = true;
+                    bestTxn = m->txnid;
+                    bestLast = m->lastPgno;
+                }
+            }
+            struct stat st;
+            if (any && ::fstat(fd, &st) == 0 && (bestLast + 1) * ps > std::uint64_t(st.st_size))
+                violations.fetch_add(1);
+        }
+    });
+    std::thread writer([&] {
+        for (int round = 0; !stop.load(); ++round) {
+            e.write([&](Txn& t) {
+                for (int i = 0; i < 400; ++i)
+                    t.mainDb().put(tst::keyOf(i, "r"), tst::blob(300, i + round));
+            });
+            e.write([&](Txn& t) {
+                for (int i = 0; i < 400; ++i)
+                    t.mainDb().erase(tst::keyOf(i, "r"));
+            });
+        }
+    });
+    std::vector<std::thread> shrinkers;
+    for (int k = 0; k < 2; ++k)
+        shrinkers.emplace_back([&] {
+            while (!stop.load())
+                e.shrink();
+        });
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+    stop.store(true);
+    for (auto& t : shrinkers)
+        t.join();
+    writer.join();
+    monitor.join();
+    ::close(fd);
+    CHECK_EQ(violations.load(), 0u);
+}
+#endif

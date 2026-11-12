@@ -171,6 +171,9 @@ struct EnvImpl
     /// The commit a sync in flight is making durable (0 when none); guarded by mtx. Until
     /// durableTxn reaches it, no page retired after the durable commit may be reused.
     TxnId syncTarget = 0;
+    /// Held for the whole of Env::shrink(): its truncation size comes from the newest commit and
+    /// assumes no other shrink lowered the frontier since its own sync.
+    std::mutex shrinkMtx;
     unsigned durableSlot = 0;
     /// NoMetaSync and pipelined Safe: a meta written into the mapping but not
     /// flushed. The next data flush carries it to the device; a pipelined one

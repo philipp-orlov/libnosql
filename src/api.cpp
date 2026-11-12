@@ -997,6 +997,7 @@ std::uint64_t Env::shrink()
     EnvImpl* e = &openEnv(impl_);
     if (e->readOnly)
         throw Error(ErrorCode::ReadOnly, "store was opened read-only");
+    std::lock_guard<std::mutex> oneShrink(e->shrinkMtx);
     const std::uint64_t before = os::fileSize(e->fd);
     const std::size_t ps = e->pageSize;
     auto treesOf = [](Txn& txn) {
