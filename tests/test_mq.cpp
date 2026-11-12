@@ -582,3 +582,25 @@ TEST(waitingForEverDoesNotOverflowTheDeadline)
     CHECK_EQ(r.message().body, std::string("late"));
     sender.join();
 }
+
+TEST(oneInvalidMessageDoesNotFailTheOthers)
+{
+    tst::Scratch s("mq");
+    Env e = Env::configure().open(s.file());
+    MessageQueue q = MessageQueue::open(e, "orders");
+    std::atomic<int> failures{0};
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 9; ++i)
+        threads.emplace_back([&, i] {
+            try {
+                q.send("body", i == 4 ? std::string(70000, 'c') : std::string("c"));
+            } catch (const Error& err) {
+                if (err.code() == ErrorCode::InvalidArgument)
+                    ++failures;
+            }
+        });
+    for (auto& t : threads)
+        t.join();
+    CHECK_EQ(failures.load(), 1);
+    CHECK_EQ(q.readyCount(), std::uint64_t(8));
+}

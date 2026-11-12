@@ -220,7 +220,8 @@ PageInfo page(Txn& t, std::uint64_t pgno)
         } else if (std::size_t(p->lower) == kPageHdr + std::size_t(p->nkeys) * 2) {
             for (unsigned n = 0; n < p->nkeys; ++n) {
                 const std::size_t off = slots(p)[n];
-                if (off >= p->upper && off + sizeof(BranchNode) <= ps - kPageChecksumBytes)
+                if (off >= p->upper && off + sizeof(BranchNode) <= ps - kPageChecksumBytes &&
+                    off % alignof(BranchNode) == 0)
                     i.entries += branchCount(p, n);
             }
         }

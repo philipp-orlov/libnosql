@@ -282,6 +282,9 @@ int commandDump(const std::string& path, const DumpOptions& opts)
                 break;
         }
     });
+    // A full disk or a closed pipe is a failure, not a silent short dump.
+    if (std::fflush(stdout) != 0 || std::ferror(stdout))
+        return kStoreError;
     return kOk;
 }
 
@@ -372,7 +375,10 @@ bool parseUnsigned(std::string_view text, std::uint64_t& out)
     for (const char c : text) {
         if (c < '0' || c > '9')
             return false;
-        v = v * 10 + std::uint64_t(c - '0');
+        const std::uint64_t digit = std::uint64_t(c - '0');
+        if (v > (UINT64_MAX - digit) / 10)
+            return false;  // would overflow
+        v = v * 10 + digit;
     }
     out = v;
     return true;

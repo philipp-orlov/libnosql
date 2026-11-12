@@ -72,7 +72,12 @@ int entry(nosql::Cursor& c, bool landed, const void** k, size_t* kl, const void*
     return 0;
 }
 
-nosql::PutMode putMode(int mode) { return static_cast<nosql::PutMode>(mode); }
+nosql::PutMode putMode(int mode)
+{
+    if (mode < 0 || mode > int(nosql::PutMode::Append))
+        throw nosql::Error(nosql::ErrorCode::InvalidArgument, "put mode out of range");
+    return static_cast<nosql::PutMode>(mode);
+}
 
 }  // namespace
 
@@ -90,6 +95,8 @@ int nosql_env_open(const char* path, const nosql_options* o, nosql_env** out)
             if (o->max_size) opts.maxSize(o->max_size);
             if (o->initial_size) opts.initialSize(o->initial_size);
             if (o->max_dbs) opts.maxDbs(o->max_dbs);
+            if (o->durability < 0 || o->durability > 3)
+                throw nosql::Error(nosql::ErrorCode::InvalidArgument, "durability out of range");
             opts.sync(static_cast<nosql::Durability>(o->durability));
             if (o->sync_interval_ms) opts.syncInterval(std::chrono::milliseconds(o->sync_interval_ms));
             opts.readOnly(o->read_only != 0);
@@ -185,6 +192,8 @@ int nosql_txn_nested(nosql_txn* parent, nosql_txn** out)
 
 int nosql_txn_commit(nosql_txn* txn)
 {
+    if (!txn)
+        return guarded([]() -> int { throw nosql::Error(nosql::ErrorCode::InvalidArgument, "null transaction"); });
     int rc = guarded([&] {
         txn->txn.commit();
         return 0;

@@ -376,6 +376,12 @@ Env& MessageQueue::env() const
 std::uint64_t MessageQueue::send(Slice body, std::string_view correlationId)
 {
     Impl& im = *impl_;
+    // Checked here, not at encode time: inside a group-commit batch one bad message would fail the
+    // sends of every other producer in the batch.
+    if (correlationId.size() > 0xffff)
+        throw Error(ErrorCode::InvalidArgument, "correlation id longer than 65535 bytes");
+    if (body.size() > 0xffffffffull)
+        throw Error(ErrorCode::InvalidArgument, "message body larger than 4 GiB");
     std::string blobKey;
     const bool external = im.isExternal(body);
     if (external)
