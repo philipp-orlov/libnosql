@@ -193,6 +193,22 @@ Page* TxnImpl::reuseRun(unsigned npages)
 
 Page* TxnImpl::allocBuffer(PageNo p, std::uint16_t flags, unsigned npages)
 {
+    // The page numbers are already taken. If no buffer can be had for them, hand them back
+    // through `loose` (room is made first, so the handing back cannot itself fail).
+    const std::size_t need = loose.size() + npages;
+    if (loose.capacity() < need)
+        loose.reserve(std::max(need, loose.capacity() * 2));
+    try {
+        return allocBufferRaw(p, flags, npages);
+    } catch (...) {
+        for (unsigned i = 0; i < npages; ++i)
+            loose.push_back(p + i);
+        throw;
+    }
+}
+
+Page* TxnImpl::allocBufferRaw(PageNo p, std::uint16_t flags, unsigned npages)
+{
     Page* buf = nullptr;
     if (npages == 1 && !pool.empty()) {
         // Freed earlier in this same transaction, so it is already in `owned`.

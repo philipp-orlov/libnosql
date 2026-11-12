@@ -303,3 +303,30 @@ TEST(abortedNestedDropInGrandchildLeavesTheSubDatabase)
         checkIntegrity(t);
     });
 }
+
+TEST(failedBufferAllocationReturnsThePageNumbers)
+{
+    tst::Scratch s("nested");
+    Env e = Env::configure().dirtyLimit(1 << 20).open(s.file());
+    e.write([](Txn& t) { t.mainDb().put("a", "1"); });
+    const auto before = e.stats();
+    const std::string big(2 << 20, 'x');
+    e.write([&](Txn& t) {
+        for (int i = 0; i < 3; ++i) {
+            Txn n = t.nested();
+            bool threw = false;
+            try {
+                n.mainDb().put("big", big);
+            } catch (const Error&) {
+                threw = true;
+            }
+            CHECK(threw);
+            n.abort();
+        }
+        checkIntegrity(t);
+    });
+    const auto after = e.stats();
+    // A leak costs a value's worth of pages (512 here) per failure; the free list itself needs a few.
+    CHECK(after.usedPages - after.freePages < before.usedPages - before.freePages + 32);
+    e.read([](Txn& t) { checkIntegrity(t); });
+}

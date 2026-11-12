@@ -76,3 +76,41 @@ int main()
 {
     return tst::runAll("corrupt");
 }
+
+/// A page that checksums but carries another page's number (a misdirected or duplicated write):
+/// reading it must fail, or the writer would retire the wrong page on its next copy.
+TEST(pageHeaderWithTheWrongPageNumberIsRefused)
+{
+    tst::Scratch scratch("corrupt");
+    const auto file = scratch.file();
+    const auto cut = scratch.file("cut.db");
+    const std::size_t pages = tst::corrupt::buildStore(file, false);
+    const std::string image = tst::corrupt::readAll(file);
+    unsigned refused = 0, tried = 0;
+    for (std::size_t page = 3; page < pages; page += 7) {
+        std::string bytes = image;
+        auto* p = reinterpret_cast<internal::Page*>(bytes.data() + page * tst::corrupt::kPage);
+        p->pgno = page - 1;
+        tst::corrupt::reseal(bytes, page);
+        tst::corrupt::writeAll(cut, bytes);
+        ++tried;
+        try {
+            Env env = Env::configure().readOnly().open(cut);
+            env.read([&](Txn& txn) {
+                std::vector<Db> dbs{txn.mainDb()};
+                for (const std::string& name : txn.listDbs())
+                    dbs.push_back(txn.db(name));
+                for (Db& db : dbs)
+                    for (auto [key, value] : db.all()) {
+                        (void)key;
+                        (void)value.size();
+                    }
+            });
+        } catch (const Error& e) {
+            if (e.code() == ErrorCode::Corrupted)
+                ++refused;
+        }
+    }
+    CHECK(tried > 10u);
+    CHECK(refused * 10 >= tried * 9);
+}
