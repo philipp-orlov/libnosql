@@ -545,3 +545,25 @@ int main()
 {
     return tst::runAll("mq");
 }
+
+TEST(staleReceiptFromAnAbortedReceiveSettlesNothing)
+{
+    tst::Scratch s("mq");
+    Env e = Env::configure().open(s.file());
+    MessageQueue q = MessageQueue::open(e, "orders");
+    q.send("work");
+
+    Receipt stale;
+    {
+        Txn t = e.writeTxn();
+        stale = q.receive(t);
+        CHECK(stale.valid());
+        t.abort();
+    }
+    Receipt b = q.tryReceive();
+    CHECK(b.valid());
+    q.ack(std::move(stale));  // the aborted receive's token must not match B's lease
+    CHECK_EQ(q.leasedCount(), std::uint64_t(1));
+    q.nack(std::move(b));
+    CHECK_EQ(q.readyCount(), std::uint64_t(1));
+}

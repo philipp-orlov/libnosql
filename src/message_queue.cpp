@@ -204,9 +204,15 @@ struct MessageQueue::Impl
 
             ++r.deliveryCount;
             const std::string rec = mqEncode(r);
-            const std::uint64_t token = scalar(tr.meta, kNextToken, 1);
+            // The counter lives in the transaction that issues the lease, so an abort rolls it back
+            // and the next delivery would reuse the token of a receipt the caller still holds.
+            // This process-wide floor survives the rollback.
+            static std::atomic<std::uint64_t> lastIssuedToken{0};
+            const std::uint64_t token =
+                std::max(scalar(tr.meta, kNextToken, 1), lastIssuedToken.load() + 1);
             if (token == UINT64_MAX)
                 throw Error(ErrorCode::MapFull, "queue delivery token space exhausted");
+            lastIssuedToken.store(token);
             setScalar(tr.meta, kNextToken, token + 1);
             tr.lease.put(Slice::ref(seqKey(seq)), mqWrapLease(now + leaseNanos(), token, rec));
             tr.ready.erase(Slice::ref(seqKey(seq)));
