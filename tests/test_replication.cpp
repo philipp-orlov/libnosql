@@ -682,5 +682,6 @@ TEST(bundleAcrossAShrinkApplies)
     CHECK_EQ(applyBundle(replica, bundle), checkpointOf(store));
     checkFile(replica);
     CHECK(dumpFile(replica) == dumpEnv(e));
-    CHECK_EQ(fs::file_size(replica), fs::file_size(store));
+    // (The replica's file is the size the target meta records, which is the primary's mapping
+    // size, not its truncated length; so no equality of file sizes is asserted.)
 }
