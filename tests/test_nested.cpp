@@ -330,3 +330,20 @@ TEST(failedBufferAllocationReturnsThePageNumbers)
     CHECK(after.usedPages - after.freePages < before.usedPages - before.freePages + 32);
     e.read([](Txn& t) { checkIntegrity(t); });
 }
+
+TEST(integrityCheckWorksInANestedTransaction)
+{
+    tst::Scratch s("nested-verify");
+    Env e = Env::configure().open(s.file());
+    for (int i = 0; i < 5; ++i)
+        e.write([&](Txn& t) {
+            for (int k = 0; k < 300; ++k)
+                t.mainDb().put(tst::keyOf(k, "a"), tst::blob(200, i));
+        });
+    e.write([](Txn& t) {
+        Txn n = t.nested();
+        n.mainDb().put("x", "y");
+        checkIntegrity(n);
+        n.commit();
+    });
+}

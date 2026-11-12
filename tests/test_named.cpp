@@ -338,3 +338,16 @@ int main()
 {
     return tst::runAll("named");
 }
+
+TEST(updateOnlyMissOnAnEmptyIntegerTreeKeepsTheWidthOpen)
+{
+    tst::Scratch scratch("integer-width-miss");
+    Env env = Env::configure().open(scratch.file());
+    env.write([](Txn& txn) {
+        Db db = txn.db("ints", DbFlags::Create | DbFlags::IntegerKey);
+        const std::uint32_t narrow = 1;
+        const std::uint64_t wide = 256;
+        CHECK(!db.put(Slice::ref(narrow), "x", PutMode::UpdateOnly));
+        CHECK(db.put(Slice::ref(wide), "wide"));  // no width was fixed by the miss
+    });
+}

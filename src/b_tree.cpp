@@ -1614,6 +1614,13 @@ bool treePut(CursorImpl& c, Slice key, Slice value, PutMode mode, WritableSlice*
 
     Tree& tr = c.tree();
     bool exact = false;
+    bool setWidth = false;
+    auto fixWidth = [&] {
+        if (setWidth) {
+            tr.flags |= std::uint32_t(key.size()) << 16;
+            t->markDirty(c.dbi);
+        }
+    };
 
     if ((tr.flags & std::uint32_t(DbFlags::IntegerKey)) != 0) {
         if (key.size() != 4 && key.size() != 8)
@@ -1621,15 +1628,13 @@ bool treePut(CursorImpl& c, Slice key, Slice value, PutMode mode, WritableSlice*
         const unsigned width = tr.flags >> 16;
         if (width && width != key.size())
             throw Error(ErrorCode::InvalidArgument, "mixed integer key widths are not supported");
-        if (!width) {
-            tr.flags |= std::uint32_t(key.size()) << 16;
-            t->markDirty(c.dbi);
-        }
+        setWidth = !width;  // fixed once the put is certain to store the key
     }
 
     if (tr.root == kInvalidPage) {
         if (mode == PutMode::UpdateOnly)
             return false;
+        fixWidth();
         const PageNo np = t->allocPages(1);
         Page* p = t->allocBuffer(np, P_LEAF, 1);
         pageInit(p, np, P_LEAF, ps);
@@ -1664,6 +1669,7 @@ bool treePut(CursorImpl& c, Slice key, Slice value, PutMode mode, WritableSlice*
         if (!rightmost)
             throw Error(ErrorCode::InvalidArgument, "append mode requires strictly ascending keys");
     }
+    fixWidth();
     BreakOnThrow breakOnThrow(t);
     touchPath(c);
 
@@ -1701,7 +1707,7 @@ bool treePut(CursorImpl& c, Slice key, Slice value, PutMode mode, WritableSlice*
                 n->vsize = std::uint32_t(value.size());
                 auto* dst = reinterpret_cast<std::byte*>(ovp) + kPageHdr;
                 if (value.data())
-                    std::memcpy(dst, value.data(), value.size());
+                    std::memmove(dst, value.data(), value.size());  // may alias the old value
                 else
                     std::memset(dst, 0, value.size());
                 std::memset(dst + value.size(), 0, span - value.size());

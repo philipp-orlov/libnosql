@@ -277,7 +277,8 @@ void checkIntegrity(Txn& t)
         if (k.size() != kFreeKeyBytes)
             throw Error(ErrorCode::Corrupted, "invalid free-list key length");
         const TxnImpl::GcKey key(freeKeyTxn(k), freeKeyChunk(k));
-        if (std::find(impl->consumed.begin(), impl->consumed.end(), key) != impl->consumed.end())
+        const auto& consumedKeys = impl->root()->consumed;
+        if (std::find(consumedKeys.begin(), consumedKeys.end(), key) != consumedKeys.end())
             continue;
         std::size_t n = 0;
         if (!forEachFreePage(cursorValue(fc), freeChunkLimit(impl->pageSize()), n,

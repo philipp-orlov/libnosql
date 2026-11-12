@@ -131,3 +131,16 @@ int main()
 {
     return tst::runAll("overflow");
 }
+
+TEST(overwritingAnOverflowValueWithASliceOfItself)
+{
+    tst::Scratch s("overflow-alias");
+    Env e = Env::configure().open(s.file());
+    e.write([](Txn& t) {
+        Db db = t.mainDb();
+        const std::string v = tst::blob(10000, 7);
+        db.put("k", v);
+        db.put("k", db.at("k").subspan(100));
+        CHECK(db.at("k").string() == v.substr(100));
+    });
+}
