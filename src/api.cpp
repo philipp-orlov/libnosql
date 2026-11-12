@@ -30,7 +30,18 @@ TxnImpl* live(TxnImpl* t)
         throw Error(ErrorCode::BadTransaction, "transaction is not usable");
     if (t->child)
         throw Error(ErrorCode::BadTransaction, "a nested transaction is still open");
+    if (t->broken)
+        throw Error(ErrorCode::BadTransaction,
+                    "a write failed part-way through; abort this transaction");
     return t;
+}
+
+void refuseIfBroken(TxnImpl* t)
+{
+    if (t->finished || !t->broken)
+        return;
+    txnAbort(t);
+    throw Error(ErrorCode::BadTransaction, "a write failed part-way through; transaction aborted");
 }
 
 TxnImpl* writable(TxnImpl* t)
@@ -390,6 +401,7 @@ void Txn::commit()
         throw Error(ErrorCode::BadTransaction, "commit the nested transaction first");
     const std::shared_ptr<TxnImpl> held = std::move(impl_);
     const std::shared_ptr<EnvImpl> keep = std::move(env_);
+    refuseIfBroken(held.get());
     if (!held->finished)
         txnCommit(held.get());
 }
@@ -403,6 +415,7 @@ void Txn::commit(std::uint64_t* awaitLater)
         throw Error(ErrorCode::BadTransaction, "commit the nested transaction first");
     const std::shared_ptr<TxnImpl> held = std::move(impl_);
     const std::shared_ptr<EnvImpl> keep = std::move(env_);
+    refuseIfBroken(held.get());
     if (!held->finished) {
         TxnId pending = 0;
         txnCommit(held.get(), &pending);

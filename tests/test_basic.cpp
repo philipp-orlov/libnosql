@@ -226,3 +226,38 @@ int main()
 {
     return tst::runAll("basic");
 }
+
+TEST(failedPutMakesTheTransactionUncommittable)
+{
+    tst::Scratch s("basic");
+    Env e = Env::configure().dirtyLimit(1 << 20).open(s.file());
+    e.write([](Txn& t) {
+        Db d = t.mainDb();
+        for (int i = 0; i < 300; ++i)
+            d.put("key" + std::to_string(i), "value");
+        d.put("precious", "old");
+    });
+    const std::string big(3 << 20, 'x');
+    {
+        Txn t = e.writeTxn();
+        bool threw = false;
+        try {
+            t.mainDb().put("precious", big);  // erases the old value, then cannot allocate
+        } catch (const Error&) {
+            threw = true;
+        }
+        CHECK(threw);
+        bool refused = false;
+        try {
+            t.commit();
+        } catch (const Error& err) {
+            refused = err.code() == ErrorCode::BadTransaction;
+        }
+        CHECK(refused);
+    }
+    e.read([](Txn& t) {
+        CHECK_EQ(t.mainDb().at("precious").string(), std::string("old"));
+        CHECK_EQ(t.mainDb().count(), std::uint64_t(301));
+        checkIntegrity(t);
+    });
+}

@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <vector>
 
 #include <new>
@@ -34,6 +35,21 @@ void throwNodeOutOfRange()
 }
 
 namespace {
+
+/// Marks the transaction unusable if an exception leaves the scope: a throw part-way through
+/// a tree change (after a count was adjusted, before the page was written) leaves the tree
+/// inconsistent, and a caller that catches it must not be able to commit that.
+struct BreakOnThrow
+{
+    TxnImpl* t;
+    int uncaught = std::uncaught_exceptions();
+    explicit BreakOnThrow(TxnImpl* txn) : t(txn) {}
+    ~BreakOnThrow()
+    {
+        if (std::uncaught_exceptions() > uncaught)
+            t->broken = true;
+    }
+};
 
 // ------------------------------------------------------------ page prims ---
 
@@ -1648,6 +1664,7 @@ bool treePut(CursorImpl& c, Slice key, Slice value, PutMode mode, WritableSlice*
         if (!rightmost)
             throw Error(ErrorCode::InvalidArgument, "append mode requires strictly ascending keys");
     }
+    BreakOnThrow breakOnThrow(t);
     touchPath(c);
 
     const bool big = leafNodeSize(key.size(), value.size(), false) > maxNodeSize(ps);
@@ -1791,6 +1808,7 @@ bool treePut(CursorImpl& c, Slice key, Slice value, PutMode mode, WritableSlice*
 void treeDelCurrent(CursorImpl& c)
 {
     TxnImpl* t = c.txn;
+    BreakOnThrow breakOnThrow(t);
     Tree& tr = c.tree();
     touchPath(c);  // idempotent: already-owned pages are left alone
     Page* p = c.pg[c.top];
@@ -1820,6 +1838,7 @@ bool treeDel(CursorImpl& c, Slice key)
         return false;
     if (!c.allowSubdb && (lnode(c.pg[c.top], c.idx[c.top])->flags & N_SUBDB))
         throw Error(ErrorCode::Incompatible, "that key names a sub-database; use Txn::dropDb()");
+    BreakOnThrow breakOnThrow(c.txn);
     touchPath(c);
     treeDelCurrent(c);
     return true;
@@ -2034,6 +2053,7 @@ void freeSubtree(TxnImpl* t, Tree& tr, PageNo pn, int depth = 0)
 
 void treeDrop(TxnImpl* txn, unsigned dbi)
 {
+    BreakOnThrow breakOnThrow(txn);
     Tree& tr = txn->dbs[dbi].tree;
     if (tr.root != kInvalidPage)
         freeSubtree(txn, tr, tr.root);

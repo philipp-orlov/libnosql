@@ -397,6 +397,8 @@ struct TxnImpl
     std::array<RootSlot, 6> savedRoots{};
     bool readOnly = false;
     bool finished = false;
+    /// A tree change threw part-way; the transaction can only be aborted.
+    bool broken = false;
 
     TxnId txnid = 0;
     std::shared_ptr<MappedRegion> region;

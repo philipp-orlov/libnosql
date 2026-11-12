@@ -119,6 +119,7 @@ void TxnImpl::reset()
     env = nullptr;
     readOnly = false;
     finished = false;
+    broken = false;
     txnid = 0;
     lastPgno = 0;
     namedDbs = 0;
