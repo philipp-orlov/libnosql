@@ -55,3 +55,9 @@ if(NOSQL_WITH_BLOB)
 else()
     target_compile_definitions(test_hardening PRIVATE NOSQL_TEST_NO_BLOB=1)
 endif()
+
+# The installed package builds and links for a consumer that finds it with find_package(nosql).
+add_test(NAME installed_consumer
+         COMMAND ${CMAKE_COMMAND} -DBUILD_DIR=${CMAKE_BINARY_DIR} -DSOURCE_DIR=${PROJECT_SOURCE_DIR}
+                 -DWORK_DIR=${CMAKE_BINARY_DIR}/installed-consumer -P ${CMAKE_CURRENT_SOURCE_DIR}/installed_consumer.cmake)
+set_tests_properties(installed_consumer PROPERTIES TIMEOUT 600)

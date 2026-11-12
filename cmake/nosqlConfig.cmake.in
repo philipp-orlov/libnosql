@@ -2,5 +2,6 @@
 
 include(CMakeFindDependencyMacro)
 find_dependency(Threads)
+find_dependency(libcore CONFIG)
 include("${CMAKE_CURRENT_LIST_DIR}/nosql-targets.cmake")
 check_required_components(nosql)

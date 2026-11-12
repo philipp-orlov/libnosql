@@ -4,12 +4,12 @@
 
 libnosql is a C++17 embedded, single-file, copy-on-write B+tree with one writer,
 many snapshot readers, named databases, and nested write transactions. It uses
-no WAL and no third-party libraries or vendored code. Formats 7 and 8 are supported (a store
+no WAL and no third-party libraries or vendored code (it depends on libcore, `core::sys` and `core::base`, the author's own library). Formats 7 and 8 are supported (a store
 reaches format 8 when it first uses `PrefixKeys`); opening any other format fails, including through compaction.
 
 See [format.md](format.md) for persisted bytes, [mq.md](mq.md) for queues,
 [replication.md](replication.md) for shipping, and [limitations.md](limitations.md)
-for operational constraints. [estimates.md](estimates.md) sizes the work.
+for operational constraints.
 
 Blob storage, queues and replication are optional subsystems: `NOSQL_WITH_BLOB`,
 `NOSQL_WITH_MQ` (which needs blob storage) and `NOSQL_WITH_REPLICATION` default to
@@ -62,7 +62,7 @@ APIs unless the requested change requires otherwise.
 
 ## File and Trees
 
-Pages 0 and 1 contain alternating meta records. Each 480-byte record follows a
+Pages 0 and 1 contain alternating meta records. Each 968-byte record follows a
 16-byte page header. It stores free, main and catalog tree roots, store/commit/
 parent identities, allocation geometry, and up to 26 deferred free pages.
 Open checks both meta slots across supported page sizes and chooses the newest
@@ -500,7 +500,7 @@ Inputs up to 240 bytes use portable scalar code everywhere. The long-input loop
 selects a kernel at compile time: six NEON lanes plus two scalar lanes on ARM64,
 SSE2 on x86-64 with an AVX2 variant chosen once at run time on GCC/Clang, and
 portable C++17 otherwise. Every kernel produces the same digest, so files move
-between ARM64 and x86-64 unchanged. There is no third-party checksum implementation.
+between ARM64 and x86-64 unchanged. There is no third-party checksum implementation (the checksum is XXH3-64 from libcore, `core::base`, the author's own library).
 Page/run, meta, blob, bundle, segment and index checks use full 64-bit digests;
 tar header checks retain the additive checksum required by tar.
 
@@ -655,7 +655,7 @@ The README's "Numbers" section carries figures from other machines (an x86 Xeon,
 and two ARM64 cores of a different host); those were not reproduced here and
 are not comparable with the tables above. The six-NEON-plus-two-scalar lane split
 in the checksum kernel was chosen by measurement on those cores (a comment in
-`src/internal/checksum.cpp`), not on this host. The SSE2 and AVX2 kernels are
+`libcore/libbase/src/xxh3.cpp`), not on this host. The SSE2 and AVX2 kernels are
 tested for equal digests but were not run here.
 
 ```sh
@@ -765,7 +765,7 @@ delay.
 `tests/Ubuntu2004.Dockerfile` builds with `-pedantic-errors` on stock Ubuntu 20.04
 (CMake 3.16), runs the tests, installs the package and builds and runs
 `tests/InstalledConsumer` against it. That container check was not re-run for this
-revision. The installed consumer is not a CTest entry. None of this establishes
+revision. None of this establishes
 runtime correctness on any particular board or its vendor kernel.
 
 Run examples in a disposable directory because several create databases/archives in

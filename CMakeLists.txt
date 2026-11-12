@@ -36,8 +36,19 @@ endif()
 # libcore supplies libbase (XXH3-64): a sibling checkout by default, ignored when the including project already
 # provides the target.
 set(NOSQL_LIBCORE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../libcore" CACHE PATH "Path to a libcore checkout")
+# The C interface is a shared library, so everything linked into it, libcore included, must be
+# position independent. Set before libcore's targets are created.
+if(NOSQL_BUILD_C_API)
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
+# An installed libcore wins; otherwise the sibling checkout is built and installed with libnosql.
+if(NOT TARGET core::base)
+    find_package(libcore CONFIG QUIET)
+endif()
 if(NOT TARGET core::base)
     set(CORE_BUILD_TESTS OFF CACHE BOOL "")
+    set(CORE_INSTALL ON CACHE BOOL "Install libcore with libnosql" FORCE)
+    set(CORE_INSTALL_COMPONENTS "base;sys" CACHE STRING "libcore components to install")
     add_subdirectory("${NOSQL_LIBCORE_DIR}" libcore)
 endif()
 
@@ -65,8 +76,7 @@ else()
     target_compile_definitions(nosql PUBLIC NOSQL_NO_REPLICATION=1)
 endif()
 add_library(nosql::nosql ALIAS nosql)
-# Not exported yet: libcore has no install rules, so an installed libnosql needs libcore installed beside it.
-target_link_libraries(nosql PUBLIC $<BUILD_INTERFACE:core::sys> $<BUILD_INTERFACE:core::base>)
+target_link_libraries(nosql PUBLIC core::sys core::base)
 
 target_include_directories(nosql
     PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -119,6 +129,7 @@ if(NOSQL_BUILD_C_API)
         set_tests_properties(csharp_binding PROPERTIES TIMEOUT 300
             ENVIRONMENT "NOSQL_LIBRARY=$<TARGET_FILE:nosql_c>;DOTNET_CLI_TELEMETRY_OPTOUT=1;DOTNET_NOLOGO=1;DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1")
     endif()
+    install(FILES include/nosql/nosql_c.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/nosql)
     install(TARGETS nosql_c LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 endif()
 
@@ -176,7 +187,8 @@ install(TARGETS nosql EXPORT nosql-targets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(DIRECTORY include/nosql DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-    PATTERN "internal" EXCLUDE)
+    PATTERN "internal" EXCLUDE
+    PATTERN "nosql_c.h" EXCLUDE)
 install(EXPORT nosql-targets NAMESPACE nosql:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/nosql)
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/nosqlConfig.cmake
           ${CMAKE_CURRENT_BINARY_DIR}/nosqlConfigVersion.cmake
