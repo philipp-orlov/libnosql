@@ -430,6 +430,23 @@ TEST(pageTableVisitsOnlyLiveEntriesWhateverItsCapacity)
     for (std::size_t i = 1; i < pages.size(); i += 2)
         CHECK(table.find(internal::PageNo(i * 7 + 3)) == &pages[i]);
 
+    {
+        // A table a bulk load grew: three live entries are visited without scanning the capacity.
+        internal::PageTable big;
+        big.reserve(1000000);
+        for (internal::PageNo k : {5, 700000, 123456})
+            big.set(k, &pages[0]);
+        std::size_t seen = 0;
+        big.forEach([&](internal::PageNo, internal::Page*) { ++seen; });
+        CHECK_EQ(seen, std::size_t(3));
+        big.clear();
+        seen = 0;
+        big.forEach([&](internal::PageNo, internal::Page*) { ++seen; });
+        CHECK_EQ(seen, std::size_t(0));
+        big.set(9, &pages[0]);
+        CHECK(big.find(9) == &pages[0]);
+    }
+
     const std::size_t capacity = table.capacity();
     table.clear();
     CHECK(table.empty());
@@ -535,7 +552,7 @@ TEST(pageTableReserveAllocatesOnlyItsFinalBuffers)
         table.reserve(65536);
         measured = counts;
     }
-    CHECK_EQ(measured.heap, 2u);
+    CHECK_EQ(measured.heap, 3u);  // slots, occupancy bitmap, its summary
     CHECK(table.find(7) == &page);
     {
         AllocationProbe probe(true, true);

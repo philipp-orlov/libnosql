@@ -41,7 +41,8 @@ public:
     std::size_t capacity() const noexcept { return slots_.size(); }
     std::size_t retainedBytes() const noexcept
     {
-        return slots_.capacity() * sizeof(Slot) + used_.capacity() * sizeof(std::uint64_t);
+        return slots_.capacity() * sizeof(Slot) + used_.capacity() * sizeof(std::uint64_t) +
+               summary_.capacity() * sizeof(std::uint64_t);
     }
 
     Page* find(PageNo key) const noexcept
@@ -83,6 +84,7 @@ public:
         }
         slots_[i] = Slot{key, val};
         used_[i >> 6] |= std::uint64_t(1) << (i & 63);
+        summary_[i >> 12] |= std::uint64_t(1) << ((i >> 6) & 63);
         ++size_;
     }
 
@@ -126,13 +128,18 @@ public:
     {
         if (size_ == 0)
             return;
-        for (std::size_t w = 0; w < used_.size(); ++w) {
-            std::uint64_t bits = used_[w];
-            while (bits) {
-                const unsigned b = lowestBit(bits);
-                bits &= bits - 1;
-                const Slot& s = slots_[(w << 6) | b];
-                f(s.key, s.val);
+        for (std::size_t sw = 0; sw < summary_.size(); ++sw) {
+            std::uint64_t words = summary_[sw];
+            while (words) {
+                const std::size_t w = (sw << 6) | lowestBit(words);
+                words &= words - 1;
+                std::uint64_t bits = used_[w];
+                while (bits) {
+                    const unsigned b = lowestBit(bits);
+                    bits &= bits - 1;
+                    const Slot& s = slots_[(w << 6) | b];
+                    f(s.key, s.val);
+                }
             }
         }
     }
@@ -159,14 +166,20 @@ public:
     {
         if (size_ == 0)
             return;
-        for (std::size_t w = 0; w < used_.size(); ++w) {
-            std::uint64_t bits = used_[w];
-            while (bits) {
-                const unsigned b = lowestBit(bits);
-                bits &= bits - 1;
-                slots_[(w << 6) | b] = Slot{};
+        for (std::size_t sw = 0; sw < summary_.size(); ++sw) {
+            std::uint64_t words = summary_[sw];
+            while (words) {
+                const std::size_t w = (sw << 6) | lowestBit(words);
+                words &= words - 1;
+                std::uint64_t bits = used_[w];
+                while (bits) {
+                    const unsigned b = lowestBit(bits);
+                    bits &= bits - 1;
+                    slots_[(w << 6) | b] = Slot{};
+                }
+                used_[w] = 0;
             }
-            used_[w] = 0;
+            summary_[sw] = 0;
         }
         size_ = 0;
     }
@@ -176,6 +189,7 @@ public:
     {
         slots_ = std::vector<Slot>();
         used_ = std::vector<std::uint64_t>();
+        summary_ = std::vector<std::uint64_t>();
         mask_ = 0;
         shift_ = 64;
         size_ = 0;
@@ -217,8 +231,10 @@ private:
     {
         std::vector<Slot> old(want);
         std::vector<std::uint64_t> oldUsed(want / 64);
+        std::vector<std::uint64_t> newSummary((want / 64 + 63) / 64);
         old.swap(slots_);
         oldUsed.swap(used_);
+        summary_.swap(newSummary);
         mask_ = want - 1;
         unsigned bits = 0;
         while ((std::size_t(1) << bits) < want)
@@ -238,6 +254,7 @@ private:
 
     std::vector<Slot> slots_;
     std::vector<std::uint64_t> used_;  ///< one bit per slot: occupied
+    std::vector<std::uint64_t> summary_;  ///< one bit per word of used_: that word may be non-zero
     std::size_t mask_ = 0;
     unsigned shift_ = 64;
     std::size_t size_ = 0;
