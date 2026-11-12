@@ -79,7 +79,9 @@ void putOctal(char* dst, std::size_t width, std::uint64_t v)
     dst[width - 1] = '\0';
 }
 
-std::uint64_t parseOctal(const char* src, std::size_t width)
+/// False for anything that is not a plain octal field: a stray byte, or the GNU base-256 form
+/// (first byte has bit 0x80), which this archive never writes.
+bool parseOctal(const char* src, std::size_t width, std::uint64_t& out)
 {
     std::uint64_t v = 0;
     for (std::size_t i = 0; i < width; ++i) {
@@ -87,10 +89,13 @@ std::uint64_t parseOctal(const char* src, std::size_t width)
         if (c == '\0' || c == ' ')
             break;
         if (c < '0' || c > '7')
-            return v;
+            return false;
+        if (v >> 61)
+            return false;  // would overflow
         v = (v << 3) | std::uint64_t(c - '0');
     }
-    return v;
+    out = v;
+    return true;
 }
 
 std::uint32_t headerChecksum(const UstarHeader& h)
@@ -358,10 +363,11 @@ struct BlobStorage::Impl
             internal::os::readAt(fd, off, &h, kBlock);
             if (internal::blockIsZero(h))
                 break;
-            const std::uint32_t want = std::uint32_t(internal::parseOctal(h.chksum, sizeof h.chksum));
-            if (want != internal::headerChecksum(h))
+            std::uint64_t wanted = 0, size = 0;
+            if (!internal::parseOctal(h.chksum, sizeof h.chksum, wanted) ||
+                std::uint32_t(wanted) != internal::headerChecksum(h) ||
+                !internal::parseOctal(h.size, sizeof h.size, size))
                 break;  // torn append or foreign data; treat as the end
-            const std::uint64_t size = internal::parseOctal(h.size, sizeof h.size);
             const std::uint64_t dataAt = off + kBlock;
             if (dataAt + size > end)
                 break;  // payload never made it to disk
@@ -397,11 +403,14 @@ struct BlobStorage::Impl
     /// (or by member name), and moves the high-water mark to the append point.
     /// Header-only, so the payload checksum is unknown. Returns the count.
     std::uint64_t adopt(Txn& t, std::uint64_t from,
-                        const std::function<std::string(std::string_view)>& keyOf)
+                        const std::function<std::string(std::string_view)>& keyOf,
+                        std::uint64_t until = UINT64_MAX)
     {
         Db db = index(t);
         std::uint64_t n = 0;
         scan(from, [&](const TarEntry& e) {
+            if (e.offset - kBlock >= until)
+                return;  // a member the caller indexes itself
             const std::string key = keyOf ? keyOf(e.name) : e.name;
             db.put(key, internal::encodeIndex(e.offset, e.size, 0, e.name, false));
             ++n;
@@ -515,6 +524,7 @@ struct BlobStorage::Writer::State
     std::size_t capacity = 0;
     std::uint64_t bufStart = 0;  ///< archive offset of buf[0]
     bool wrote = false;
+    std::uint64_t startedAt = 0;  ///< where this Writer's first member begins
     bool holdsSlot = false;  ///< owns Impl::writerActive
 
     void claimSlot()
@@ -569,8 +579,8 @@ BlobStorage::Writer BlobStorage::beginWrite()
     Writer w;
     w.st_ = std::make_unique<Writer::State>();
     w.st_->impl = impl_.get();
+    w.st_->claimSlot();  // first: a second Writer on this thread must say Busy, not wait for the slot
     w.st_->owned = impl_->env->writeTxn();
-    w.st_->claimSlot();
     w.st_->txn = &w.st_->owned;
     w.st_->index = impl_->index(w.st_->owned);
     w.st_->capacity = impl_->writeBuffer;
@@ -582,6 +592,8 @@ BlobStorage::Writer BlobStorage::beginWrite(Txn& txn)
 {
     if (impl_->readOnly)
         throw Error(ErrorCode::ReadOnly, "archive was opened read-only");
+    if (impl_->failed.load())
+        throw Error(ErrorCode::BadTransaction, "archive sync failed; close and reopen it");
     if (!txn.valid() || txn.isReadOnly())
         throw Error(ErrorCode::InvalidArgument, "a Writer needs a write transaction");
     if (!txn.belongsTo(*impl_->env))
@@ -603,6 +615,9 @@ void BlobStorage::Writer::add(Slice key, std::string_view name, Slice contents)
         throw Error(ErrorCode::InvalidArgument, "writer has been committed");
     if (name.empty() || name.size() > sizeof(UstarHeader::name))
         throw Error(ErrorCode::InvalidArgument, "member name must be 1..100 bytes");
+    // The ustar size field holds eleven octal digits.
+    if (contents.size() > 077777777777ull)
+        throw Error(ErrorCode::ValueTooLarge, "blob larger than 8 GiB - 1");
     Impl* im = st_->impl;
 
     UstarHeader h;
@@ -619,6 +634,8 @@ void BlobStorage::Writer::add(Slice key, std::string_view name, Slice contents)
     {
         std::lock_guard<std::mutex> lk(im->appendMtx);
         at = im->appendAt;
+        if (!st_->wrote)
+            st_->startedAt = at;
         if (total >= st_->capacity / kDirectDivisor) {
             // Too big to be worth copying: one gathered write straight to the
             // file, behind whatever is already queued ahead of it.
@@ -660,6 +677,11 @@ void BlobStorage::Writer::commit()
         // or a crash could leave the index pointing past the file's end.
         if (im->syncOnAppend)
             im->syncArchive();
+        // Members of an abandoned earlier Writer sit between the mark and this one's first
+        // member: adopt them before the mark moves past them for good.
+        const std::uint64_t mark = im->readIndexedUpTo(*st_->txn);
+        if (mark < st_->startedAt)
+            im->adopt(*st_->txn, mark, {}, st_->startedAt);
         im->writeIndexedUpTo(*st_->txn, im->appendAt);
     }
     if (st_->txn == &st_->owned)
@@ -689,7 +711,7 @@ void BlobStorage::finalize()
     // is byte-for-byte what the tools expect.
     const std::uint64_t padded = internal::roundUp(impl_->appendAt + kMarker, kBlocking);
     internal::os::resizeFile(impl_->fd, padded);
-    static const std::byte zeros[kBlocking] = {};
+    static const std::byte zeros[kBlocking + kMarker] = {};
     internal::os::writeAt(impl_->fd, impl_->appendAt, zeros, std::size_t(padded - impl_->appendAt));
     impl_->syncArchive();
 }

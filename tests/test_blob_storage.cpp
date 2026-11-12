@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
+#include <chrono>
+#include <future>
 #include <cstdio>
 #include <ctime>
 #include <string>
@@ -762,4 +764,74 @@ TEST(readOnlyOpenerOfAStoreWithoutAnIndexSeesNothing)
 int main()
 {
     return tst::runAll("tar");
+}
+
+TEST(abandonedBatchIsAdoptedAfterALaterCommit)
+{
+    tst::Scratch s("tar");
+    Env e = Env::configure().open(s.file());
+    auto tar = BlobStorage::open(e, "images");
+    {
+        auto w = tar.beginWrite();
+        w.add("a", "a.bin", "abandoned");
+    }
+    tar.put("b", "b.bin", "committed");  // moves the indexed mark past the abandoned member
+    tar.catchUp();
+    CHECK(tar.find("a.bin").valid());
+    CHECK_EQ(tar.at("a.bin").data().string(), std::string("abandoned"));
+    CHECK_EQ(tar.at("b").data().string(), std::string("committed"));
+}
+
+TEST(oversizedBlobIsRefusedBeforeAnyWrite)
+{
+    tst::Scratch s("tar");
+    Env e = Env::configure().open(s.file());
+    auto tar = BlobStorage::open(e, "images");
+    const std::uint64_t before = tar.archiveSize();
+    const char byte = 'x';
+    const Slice fake(&byte, 8ull << 30);  // never read: the check fires first
+    auto w = tar.beginWrite();
+    CHECK_THROWS(w.add("big", "big.bin", fake), ErrorCode::ValueTooLarge);
+    w.commit();
+    CHECK_EQ(tar.archiveSize(), before);
+}
+
+TEST(finalizePadsWithZerosAtEveryAlignment)
+{
+    for (std::size_t size = 0; size <= 10240; size += 512) {
+        tst::Scratch s("tar");
+        Env e = Env::configure().open(s.file());
+        auto tar = BlobStorage::open(e, "images");
+        tar.put("k", "k.bin", std::string(size, 'p'));
+        tar.finalize();
+        std::FILE* f = std::fopen(tar.archivePath().string().c_str(), "rb");
+        CHECK(f != nullptr);
+        std::fseek(f, 0, SEEK_END);
+        const long end = std::ftell(f);
+        std::fseek(f, long(tar.archiveSize()), SEEK_SET);
+        for (long i = long(tar.archiveSize()); i < end; ++i)
+            CHECK_EQ(std::fgetc(f), 0);
+        std::fclose(f);
+    }
+}
+
+TEST(secondWriterOnTheSameThreadIsBusyNotAHang)
+{
+    tst::Scratch s("tar");
+    Env e = Env::configure().open(s.file());
+    auto tar = BlobStorage::open(e, "images");
+    auto w = tar.beginWrite();
+    auto outcome = std::async(std::launch::async, [&] {
+        try {
+            auto second = tar.beginWrite();
+        } catch (const Error& err) {
+            return err.code() == ErrorCode::Busy;
+        }
+        return false;
+    });
+    if (outcome.wait_for(std::chrono::seconds(3)) != std::future_status::ready) {
+        CHECK(false);
+        std::_Exit(1);
+    }
+    CHECK(outcome.get());
 }
