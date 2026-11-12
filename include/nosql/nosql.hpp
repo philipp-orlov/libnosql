@@ -745,7 +745,7 @@ public:
     /// its size, and it returns 0.
     std::uint64_t shrink();
     /// As shrink(), but gives up with ErrorCode::Busy when the write slot (or another shrink) is not
-    /// free within `timeout`, for each step that needs it.
+    /// free within `timeout` in total, however many steps it takes.
     std::uint64_t shrink(std::chrono::milliseconds timeout);
 
     /// Make every commit so far durable now. Under Lazy and None this is the

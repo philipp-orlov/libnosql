@@ -1013,14 +1013,21 @@ std::uint64_t Env::shrinkWith(const std::chrono::milliseconds* timeout)
     if (e->readOnly)
         throw Error(ErrorCode::ReadOnly, "store was opened read-only");
     // One shrink at a time; with a timeout, waiting for the other (or for a writer) is bounded.
+    // The timeout bounds the whole call: each step waits for what is left of it.
+    const auto deadline = timeout ? std::chrono::steady_clock::now() + *timeout
+                                  : std::chrono::steady_clock::time_point::max();
+    const auto remaining = [&] {
+        return std::max(std::chrono::milliseconds(0),
+                        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()));
+    };
     std::unique_lock<std::timed_mutex> oneShrink(e->shrinkMtx, std::defer_lock);
     if (timeout) {
-        if (!oneShrink.try_lock_for(*timeout))
+        if (!oneShrink.try_lock_for(remaining()))
             throw Error(ErrorCode::Busy, "another shrink is running");
     } else {
         oneShrink.lock();
     }
-    const auto takeWriter = [&] { return timeout ? writeTxn(*timeout) : writeTxn(); };
+    const auto takeWriter = [&] { return timeout ? writeTxn(remaining()) : writeTxn(); };
     const std::uint64_t before = os::fileSize(e->fd);
     const std::size_t ps = e->pageSize;
     auto treesOf = [](Txn& txn) {
