@@ -168,6 +168,9 @@ struct EnvImpl
     /// into the other slot, so a torn write always leaves this one, and
     /// reclamation never recycles a page this snapshot still names.
     TxnId durableTxn = 0;
+    /// The commit a sync in flight is making durable (0 when none); guarded by mtx. Until
+    /// durableTxn reaches it, no page retired after the durable commit may be reused.
+    TxnId syncTarget = 0;
     unsigned durableSlot = 0;
     /// NoMetaSync and pipelined Safe: a meta written into the mapping but not
     /// flushed. The next data flush carries it to the device; a pipelined one

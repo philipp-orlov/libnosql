@@ -389,3 +389,65 @@ int main()
 {
     return tst::runAll("power");
 }
+
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include "nosql/internal/io_observer.hpp"
+
+/// A sync that has captured commit N and waits in its data flush must keep the pages N names:
+/// later commits retire them, and the next writer may not write new bytes into them.
+TEST(syncInFlightPinsThePagesItIsMakingDurable)
+{
+    using internal::os::IoEvent;
+    using internal::os::ScopedIoObserver;
+    for (Durability mode : {Durability::None, Durability::Lazy}) {
+        tst::Scratch scratch("sync-race");
+        Env env = Env::configure().sync(mode).syncInterval(std::chrono::hours(1)).open(scratch.file());
+        auto fill = [&](int round) {
+            env.write([&](Txn& txn) {
+                Db d = txn.mainDb();
+                for (int i = 0; i < 50; ++i)
+                    d.put("k" + std::to_string(i), "round" + std::to_string(round));
+            });
+        };
+        for (int r = 0; r < 4; ++r)
+            fill(r);
+        const std::string expected = "round3";
+
+        std::mutex mu;
+        std::condition_variable cv;
+        bool atBarrier = false, release = false;
+        std::thread syncer([&] {
+            // Observers are per thread: this one holds the sync in its data flush.
+            ScopedIoObserver hold([&](IoEvent event, std::size_t) {
+                if (event != IoEvent::DataBarrier)
+                    return;
+                std::unique_lock<std::mutex> lk(mu);
+                atBarrier = true;
+                cv.notify_all();
+                cv.wait(lk, [&] { return release; });
+            });
+            env.sync(true);
+        });
+        {
+            std::unique_lock<std::mutex> lk(mu);
+            CHECK(cv.wait_for(lk, std::chrono::seconds(5), [&] { return atBarrier; }));
+        }
+        for (int r = 10; r < 14; ++r)
+            fill(r);
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            release = true;
+        }
+        cv.notify_all();
+        syncer.join();
+        const auto copy = scratch.file("copy.db");
+        std::filesystem::copy_file(scratch.file(), copy);
+        Env crashed = Env::configure().readOnly().open(copy);
+        crashed.read([&](Txn& txn) {
+            checkIntegrity(txn);
+            CHECK_EQ(txn.mainDb().at("k7").string(), expected);
+        });
+    }
+}

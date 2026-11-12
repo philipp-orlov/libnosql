@@ -1342,6 +1342,8 @@ void syncEnv(EnvImpl& e, bool force)
         keep = e.region;  // where the mapping can move, this one stays mapped
         view = e.region->m;
         durable = e.durableTxn;
+        if (e.deferredMeta() && m.txnid > durable)
+            e.syncTarget = m.txnid;
     }
     if (e.deferredMeta()) {
         // A failed flush may have lost pages the in-memory meta names; it

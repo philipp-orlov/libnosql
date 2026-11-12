@@ -259,6 +259,9 @@ Txn Env::beginWriter()
                 t->readersOldest =
                     e->readers.empty() ? newest : std::min<TxnId>(e->readers.front().first, newest);
                 t->exemptEpoch = std::min<TxnId>(e->durableTxn, newest);
+                // A sync beside us is still making a newer commit durable: its pages stay put.
+                if (e->syncTarget > e->durableTxn)
+                    t->readersOldest = t->oldest;
             }
         }
         // Pages handed out under an older durable commit may be named by the
