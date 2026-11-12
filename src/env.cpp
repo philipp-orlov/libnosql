@@ -116,8 +116,10 @@ void syncIfDue(EnvImpl& e) noexcept
         if (e.meta.txnid <= e.durableTxn)
             return;  // nothing waiting
     }
+    // The lock outside the try: `failed` is set while syncMtx is still held, so a writer that
+    // takes the lock next sees it.
+    std::lock_guard<std::mutex> sl(e.syncMtx);
     try {
-        std::lock_guard<std::mutex> sl(e.syncMtx);
         syncEnv(e, false);
     } catch (const Error& err) {
         if (err.code() != ErrorCode::BadTransaction)

@@ -351,3 +351,23 @@ TEST(sharedHandlesReadConcurrentlyAndKeepTheStoreOpen)
 }
 
 int main() { return tst::runAll("hardening"); }
+
+TEST(commitInFlightWhenASyncFailsIsRefused)
+{
+    tst::Scratch scratch("poisoned-commit");
+    Env env = Env::configure().sync(Durability::None).open(scratch.file());
+    for (int i = 0; i < 3; ++i)
+        env.write([&](Txn& txn) { txn.mainDb().put("key", std::to_string(i)); });
+    Txn inFlight = env.writeTxn();
+    inFlight.mainDb().put("key", "late");
+    const auto durable = env.stats().durableTxn;
+    {
+        ScopedIoObserver fault([](IoEvent event, std::size_t) {
+            if (event == IoEvent::Sync)
+                throw Error(ErrorCode::IoError, "injected fsync failure");
+        });
+        CHECK_THROWS(env.sync(true), ErrorCode::IoError);
+    }
+    CHECK_THROWS(inFlight.commit(), ErrorCode::BadTransaction);
+    CHECK_EQ(env.stats().durableTxn, durable);
+}

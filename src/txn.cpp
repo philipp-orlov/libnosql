@@ -1007,6 +1007,9 @@ TxnId writeMeta(TxnImpl* t)
 
     if (e->pipelined) {
         std::lock_guard<std::mutex> sl(e->syncMtx);
+        if (e->failed.load())
+            throw Error(ErrorCode::BadTransaction,
+                        "commit failed; close and reopen the environment");
         // One barrier for this commit's data and for the previous commit's
         // meta, still waiting for one; the runs name that page too, for the
         // platforms that flush by range. Then this meta goes in without a
@@ -1034,6 +1037,9 @@ TxnId writeMeta(TxnImpl* t)
         steadyNs() - e->lastSyncNs.load(std::memory_order_relaxed) >= e->syncIntervalNs;
     if (e->dura == Durability::Safe || e->dura == Durability::NoMetaSync) {
         std::lock_guard<std::mutex> sl(e->syncMtx);
+        if (e->failed.load())
+            throw Error(ErrorCode::BadTransaction,
+                        "commit failed; close and reopen the environment");
         // A barrier, not a hint: it blocks until the data is off every
         // write-back cache in the stack, so the meta write below cannot race
         // it even if the OS, controller or drive reorder writes freely on
@@ -1055,7 +1061,15 @@ TxnId writeMeta(TxnImpl* t)
         publish(*e, t, m);
     } else if (lazyDue) {
         std::lock_guard<std::mutex> sl(e->syncMtx);
-        syncTo(*e, t->region->m, m);
+        if (e->failed.load())
+            throw Error(ErrorCode::BadTransaction,
+                        "commit failed; close and reopen the environment");
+        try {
+            syncTo(*e, t->region->m, m);
+        } catch (...) {
+            e->failed.store(true);
+            throw;
+        }
         publish(*e, t, m);
     } else {
         // Lazy before its interval, and None: the meta lives in memory only.
@@ -1225,6 +1239,12 @@ void txnCommit(TxnImpl* t, TxnId* awaitLater)
         t->parent->child = nullptr;
         finish(t);
         return;
+    }
+    // A sync that failed after this writer began has poisoned the store: its in-memory meta
+    // names pages the kernel may have dropped, and must not be written.
+    if (e->failed.load()) {
+        finishWriter(t);
+        throw Error(ErrorCode::BadTransaction, "commit failed; close and reopen the environment");
     }
 
     // Anything that throws part-way through leaves the store on its previous
