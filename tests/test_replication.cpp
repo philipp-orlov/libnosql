@@ -655,3 +655,32 @@ TEST(staleSegmentsOfALostHistoryAreNeverShipped)
     }
 }
 #endif
+
+TEST(bundleAcrossAShrinkApplies)
+{
+    tst::Scratch dir("repl-shrink");
+    const fs::path store = dir.file(), ship = dir.file("ship");
+    const fs::path replica = dir.file("replica.db"), bundle = dir.file("d.bundle");
+    Env e = Env::configure().sync(Durability::NoMetaSync).shipTo(ship).open(store);
+    put(e, 0, 100);
+    baseImage(e, replica);
+    const Checkpoint at = checkpointOf(replica);
+
+    put(e, 1000, 51000, "bulk");
+    e.write([](Txn& t) {
+        for (std::uint64_t i = 1000; i < 51000; ++i)
+            t.mainDb().erase(tst::keyOf(i));
+    });
+    for (int i = 0; i < 3; ++i)
+        put(e, 200 + i, 201 + i);  // let the erased pages come free
+    const auto big = fs::file_size(store);
+    const auto released = e.shrink();
+    std::printf("    shrink released %llu of %llu bytes\n", (unsigned long long)released, (unsigned long long)big);
+    CHECK(released > 0);
+
+    CHECK(ShipLog(ship).extract(at, bundle) == ShipStatus::Ok);
+    CHECK_EQ(applyBundle(replica, bundle), checkpointOf(store));
+    checkFile(replica);
+    CHECK(dumpFile(replica) == dumpEnv(e));
+    CHECK_EQ(fs::file_size(replica), fs::file_size(store));
+}

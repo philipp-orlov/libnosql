@@ -529,7 +529,16 @@ ShipStatus ShipLog::extract(const Checkpoint& base, const std::filesystem::path&
         h.baseTxnid = base.txnid;
         h.baseMetaChecksum = base.metaChecksum;
         h.targetTxnid = target;
-        h.pageCount = ordered.count();
+        // A shrink inside the range leaves pages above the target's end: not part of the
+        // target store, and applyBundle rejects any page past its lastPgno. Pages are in order.
+        std::uint64_t kept = 0;
+        for (auto [key, value] : ordered.all()) {
+            (void)value;
+            if (internal::readLittle<PageNo>(key.data()) > targetMeta.lastPgno)
+                break;
+            ++kept;
+        }
+        h.pageCount = kept;
 
         internal::BundleIdentity identity{base.storeId, base.commitId};
         os::writeAt(out, sizeof h, &identity, sizeof identity);
@@ -538,7 +547,10 @@ ShipStatus ShipLog::extract(const Checkpoint& base, const std::filesystem::path&
         checksum.update(&h, sizeof h);
         checksum.update(&identity, sizeof identity);
         std::vector<std::byte> image(pageSize);
+        std::uint64_t written = 0;
         for (auto [key, value] : ordered.all()) {
+            if (written++ == kept)
+                break;
             const auto where = value.as<Position>();
             const auto& segment = segs[std::size_t(where.segment)];
             PageRecord rec{};
