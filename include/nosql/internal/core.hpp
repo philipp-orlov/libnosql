@@ -787,7 +787,7 @@ bool cursorLast(CursorImpl& c);
 bool cursorNext(CursorImpl& c);
 bool cursorPrev(CursorImpl& c);
 /// Re-anchor after a mutation if the transaction moved on without us.
-void cursorRevalidate(CursorImpl& c);
+bool cursorRevalidate(CursorImpl& c);
 
 Slice cursorKey(CursorImpl& c);
 /// Leaf `p`'s key `i` whole: in place, or on a leaf with shared bytes

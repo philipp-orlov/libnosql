@@ -1456,19 +1456,20 @@ std::uint64_t cursorRank(CursorImpl& c)
     return rank;
 }
 
-void cursorRevalidate(CursorImpl& c)
+/// True when the entry the cursor stood on is gone and it now sits on that entry's successor.
+bool cursorRevalidate(CursorImpl& c)
 {
     TxnImpl* r = c.txn->root();
     if (c.seqSeen == r->seq)
-        return;
+        return false;
     if (!c.track) {
         c.seqSeen = r->seq;
-        return;
+        return false;
     }
     c.seqSeen = r->seq;
     if (!c.positioned) {
         c.top = -1;
-        return;
+        return false;
     }
     // Swap rather than move: both buffers stay alive, so a cursor that
     // re-anchors on every mutation never touches the allocator again.
@@ -1479,9 +1480,10 @@ void cursorRevalidate(CursorImpl& c)
     if (!treeSearch(c, Slice(key.data(), key.size()), &exact) || !normalizeForward(c)) {
         c.positioned = false;
         c.top = -1;
-        return;
+        return false;
     }
     setAnchor(c);
+    return !exact;
 }
 
 bool cursorFirst(CursorImpl& c)
@@ -1527,9 +1529,11 @@ bool cursorLast(CursorImpl& c)
 
 bool cursorNext(CursorImpl& c)
 {
-    cursorRevalidate(c);
+    const bool onSuccessor = cursorRevalidate(c);
     if (!c.positioned)
         return false;
+    if (onSuccessor)
+        return true;  // the erased entry's successor is already under the cursor
     for (;;) {
         if (c.idx[c.top] + 1u < c.pg[c.top]->nkeys) {
             ++c.idx[c.top];

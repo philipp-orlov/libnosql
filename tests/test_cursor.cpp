@@ -448,3 +448,24 @@ int main()
 {
     return tst::runAll("cursor");
 }
+
+TEST(erasingTheCurrentEntryThroughDbDoesNotSkipTheNext)
+{
+    tst::Scratch s("cursor-erase");
+    Env e = Env::configure().open(s.file());
+    e.write([](Txn& t) {
+        Db d = t.mainDb();
+        for (int i = 0; i < 10; ++i)
+            d.put(tst::keyOf(i), "v");
+        for (auto [k, v] : d.all())
+            d.erase(k.string());
+        CHECK_EQ(d.count(), std::uint64_t(0));
+        for (int i = 0; i < 10; ++i)
+            d.put(tst::keyOf(i), "v");
+        Cursor c = d.cursor();
+        CHECK(c.first());
+        d.erase(c.key());
+        CHECK(c.next());
+        CHECK(c.key().string() == tst::keyOf(1));
+    });
+}
