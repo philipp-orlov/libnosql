@@ -234,10 +234,10 @@ default, so `nosql::Env store("app.db")` works too.
 | `preallocate(b)` | on | `fallocate` when the file grows, so a full disk is an `IoError` at growth instead of a fault later; the file then occupies its whole size on disk. |
 | `allowNetworkFilesystem(b)` | off | NFS, SMB, FUSE and similar are refused with `ErrorCode::Unsupported` (Linux): `flock` is not dependable there and remote truncation arrives as SIGBUS. |
 | `sync(Durability)` | `Durability::Safe` | see below. |
-| `sealedCommits(b)` | off | under `Safe`, one device flush per commit instead of two: the meta page lists the pages the commit wrote, and a store being opened takes it only if they are all there. About half the commit latency; raises the store to format 9. See `docs/design.md`, "Sealed commits". |
+| `sealedCommits(b)` | on | under `Safe`, one device flush per commit instead of two: the meta page lists the pages the commit wrote, and a store being opened takes it only if they are all there. About half the commit latency; raises the store to format 9. Off: two flushes, as before. See `docs/design.md`, "Sealed commits". |
 | `syncInterval(d)` | 1 second | under `Durability::Lazy`, the first commit this long after the last sync runs the next one; zero syncs every commit. |
 | `cacheReadChecksums(b)` | off | let readers trust a page check this process already made; see the integrity tradeoff below. |
-| `writerUsesReadCache(b)` | off | with `cacheReadChecksums()`, let a write transaction's reads trust those checks too; what it copies forward is still verified. |
+| `writerUsesReadCache(b)` | on | with `cacheReadChecksums()`, a write transaction's reads trust those checks too; what it copies forward is still verified. Off: a write transaction verifies every page it reads. |
 | `revalidateAfter(d)` | 1 minute | how long a cached page check may be trusted; zero means for ever. |
 | `bufferCache(n)` | 32 MiB | page buffers kept recycled between transactions. |
 | `dirtyLimit(n)` | 256 MiB | active dirty page buffers; a transaction past it spills pages to the file early; zero disables. |
@@ -256,9 +256,9 @@ publishes them, so a check made by any read transaction stays good for every
 later one, on every thread, until the page really changes. What the cache cannot
 see is the file changing underneath the process -- a media or memory fault --
 so every remembered check is dropped after `revalidateAfter()` (default one
-minute), and `Env::invalidateReadCache()` drops them on demand. Write
-transactions and `checkIntegrity(txn)` always verify. With `writerUsesReadCache()`
-as well, a write transaction's gets, seeks and scans trust the remembered checks
+minute), and `Env::invalidateReadCache()` drops them on demand.
+`checkIntegrity(txn)` always verifies. With `writerUsesReadCache()`, which is on
+unless turned off, a write transaction's gets, seeks and scans trust the remembered checks
 like a reader's (200,000 random gets over 500,000 entries: 865 ns each in a
 write transaction without it, 430 ns with it, the same as in a read
 transaction), and it verifies instead at the points where bytes would enter the

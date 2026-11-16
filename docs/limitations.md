@@ -184,7 +184,7 @@ strike against it; libsql adds one on top), the storage-engine-level gaps are re
   checkpoint, decoupled from commit latency. Skewed hot-key writes or large
   multi-row transactions cost structurally more here.
 * **A sealed commit that is damaged afterwards is lost quietly.** With
-  `sealedCommits()` a store being opened takes its newest commit only if every page that
+  `sealedCommits()`, the default, a store being opened takes its newest commit only if every page that
   commit wrote is in the file and matches its checksum; that is how a commit cut short by a
   power failure is told. A page of the newest commit damaged later looks the same, so the
   store opens on the commit before and reports the one it passed over in
@@ -198,7 +198,7 @@ strike against it; libsql adds one on top), the storage-engine-level gaps are re
   dropped every `revalidateAfter()` interval. External corruption after a check
   may be missed until that interval passes or `checkIntegrity` runs. The bitmap
   covers `maxSize` up to 4 MiB of bits; higher pages, writes, and explicit
-  integrity checks always use strict validation. `writerUsesReadCache()` extends the
+  integrity checks always use strict validation. `writerUsesReadCache()`, on by default, extends the
   cache to what a write transaction only reads; pages it copies forward are still verified.
   Large overflow values preserve contiguous slices by placing one checksum at
   the end of the run; an uncached read verifies the full run, not only the requested bytes.

@@ -676,7 +676,8 @@ TEST(sealedCommitsFlushOnceWhereTheManifestFits)
         CHECK_EQ(plain.data, 1u);
         CHECK_EQ(plain.meta, 1u);
     }
-    CHECK_EQ(internal::metaVersion(newestMetaOf(s.file(), 4096)), internal::kOldestFormatVersion);
+    // Not raised to format 9 (7, or 8 where the build's trees are prefix-compressed).
+    CHECK(internal::metaVersion(newestMetaOf(s.file(), 4096)) < internal::kFormatSealed);
     {
         Env e = Env::configure().sealedCommits().open(s.file());
         for (int i = 1; i < 6; ++i) {
@@ -712,8 +713,7 @@ TEST(sealedCommitsFlushOnceWhereTheManifestFits)
         Env lazy = Env::configure().sealedCommits().sync(Durability::NoMetaSync).open(other.file());
         barriersOf(lazy, 5, 0);
         lazy.close();
-        CHECK_EQ(internal::metaVersion(newestMetaOf(other.file(), 4096)),
-                 internal::kOldestFormatVersion);
+        CHECK(internal::metaVersion(newestMetaOf(other.file(), 4096)) < internal::kFormatSealed);
         Env piped = Env::configure().sealedCommits().pipelineCommits().open(other.file());
         barriersOf(piped, 5, 1);
         piped.close();
@@ -726,8 +726,7 @@ TEST(sealedCommitsFlushOnceWhereTheManifestFits)
         const Barriers b = barriersOf(e, 5, 0);
         CHECK_EQ(b.meta, 1u);
         e.close();
-        CHECK_EQ(internal::metaVersion(newestMetaOf(small.file(), 1024)),
-                 internal::kOldestFormatVersion);
+        CHECK(internal::metaVersion(newestMetaOf(small.file(), 1024)) < internal::kFormatSealed);
     }
 }
 

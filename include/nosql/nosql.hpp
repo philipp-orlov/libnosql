@@ -29,15 +29,16 @@
 /// The default of Env::Options::pipelineCommits(). A build can turn it on for
 /// every store (CMake option NOSQL_PIPELINE_COMMITS_DEFAULT), which is how the
 /// whole test suite runs pipelined.
-/// Whether Env::Options::writerUsesReadCache() defaults to on (CMake option
-/// NOSQL_WRITER_CACHE_DEFAULT); it takes effect on stores opened with cacheReadChecksums().
+/// The default of Env::Options::writerUsesReadCache(): on. It takes effect on stores
+/// opened with cacheReadChecksums(). A build can turn it off (CMake option
+/// NOSQL_WRITER_CACHE_DEFAULT=OFF), for running the suite the other way.
 #ifndef NOSQL_WRITER_CACHE_DEFAULT
-#define NOSQL_WRITER_CACHE_DEFAULT 0
+#define NOSQL_WRITER_CACHE_DEFAULT 1
 #endif
-/// Whether Env::Options::sealedCommits() defaults to on (CMake option
-/// NOSQL_SEALED_COMMITS_DEFAULT), for running the suite that way.
+/// The default of Env::Options::sealedCommits(): on. A build can turn it off (CMake
+/// option NOSQL_SEALED_COMMITS_DEFAULT=OFF), for running the suite the other way.
 #ifndef NOSQL_SEALED_COMMITS_DEFAULT
-#define NOSQL_SEALED_COMMITS_DEFAULT 0
+#define NOSQL_SEALED_COMMITS_DEFAULT 1
 #endif
 #ifndef NOSQL_PIPELINE_COMMITS_DEFAULT
 #define NOSQL_PIPELINE_COMMITS_DEFAULT 0
@@ -576,7 +577,8 @@ public:
         /// since. Either way it opens on the commit before and says so in
         /// EnvStats::rolledBackTxn, where without this option the damaged page would
         /// be reported as ErrorCode::Corrupted when it is read. Only the newest commit
-        /// is ever in question. Off by default.
+        /// is ever in question. On by default; sealedCommits(false) keeps the two
+        /// flushes and the store at the format it has.
         Options& sealedCommits(bool on = true)
         {
             sealedCommits_ = on;
@@ -625,8 +627,8 @@ public:
         /// every reader for the life of the environment. What it cannot see is
         /// the file changing underneath the process -- media or memory faults
         /// -- so every remembered check is dropped after `revalidateAfter()`.
-        /// Off by default: then every access verifies. Writers always verify,
-        /// unless writerUsesReadCache() is set as well.
+        /// Off by default: then every access verifies. With it on, a write
+        /// transaction's reads use the cache too unless writerUsesReadCache(false).
         Options& cacheReadChecksums(bool on = true)
         {
             cacheReadChecksums_ = on;
@@ -639,7 +641,7 @@ public:
         /// checked at the moment it is copied forward, and an overflow run when it is
         /// moved or released, so damage is never sealed under a new checksum. What the
         /// option gives up is the check on bytes the writer hands to the caller, exactly
-        /// as cacheReadChecksums() does for readers. Off by default, and without effect
+        /// as cacheReadChecksums() does for readers. On by default, and without effect
         /// unless cacheReadChecksums() is on.
         Options& writerUsesReadCache(bool on = true)
         {

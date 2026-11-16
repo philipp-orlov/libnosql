@@ -2,7 +2,9 @@
 # address+undefined sanitizer build and a thread sanitizer build, and the
 # Release and thread sanitizer builds again with every store's commits pipelined
 # (NOSQL_PIPELINE_COMMITS_DEFAULT), since that path is opt-in, and a Release
-# build with every byte-ordered tree prefix-compressed (NOSQL_PREFIX_KEYS_DEFAULT),
+# build with every byte-ordered tree prefix-compressed (NOSQL_PREFIX_KEYS_DEFAULT)
+# and with sealedCommits() and writerUsesReadCache() defaulting to off, the paths
+# the other builds no longer take by default,
 # an MSVC build on Windows, and a short run of each libFuzzer target.
 name: ci
 
@@ -117,6 +119,7 @@ jobs:
         run: >-
           cmake -DNOSQL_LIBCORE_DIR=${{ github.workspace }}/libcore -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           -DNOSQL_PREFIX_KEYS_DEFAULT=ON
+          -DNOSQL_SEALED_COMMITS_DEFAULT=OFF -DNOSQL_WRITER_CACHE_DEFAULT=OFF
       - name: Build
         run: cmake --build build
       - name: Test

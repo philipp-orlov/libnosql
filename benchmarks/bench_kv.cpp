@@ -299,20 +299,20 @@ int main(int argc, char** argv)
             round += txns;
         });
         const std::uint64_t durable = 200;
-        report.run("commit 1 put (fsync, Safe)", durable, 0, std::min(c.reps, 2), [&] {
+        report.run("commit 1 put (fsync, Safe, two flushes)", durable, 0, std::min(c.reps, 2), [&] {
             Env safe = Env::configure()
                            .pageSize(c.pageSize)
                            .sync(Durability::Safe)
+                           .sealedCommits(false)
                            .open(scratch.file("durable.db"));
             for (std::uint64_t t = 0; t < durable; ++t)
                 safe.write([&](Txn& tx) { tx.mainDb().put(keys[(round + t) % n], value); });
             round += durable;
         });
-        report.run("commit 1 put (fsync, Safe, sealed)", durable, 0, std::min(c.reps, 2), [&] {
+        report.run("commit 1 put (fsync, Safe)", durable, 0, std::min(c.reps, 2), [&] {
             Env safe = Env::configure()
                            .pageSize(c.pageSize)
                            .sync(Durability::Safe)
-                           .sealedCommits()
                            .open(scratch.file("sealed.db"));
             for (std::uint64_t t = 0; t < durable; ++t)
                 safe.write([&](Txn& tx) { tx.mainDb().put(keys[(round + t) % n], value); });

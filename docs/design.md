@@ -402,7 +402,7 @@ overwritten, so a torn newest meta falls back to it.
 ### Sealed commits: `Safe` with `sealedCommits()`
 
 Everything above orders the meta after the data with a flush between them, so a `Safe` commit
-costs two device flushes. `Env::Options::sealedCommits()` makes it one, still without a log:
+costs two device flushes. `Env::Options::sealedCommits()`, on by default, makes it one, still without a log:
 the commit writes its pages and its meta page and flushes once. The device may then hold the
 meta without some of the pages, so this is detected where the two-flush order prevents it:
 
@@ -658,7 +658,7 @@ covering pages actually checked become resident, and a reset clears only up to
 the highest word ever set rather than the whole bitmap. Overflow runs cache only their starting page after checking the whole run.
 Failed validation never populates the cache.
 
-A write transaction ignores the cache unless `writerUsesReadCache()` is also set. Then its
+A write transaction ignores the cache under `writerUsesReadCache(false)`. By default it uses it: its
 descents (`TxnImpl::getPage`) trust and set the bits like a reader's, and the verification
 moves to where committed bytes enter the next snapshot: `verifyBeforeCopy` in `touchLevel` and
 in the rebalance that copies a sibling, and `getPageForWrite` (or a forced `getOverflow`)
