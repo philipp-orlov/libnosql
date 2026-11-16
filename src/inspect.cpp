@@ -127,7 +127,7 @@ std::vector<MetaInfo> metas(Txn& t)
         MetaInfo i;
         i.slot = slot;
         i.valid = metaValid(m, 0);
-        i.version = m.version;
+        i.version = metaVersion(m);
         i.pageSize = m.pageSize;
         i.txnid = m.txnid;
         i.lastPgno = m.lastPgno;

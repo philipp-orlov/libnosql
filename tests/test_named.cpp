@@ -247,7 +247,8 @@ TEST(integrityDiscoversUnopenedNamedTrees)
 {
     tst::Scratch scratch("unopened-tree");
     {
-        Env env = Env::configure().open(scratch.file());
+        // Not sealed: a sealed commit with a damaged page is passed over at open.
+        Env env = Env::configure().sealedCommits(false).open(scratch.file());
         env.write([](Txn& txn) { txn.db("hidden", DbFlags::Create).put("key", "value"); });
     }
     std::fstream file(scratch.file(), std::ios::in | std::ios::out | std::ios::binary);

@@ -5,7 +5,7 @@ A single-file, embedded, ACID key/value store in C++17.
 **Format 7:** little-endian metadata, in-tree XXH3-64 page/run checksums, a separate database catalog,
 persistent identities, deferred free-page state, a free list kept in leaf-sized chunks, entry counts
 in every branch slot, and a meta page that carries a small free-list entry and the roots of recently
-written sub-databases. Pages are 1 KiB to 64 KiB. Formats 7 and 8 are supported (a store moves to format 8 when it first uses `PrefixKeys`); any other file is rejected
+written sub-databases. Pages are 1 KiB to 64 KiB. Formats 7 to 9 are supported (a store moves to format 8 when it first uses `PrefixKeys`, to 9 with its first sealed commit); any other file is rejected
 as incompatible rather than misread (replication bundles and segments moved to version 6 with it).
 `nosql compact source.db compacted.db` builds a separate compacted store;
 archives must be handled separately and physical replication restarts from a new base.
@@ -234,6 +234,7 @@ default, so `nosql::Env store("app.db")` works too.
 | `preallocate(b)` | on | `fallocate` when the file grows, so a full disk is an `IoError` at growth instead of a fault later; the file then occupies its whole size on disk. |
 | `allowNetworkFilesystem(b)` | off | NFS, SMB, FUSE and similar are refused with `ErrorCode::Unsupported` (Linux): `flock` is not dependable there and remote truncation arrives as SIGBUS. |
 | `sync(Durability)` | `Durability::Safe` | see below. |
+| `sealedCommits(b)` | off | under `Safe`, one device flush per commit instead of two: the meta page lists the pages the commit wrote, and a store being opened takes it only if they are all there. About half the commit latency; raises the store to format 9. See `docs/design.md`, "Sealed commits". |
 | `syncInterval(d)` | 1 second | under `Durability::Lazy`, the first commit this long after the last sync runs the next one; zero syncs every commit. |
 | `cacheReadChecksums(b)` | off | let readers trust a page check this process already made; see the integrity tradeoff below. |
 | `writerUsesReadCache(b)` | off | with `cacheReadChecksums()`, let a write transaction's reads trust those checks too; what it copies forward is still verified. |

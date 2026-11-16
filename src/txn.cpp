@@ -61,6 +61,7 @@ void TxnImpl::releaseResources()
     flushList.clear();
     flushRuns.clear();
     flushSpans.clear();
+    manifest.clear();
     gcKeys.clear();
     gcAdd.clear();
     gcAcc.clear();
@@ -92,6 +93,7 @@ void TxnImpl::releaseResources()
     trim(flushList);
     trim(flushRuns);
     trim(flushSpans);
+    trim(manifest);
     trim(gcKeys);
     trim(gcAdd);
     trim(gcAcc);
@@ -607,7 +609,7 @@ void updateFreelist(TxnImpl* t)
     freed.clear();
     const std::size_t chunkPages = freeChunkPages(t->pageSize());
     // Runs only where every build that opens the store reads them.
-    const bool runs = t->meta.version >= kFormatVersion || t->prefixFormat;
+    const bool runs = metaVersion(t->meta) >= kFormatPrefix || t->prefixFormat;
     std::size_t written = 0;  ///< chunks currently recorded under our id
     constexpr int kMaxRounds = 8;
     // At most this many of our retired pages go inline, leaving room in the
@@ -815,10 +817,30 @@ void writePages(TxnImpl* t)
         spans.clear();
     };
     bool runSpilled = false;
+    // What a sealed commit's meta page lists: each page or run with its trailer.
+    std::vector<ManifestEntry>& manifest = t->manifest;
+    manifest.clear();
+    t->manifestFits = e->sealed;
+    const auto list = [&](PageNo p, unsigned n, const std::byte* bytes) {
+        if (!t->manifestFits)
+            return;
+        if (n > kManifestRunMax || manifest.size() >= manifestCapacity(ps)) {
+            t->manifestFits = false;  // this commit flushes twice
+            return;
+        }
+        ManifestEntry entry;
+        entry.run = p | (std::uint64_t(n) << 48);
+        entry.checksum =
+            readLittle<std::uint64_t>(bytes + std::size_t(n) * ps - kPageChecksumBytes);
+        manifest.push_back(entry);
+    };
+    if (e->sealed && manifest.capacity() < manifestCapacity(ps))
+        manifest.reserve(manifestCapacity(ps));
     for (const auto& [p, buf] : ids) {
         if (!buf) {
             const Page* written = e->mapPage(*t->region, p);
             const unsigned n = isOverflow(written) ? ovPages(written) : 1u;
+            list(p, n, reinterpret_cast<const std::byte*>(written));
             e->validation.invalidate(p, n);
             if (!runs.empty() && runs.back().second + 1 == p &&
                 (kWriteThroughMapping || runSpilled)) {
@@ -832,6 +854,7 @@ void writePages(TxnImpl* t)
             continue;
         }
         const unsigned n = sealForFile(buf, ps);
+        list(p, n, reinterpret_cast<const std::byte*>(buf));
         // Before the meta that publishes these bytes: a reader that can see
         // them must find them unverified.
         e->validation.invalidate(p, n);
@@ -862,13 +885,25 @@ std::int64_t steadyNs() noexcept { return steadyNowNs(); }
 
 /// Writes `m` into the meta slot that does not hold the newest durable meta,
 /// so a torn write leaves that one in charge. Caller holds syncMtx.
-unsigned storeMeta(EnvImpl& e, const os::Mapping& view, const Meta& m)
+unsigned storeMeta(EnvImpl& e, const os::Mapping& view, const Meta& m,
+                   const std::vector<ManifestEntry>* manifest = nullptr)
 {
     const unsigned slot = 1u - e.durableSlot;
     Page* mp = reinterpret_cast<Page*>(view.base + slot * e.pageSize);
     mp->pgno = slot;
     mp->flags = P_META;
     mp->nkeys = 0;
+    if (manifest) {
+        // A sealed meta: the list of what the commit wrote goes in after the record.
+        // Whatever part of the page reaches the device, the record counts only with
+        // a manifest that carries its checksum (sealedMetaLanded).
+        std::byte* at = reinterpret_cast<std::byte*>(mp) + kManifestOffset;
+        ManifestHeader h;
+        sealManifest(h, m, manifest->data(), manifest->size());
+        if (!manifest->empty())
+            std::memcpy(at + sizeof h, manifest->data(), manifest->size() * sizeof(ManifestEntry));
+        std::memcpy(at, &h, sizeof h);
+    }
     *metaOf(mp) = m;
     os::recordMappedWrite(e.fd, std::uint64_t(slot) * e.pageSize, mp, e.pageSize);
     return slot;
@@ -988,9 +1023,17 @@ TxnId writeMeta(TxnImpl* t)
     EnvImpl* e = t->env;
     Meta m = t->meta;
     std::memcpy(m.magic, kMagic, sizeof m.magic);
-    // A store's version only rises: to 8 when it first holds P_PREFIX leaves.
-    m.version =
-        std::max<std::uint32_t>(m.version, t->prefixFormat ? kFormatVersion : kOldestFormatVersion);
+    // One device flush instead of two: the meta page goes out with the data it names
+    // and lists that data, so that a meta the device kept without all of it is found
+    // out when the store is opened. Only where this commit's pages fit the list.
+    const bool seal = e->sealed && t->manifestFits && !e->pipelined && e->dura == Durability::Safe;
+    // A store's version only rises: to 8 when it first holds P_PREFIX leaves, to 9
+    // with its first sealed commit. The sealed bit is this meta's alone.
+    std::uint32_t version = std::max<std::uint32_t>(
+        metaVersion(m), t->prefixFormat ? kFormatPrefix : kOldestFormatVersion);
+    if (seal)
+        version = kFormatSealed | kMetaSealed;
+    m.version = version;
     m.pageSize = std::uint32_t(e->pageSize);
     m.txnid = t->txnid;
     m.lastPgno = t->lastPgno;
@@ -1065,6 +1108,31 @@ TxnId writeMeta(TxnImpl* t)
         if (e->failed.load())
             throw Error(ErrorCode::BadTransaction,
                         "commit failed; close and reopen the environment");
+        if (seal) {
+            // Meta and data under one barrier. Nothing this commit wrote is a page
+            // the durable snapshot names, and the meta goes into the slot that does
+            // not hold that snapshot's, so whatever part of it all the device keeps,
+            // the store opens on this commit or on the one before.
+            // What the slot holds goes back if the flush fails: a commit that reports
+            // failure must not be the one a reopened store shows.
+            const unsigned slot = 1u - e->durableSlot;
+            std::byte* page = t->region->m.base + std::size_t(slot) * e->pageSize;
+            std::memcpy(e->metaUndo.data(), page, e->pageSize);
+            assignGrowing(e->syncRuns, t->flushRuns.begin(), t->flushRuns.end());
+            e->syncRuns.insert(e->syncRuns.begin(), {slot, slot});
+            storeMeta(*e, t->region->m, m, &t->manifest);
+            try {
+                os::flushData(e->fd, t->region->m, e->syncRuns, e->pageSize);
+            } catch (...) {
+                std::memcpy(page, e->metaUndo.data(), e->pageSize);
+                os::recordMappedWrite(e->fd, std::uint64_t(slot) * e->pageSize, page, e->pageSize);
+                throw;
+            }
+            markDurable(*e, m.txnid, slot);
+            publish(*e, t, m);
+            e->commitCv.notify_all();
+            return 0;
+        }
         // A barrier, not a hint: it blocks until the data is off every
         // write-back cache in the stack, so the meta write below cannot race
         // it even if the OS, controller or drive reorder writes freely on

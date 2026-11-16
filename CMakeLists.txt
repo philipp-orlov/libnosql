@@ -14,6 +14,8 @@ option(NOSQL_PIPELINE_COMMITS_DEFAULT
        "Make Env::Options::pipelineCommits() default to on (the suite runs this way in CI)" OFF)
 option(NOSQL_WRITER_CACHE_DEFAULT
        "Make Env::Options::writerUsesReadCache() default to on (for running the suite that way)" OFF)
+option(NOSQL_SEALED_COMMITS_DEFAULT
+       "Make Env::Options::sealedCommits() default to on (for running the suite that way)" OFF)
 option(NOSQL_BUILD_C_API "Build libnosql_c, the C interface (include/nosql/nosql_c.h) the C# binding loads" OFF)
 option(NOSQL_BUILD_FUZZERS "Build the libFuzzer targets in fuzz/ (clang only)" OFF)
 option(NOSQL_PREFIX_KEYS_DEFAULT
@@ -109,6 +111,9 @@ if(NOSQL_PIPELINE_COMMITS_DEFAULT)
 endif()
 if(NOSQL_WRITER_CACHE_DEFAULT)
     target_compile_definitions(nosql PUBLIC NOSQL_WRITER_CACHE_DEFAULT=1)
+endif()
+if(NOSQL_SEALED_COMMITS_DEFAULT)
+    target_compile_definitions(nosql PUBLIC NOSQL_SEALED_COMMITS_DEFAULT=1)
 endif()
 if(NOSQL_PREFIX_KEYS_DEFAULT)
     target_compile_definitions(nosql PUBLIC NOSQL_PREFIX_KEYS_DEFAULT=1)

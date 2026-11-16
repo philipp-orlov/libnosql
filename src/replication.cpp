@@ -46,11 +46,28 @@ std::string describe(const Checkpoint& c)
 /// takes no lock: a concurrent commit can only make us see the older of the
 /// two slots, which is a consistent snapshot by construction, and a torn slot
 /// fails its own checksum.
+Meta readNewestMeta(os::FileHandle fd, const std::filesystem::path& what);
+
+/// Writes meta record `m` into `slot` of a store file being built, whose pages are all
+/// written and flushed before it is put in place. A sealed record is copied as it is,
+/// so that its checksum stays the one checkpoints name; it gets a manifest that lists
+/// nothing, which is all the record needs to count here.
+void writeMetaRecord(os::FileHandle file, unsigned slot, std::size_t ps, const Meta& m)
+{
+    os::writeAt(file, std::uint64_t(slot) * ps + kPageHdr, &m, sizeof m);
+    if (!internal::metaSealed(m))
+        return;
+    internal::ManifestHeader h;
+    internal::sealManifest(h, m, nullptr, 0);
+    os::writeAt(file, std::uint64_t(slot) * ps + internal::kManifestOffset, &h, sizeof h);
+}
+
 Meta readNewestMeta(os::FileHandle fd, const std::filesystem::path& what)
 {
     const std::uint64_t bytes = os::fileSize(fd);
     Meta best{};
     bool have = false;
+    std::vector<std::byte> scratch;
     for (std::uint64_t ps = kMinPageSize; ps <= kMaxPageSize; ps *= 2) {
         for (unsigned slot = 0; slot < 2; ++slot) {
             const std::uint64_t off = std::uint64_t(slot) * ps + kPageHdr;
@@ -59,6 +76,18 @@ Meta readNewestMeta(os::FileHandle fd, const std::filesystem::path& what)
             Meta m{};
             os::readAt(fd, off, &m, sizeof m);
             if (m.pageSize != ps || !metaValid(m, ps))
+                continue;
+            // A sealed commit's meta counts only with the pages it lists (format.hpp).
+            if (internal::metaSealed(m) &&
+                !internal::sealedMetaLanded(
+                    m, slot, bytes,
+                    [&](std::uint64_t at, void* out, std::size_t n) {
+                        if (at + n > bytes)
+                            throw Error(ErrorCode::Corrupted,
+                                        "sealed meta lists a page outside " + what.string());
+                        os::readAt(fd, at, out, n);
+                    },
+                    scratch))
                 continue;
             if (!have || m.txnid > best.txnid) {
                 best = m;
@@ -219,7 +248,7 @@ void copySnapshot(Txn& txn, const std::filesystem::path& dst)
         // newer one on the source whose pages we did not copy, and formatStore
         // already establishes that two identical slots are a valid store.
         for (unsigned slot = 0; slot < 2; ++slot)
-            os::writeAt(file, std::uint64_t(slot) * ps + kPageHdr, &m, sizeof m);
+            writeMetaRecord(file, slot, ps, m);
     }
     out.publish(/*replace=*/false);
 }
@@ -304,8 +333,7 @@ Checkpoint applyBundle(const std::filesystem::path& store, const std::filesystem
     if (checksum.digest() != scan.header.payloadChecksum)
         throw Error(ErrorCode::Corrupted, "bundle changed during apply");
     for (unsigned slot = 0; slot < 2; ++slot)
-        os::writeAt(replacement.fd(), std::uint64_t(slot) * ps + kPageHdr,
-                    &scan.target, sizeof scan.target);
+        writeMetaRecord(replacement.fd(), slot, ps, scan.target);
 #ifdef _WIN32
     // Windows renames over an open file only with POSIX semantics, which not
     // every volume or version has; the store is no longer needed here.

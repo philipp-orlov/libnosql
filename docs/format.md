@@ -10,11 +10,36 @@ slotted-page header is 16 bytes; pages are 1 KiB to 64 KiB. Opening a store of
 any other format version, 5 and 6 included, fails with `ErrorCode::Incompatible`
 for both read-only and writable open; nothing is converted.
 
+A store's `version` rises with what it holds, so that older builds open it for as long as
+they can: 7; 8 once it holds a `P_PREFIX` leaf (from then on free-list chunks may be written as runs); 9 from its
+first sealed commit (below). This build reads and writes 7 to 9.
+
+### Sealed meta pages (format 9)
+
+The low 16 bits of `version` are the format number. Bit 16 (`kMetaSealed`) marks a record
+written by a sealed commit (`Env::Options::sealedCommits()`), whose meta page reached the
+device under the same flush as its data. Such a record is valid only together with the
+manifest that follows it in the page, at offset 984 (16 + 968):
+
+| Offset | Bytes | Field |
+|---|---|---|
+| 0 | 8 | txnid, the record's |
+| 8 | 8 | the record's checksum |
+| 16 | 4 | count of entries |
+| 20 | 4 | reserved, zero |
+| 24 | 8 | XXH3-64 of this header with this field zero, then the entries |
+| 32 | 16 × count | entries: `u64` first page number in bits 0-47 and page count in bits 48-63; `u64` the checksum in that page's or run's trailer |
+
+A reader accepts the record only if the header carries its txnid and checksum, the manifest
+checksum holds, and every listed page is in the file with that trailer and bytes that match
+it; otherwise the record counts as never written. A record without the bit ignores the area.
+A page of size P has room for (P − 1016) / 16 entries: 192 at 4 KiB, none at 1 KiB.
+
 Three version numbers appear in the persisted bytes and are independent of each other:
 
 | where | value | constant |
 |---|---|---|
-| store meta `version` (this document) | 7 | `kFormatVersion` in `format.hpp` |
+| store meta `version` (this document) | 7 to 9 | `kOldestFormatVersion` to `kFormatVersion` in `format.hpp` |
 | replication bundle and segment headers | 6 | `kReplicationVersion` in `replication_format.hpp` |
 | blob index record prefix | 5 | the literal in `blob_storage.cpp` |
 
@@ -126,7 +151,7 @@ meta page. Identity fields are opaque 16-byte tokens.
 | Offset | Bytes | Field |
 |---|---|---|
 | 0 | 16 | magic, `NOSQL-ORLOV`, NUL padded |
-| 16 | 4 | version = 7 |
+| 16 | 4 | version: format number 7 to 9 in the low half, `kMetaSealed` in bit 16 |
 | 20 | 4 | pageSize |
 | 24 | 8 | txnid |
 | 32 | 8 | lastPgno |

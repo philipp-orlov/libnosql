@@ -480,7 +480,7 @@ void formatStore(EnvImpl& e)
     Meta m{};
     std::memcpy(m.magic, kMagic, sizeof m.magic);
     // The oldest version that reads it, until it holds a PrefixKeys tree.
-    m.version = NOSQL_PREFIX_KEYS_DEFAULT ? kFormatVersion : kOldestFormatVersion;
+    m.version = NOSQL_PREFIX_KEYS_DEFAULT ? kFormatPrefix : kOldestFormatVersion;
     m.pageSize = std::uint32_t(e.pageSize);
     m.lastPgno = 1;  // the two meta pages
     m.fileSize = e.region->m.size;
@@ -538,8 +538,8 @@ std::size_t probePageSize(const MappedRegion& r)
     const Meta* m = metaOf(reinterpret_cast<const Page*>(r.m.base));
     if (!magicOk(*m))
         throw Error(ErrorCode::Corrupted, "not a libnosql store (bad magic number)");
-    if (m->version < kOldestFormatVersion || m->version > kFormatVersion)
-        throw Error(ErrorCode::Incompatible, "store format version " + std::to_string(m->version) +
+    if (metaVersion(*m) < kOldestFormatVersion || metaVersion(*m) > kFormatVersion)
+        throw Error(ErrorCode::Incompatible, "store format version " + std::to_string(metaVersion(*m)) +
                                                  ", this build speaks " +
                                                  std::to_string(kOldestFormatVersion) + " to " +
                                                  std::to_string(kFormatVersion));
@@ -551,10 +551,15 @@ std::size_t probePageSize(const MappedRegion& r)
 /// (not write ordering) is what detects the tear, and the reclamation rule
 /// guarantees the older snapshot's pages were never overwritten. See
 /// docs/design.md, "The meta page's own durability".
+}  // namespace
+
+std::atomic<bool> sealedMetaChecked{true};
+
+namespace {
+
 void loadMeta(EnvImpl& e)
 {
-    const Meta* best = nullptr;
-    unsigned bestSlot = 0;
+    const Meta* found[2] = {nullptr, nullptr};
     for (unsigned slot = 0; slot < 2; ++slot) {
         if ((slot + 1) * e.pageSize > e.region->m.size)
             break;
@@ -562,12 +567,40 @@ void loadMeta(EnvImpl& e)
         if (p->flags != P_META)
             continue;
         const Meta* m = metaOf(p);
-        if (!metaValid(*m, e.pageSize))
+        if (metaValid(*m, e.pageSize))
+            found[slot] = m;
+    }
+    // Newest first. A sealed commit's meta went to the device together with its pages:
+    // it counts only if they all arrived, and if not the commit before it is intact.
+    const std::byte* base = e.region->m.base;
+    const std::uint64_t size = e.region->m.size;
+    std::vector<std::byte> scratch;
+    const auto landed = [&](unsigned slot) {
+        const Meta& m = *found[slot];
+        if (!metaSealed(m) || !sealedMetaChecked.load(std::memory_order_relaxed))
+            return true;
+        return sealedMetaLanded(
+            m, slot, size,
+            [&](std::uint64_t at, void* out, std::size_t n) {
+                if (at + n > size)
+                    throw Error(ErrorCode::Corrupted, "sealed meta lists a page outside the file");
+                std::memcpy(out, base + at, n);
+            },
+            scratch);
+    };
+    const Meta* best = nullptr;
+    unsigned bestSlot = 0;
+    const unsigned first = found[1] && (!found[0] || found[1]->txnid > found[0]->txnid) ? 1u : 0u;
+    for (const unsigned slot : {first, 1u - first}) {
+        if (!found[slot])
             continue;
-        if (!best || m->txnid > best->txnid) {
-            best = m;
-            bestSlot = slot;
+        if (!landed(slot)) {
+            e.rolledBackTxn = found[slot]->txnid;
+            continue;
         }
+        best = found[slot];
+        bestSlot = slot;
+        break;
     }
     if (!best)
         throw Error(ErrorCode::Corrupted, "no usable meta page in " + e.path.string());
@@ -673,6 +706,10 @@ Env Env::Options::open(const std::filesystem::path& path) const
 
     const std::size_t ps = e->pageSize;
     e->buffers.configure(ps, bufferCache_);
+    e->sealed = sealedCommits_ && e->dura == Durability::Safe && !e->pipelined &&
+                manifestCapacity(ps) > 0;
+    if (e->sealed)
+        e->metaUndo.resize(ps);
     // A spilled buffer gives its memory back only as whole system pages.
     e->spill = spillDirtyPages_ && ps >= os::systemPageSize();
     if (cacheReadChecksums_)

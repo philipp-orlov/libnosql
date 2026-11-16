@@ -397,6 +397,7 @@ EnvStats Env::stats() const
         s.spilledPages = e->spilledPages.load(std::memory_order_relaxed);
         s.unspilledPages = e->unspilledPages.load(std::memory_order_relaxed);
         s.durableTxn = std::min<std::uint64_t>(e->durableTxn, e->meta.txnid);
+        s.rolledBackTxn = e->rolledBackTxn;
         if (e->ship) {
             s.captureFailures = e->ship->failures();
             s.capturedTxnid = e->ship->capturedTxnid();
@@ -1170,7 +1171,7 @@ void compact(const std::filesystem::path& src, const std::filesystem::path& dst)
     };
     Meta meta{};
     std::memcpy(meta.magic, kMagic, sizeof meta.magic);
-    meta.version = kFormatVersion;
+    meta.version = kFormatPrefix;
     meta.pageSize = st.pageSize;
     meta.txnid = 1;
     meta.storeId = newIdentity();
@@ -1185,7 +1186,7 @@ void compact(const std::filesystem::path& src, const std::filesystem::path& dst)
         ++meta.namedDbs;
     }
     meta.catalogTree = catalog.finish();
-    meta.version = prefixed ? kFormatVersion : kOldestFormatVersion;
+    meta.version = prefixed ? kFormatPrefix : kOldestFormatVersion;
     destination.finish(meta);
     rt.abort();
     output.close();

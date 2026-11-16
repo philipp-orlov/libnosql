@@ -12,6 +12,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 #include "nosql/slice.hpp"
 #include "nosql/internal/endian.hpp"
@@ -27,11 +28,20 @@ inline constexpr PageNo kInvalidPage = ~PageNo(0);
 /// Stored verbatim so the first bytes of the file read as the name in any hex
 /// dump. Padded to 16 so every 64-bit field after it stays 8-byte aligned.
 inline constexpr char kMagic[16] = "NOSQL-ORLOV";
-/// The newest format this build writes and reads: 8 added P_PREFIX leaves
-/// (DbFlags::PrefixKeys). A store keeps the oldest version that can read it,
-/// 7, until it first holds such a sub-database, so older builds open it.
-inline constexpr std::uint32_t kFormatVersion = 8;
+/// The newest format this build writes and reads. A store keeps the oldest version
+/// that can read it, so older builds open it for as long as they can: 7 until it first
+/// holds a P_PREFIX leaf (DbFlags::PrefixKeys), then 8; 9 from its first sealed commit
+/// (Env::Options::sealedCommits()), whose meta page is only valid together with the
+/// pages its manifest lists.
+inline constexpr std::uint32_t kFormatVersion = 9;
+inline constexpr std::uint32_t kFormatPrefix = 8;
+inline constexpr std::uint32_t kFormatSealed = 9;
 inline constexpr std::uint32_t kOldestFormatVersion = 7;
+/// Meta::version holds the format number in its low half. This bit above it says the
+/// meta was written by a sealed commit: a manifest follows the record in the page, and
+/// the meta counts as written only if the manifest and every page it lists are there
+/// (sealedMetaLanded). Under the meta's checksum, so no torn write can drop it.
+inline constexpr std::uint32_t kMetaSealed = 1u << 16;
 inline constexpr std::size_t kPageChecksumBytes = 8;
 
 using Identity = std::array<std::uint64_t, 2>;
@@ -460,10 +470,128 @@ inline bool magicOk(const Meta& m) noexcept
     return std::memcmp(m.magic, kMagic, sizeof kMagic) == 0;
 }
 
+/// The format number of the store as of `m`.
+inline std::uint32_t metaVersion(const Meta& m) noexcept
+{
+    return std::uint32_t(m.version) & 0xffffu;
+}
+inline bool metaSealed(const Meta& m) noexcept
+{
+    return (std::uint32_t(m.version) & kMetaSealed) != 0;
+}
+
+/// The record itself is whole and one this build reads. A sealed one must also pass
+/// sealedMetaLanded() before it is taken for a snapshot.
 inline bool metaValid(const Meta& m, std::size_t expectPageSize) noexcept
 {
-    return magicOk(m) && m.version >= kOldestFormatVersion && m.version <= kFormatVersion &&
+    const std::uint32_t version = metaVersion(m);
+    return magicOk(m) && version >= kOldestFormatVersion && version <= kFormatVersion &&
+           (std::uint32_t(m.version) & ~(0xffffu | kMetaSealed)) == 0 &&
+           (!metaSealed(m) || version >= kFormatSealed) &&
            (expectPageSize == 0 || m.pageSize == expectPageSize) && m.checksum == metaChecksum(m);
+}
+
+// ------------------------------------------------------------- manifest ---
+//
+// A sealed commit writes its pages and its meta page and flushes once. The device may
+// then hold the meta without some of the pages, so the meta page lists, after the
+// record, every page or overflow run the commit wrote with the checksum in its trailer.
+// Whoever picks the newest meta checks the list; a meta that fails is one that was
+// never written, and the other slot's is taken, exactly as for a torn meta page.
+
+struct ManifestHeader
+{
+    Little<std::uint64_t> txnid;         ///< the meta's
+    Little<std::uint64_t> metaChecksum;  ///< the meta's: a manifest belongs to one record
+    Little<std::uint32_t> count;         ///< entries that follow
+    Little<std::uint32_t> reserved;
+    Little<std::uint64_t> checksum;      ///< of this header with `checksum` zero, then the entries
+};
+static_assert(sizeof(ManifestHeader) == 32);
+
+/// One page, or one overflow run, a sealed commit wrote.
+struct ManifestEntry
+{
+    Little<std::uint64_t> run;       ///< first page number, and the page count above bit 48
+    Little<std::uint64_t> checksum;  ///< the trailer of the page or run
+};
+static_assert(sizeof(ManifestEntry) == 16);
+inline constexpr std::uint64_t kManifestRunMax = 0xffff;  ///< pages in one entry
+
+inline constexpr std::size_t kManifestOffset = kPageHdr + sizeof(Meta);
+/// Entries a meta page of `pageSize` has room for; none at the smallest page size.
+inline constexpr std::size_t manifestCapacity(std::size_t pageSize) noexcept
+{
+    return pageSize < kManifestOffset + sizeof(ManifestHeader)
+               ? 0
+               : (pageSize - kManifestOffset - sizeof(ManifestHeader)) / sizeof(ManifestEntry);
+}
+
+/// Fills in `h` for meta `m` and `count` entries at `entries`.
+inline void sealManifest(ManifestHeader& h, const Meta& m, const ManifestEntry* entries,
+                         std::size_t count) noexcept
+{
+    h.txnid = m.txnid;
+    h.metaChecksum = m.checksum;
+    h.count = std::uint32_t(count);
+    h.reserved = 0;
+    h.checksum = 0;
+    Checksum64 sum;
+    sum.update(&h, sizeof h);
+    if (count)
+        sum.update(entries, count * sizeof(ManifestEntry));
+    h.checksum = sum.digest();
+}
+
+/// Whether sealed meta `m`, read from a store of `fileBytes` bytes, was written whole:
+/// its manifest is there and is its own, and every page it lists is in the file with the
+/// checksum listed and bytes that match it. `readAt(offset, out, n)` reads the store;
+/// `scratch` is a buffer of at least one page, grown here for longer runs.
+template <class ReadAt, class Buffer>
+bool sealedMetaLanded(const Meta& m, unsigned slot, std::uint64_t fileBytes, ReadAt&& readAt,
+                      Buffer& scratch)
+{
+    const std::size_t ps = m.pageSize;
+    const std::size_t capacity = manifestCapacity(ps);
+    if ((std::uint64_t(m.lastPgno) + 1) * ps > fileBytes)
+        return false;  // the file never grew to hold it
+    ManifestHeader h;
+    const std::uint64_t at = std::uint64_t(slot) * ps + kManifestOffset;
+    if (capacity == 0)
+        return false;
+    readAt(at, &h, sizeof h);
+    if (h.txnid != m.txnid || h.metaChecksum != m.checksum || h.count > capacity || h.reserved != 0)
+        return false;
+    const std::size_t count = h.count;
+    if (scratch.size() < ps)
+        scratch.resize(ps);
+    // The entries fit one page; keep them apart from the pages read below.
+    std::vector<ManifestEntry> entries(count);
+    if (count)
+        readAt(at + sizeof h, entries.data(), count * sizeof(ManifestEntry));
+    const std::uint64_t stored = h.checksum;
+    ManifestHeader check = h;
+    sealManifest(check, m, entries.data(), count);
+    if (check.checksum != stored)
+        return false;
+    for (const ManifestEntry& e : entries) {
+        const std::uint64_t first = std::uint64_t(e.run) & kMaxPgno;
+        const std::uint64_t pages = std::uint64_t(e.run) >> 48;
+        if (first < 2 || pages == 0 || first + pages - 1 > m.lastPgno)
+            return false;
+        const std::size_t bytes = std::size_t(pages * ps);
+        if (scratch.size() < bytes)
+            scratch.resize(bytes);
+        readAt(first * ps, scratch.data(), bytes);
+        const auto* data = reinterpret_cast<const std::byte*>(scratch.data());
+        const Page* page = reinterpret_cast<const Page*>(data);
+        if (page->pgno != first || (isOverflow(page) ? ovPages(page) : 1u) != pages)
+            return false;
+        if (readLittle<std::uint64_t>(data + bytes - kPageChecksumBytes) != e.checksum ||
+            checksum64(data, bytes - kPageChecksumBytes) != e.checksum)
+            return false;
+    }
+    return true;
 }
 
 // The two meta slots alternate by transaction id parity, so the previous

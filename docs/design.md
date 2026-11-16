@@ -4,8 +4,8 @@
 
 libnosql is a C++17 embedded, single-file, copy-on-write B+tree with one writer,
 many snapshot readers, named databases, and nested write transactions. It uses
-no WAL and no third-party libraries or vendored code (it depends on libcore, `core::sys` and `core::base`, the author's own library). Formats 7 and 8 are supported (a store
-reaches format 8 when it first uses `PrefixKeys`); opening any other format fails, including through compaction.
+no WAL and no third-party libraries or vendored code (it depends on libcore, `core::sys` and `core::base`, the author's own library). Formats 7 to 9 are supported (a store
+reaches format 8 when it first uses `PrefixKeys`, format 9 with its first sealed commit); opening any other format fails, including through compaction.
 
 See [format.md](format.md) for persisted bytes, [mq.md](mq.md) for queues,
 [replication.md](replication.md) for shipping, and [limitations.md](limitations.md)
@@ -398,6 +398,58 @@ the slot that does not hold the newest durable meta (under `Safe` that is plain
 alternation by transaction parity), open picks the newest valid one, and the
 reclamation rule below guarantees the durable snapshot's pages were never
 overwritten, so a torn newest meta falls back to it.
+
+### Sealed commits: `Safe` with `sealedCommits()`
+
+Everything above orders the meta after the data with a flush between them, so a `Safe` commit
+costs two device flushes. `Env::Options::sealedCommits()` makes it one, still without a log:
+the commit writes its pages and its meta page and flushes once. The device may then hold the
+meta without some of the pages, so this is detected where the two-flush order prevents it:
+
+* **The manifest.** After the record, the meta page lists every page and overflow run the
+  commit wrote (spilled pages included) with the checksum in its trailer: a 32-byte header
+  bound to the record by its transaction id and checksum, then 16 bytes per page or run,
+  192 at 4 KiB pages (`format.hpp`, `writePages`, `storeMeta`). The record carries a bit in
+  the upper half of `version` (`kMetaSealed`), under the record's own checksum, that says
+  the manifest must be there.
+* **At open,** `loadMeta` takes the newest valid meta; if it is sealed it reads the manifest
+  and every page it lists and compares each trailer and each recomputed checksum
+  (`sealedMetaLanded`). A meta that fails is one that was never written, and the other slot's
+  is taken, exactly as for a torn meta page. `replication.cpp`'s `readNewestMeta` applies the
+  same check. Nothing is replayed.
+* **Why the fallback is intact.** The reclamation rule is unchanged: commit T+1 writes only
+  pages the durable snapshot T does not name, and its meta goes into the slot that does not
+  hold T's. Nothing T+1 writes, in whatever part the device keeps it, touches T.
+* **A commit whose pages do not fit the list,** or whose run is longer than 65,535 pages,
+  flushes twice as before and is not marked sealed; so does every commit at 1 KiB pages,
+  where a meta page has no room for a manifest. `Lazy`, `None`, `NoMetaSync` and pipelined
+  commits are unchanged.
+* **A flush that fails:** the meta page was written before the flush, so the slot's previous
+  bytes are put back (`EnvImpl::metaUndo`) before the commit reports failure; a store
+  reopened without a power cut then shows the commit before, as it does without the option.
+* **Copies.** `copySnapshot` and `applyBundle` copy a meta record verbatim into a file whose
+  pages are all flushed before it is renamed into place. A sealed record keeps its bit, since
+  the record's checksum is what checkpoints name, and gets a manifest that lists nothing
+  (`writeMetaRecord`).
+* **Format.** The first sealed commit raises the store to format 9; older builds refuse it.
+  A store at format 9 opens and commits with or without the option.
+
+What it gives up: a store being opened cannot tell a sealed commit that never reached the
+device from one that did and had a page damaged afterwards. Both open on the commit before.
+`EnvStats::rolledBackTxn` reports the commit passed over; without a power cut in between it
+means the newest commit was lost to damage, which without the option would be reported as
+`Corrupted` when the page is read. Only the newest commit is ever in question.
+
+Measured on this machine's NVMe (ext4), 300 one-put commits on a 20,000-key store: `Safe`
+3.0 ms per commit, `Safe` sealed 1.5 ms, `NoMetaSync` (which does not promise that a returned
+commit is durable) 1.5 ms.
+
+The `power` suite records three sealed workloads (plain, spilling, shrinking; each with
+commits too wide to seal) and replays more than 12,000 power-cut images of them, each cut
+losing the unflushed sectors in a different way; every image opens on a whole commit no older
+than the last one reported durable. `sealedMetasAreOnlyAsGoodAsTheirManifestCheck` is the
+control: with the check at open switched off, the same record produces images that open on a
+commit whose pages are missing.
 
 ### Failure
 

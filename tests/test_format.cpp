@@ -18,7 +18,8 @@ TEST(littleEndianFieldsHaveGoldenBytes)
         CHECK_EQ(bytes[index], index + 1);
     CHECK_EQ(internal::readLittle<std::uint64_t>(bytes), 0x0807060504030201ull);
     CHECK_EQ(sizeof(internal::Page), 16u);
-    CHECK_EQ(internal::kFormatVersion, 8u);
+    CHECK_EQ(internal::kFormatVersion, 9u);
+    CHECK_EQ(internal::kFormatPrefix, 8u);
     CHECK_EQ(internal::kOldestFormatVersion, 7u);
     CHECK_EQ(internal::kPageChecksumBytes, 8u);
     CHECK_EQ(sizeof(internal::Meta), 968u);
@@ -31,7 +32,9 @@ TEST(readsRejectCorruptedLeafAndOverflowPayload)
         tst::Scratch scratch("checksum");
         std::uint64_t offset = 0;
         {
-            Env env = Env::configure().open(scratch.file());
+            // Not sealed: a sealed commit with a damaged page is passed over at open
+            // (sealedCommitWithADamagedPageIsPassedOver in test_env.cpp).
+            Env env = Env::configure().sealedCommits(false).open(scratch.file());
             env.write([&](Txn& txn) { txn.mainDb().put("key", std::string(size, 'a')); });
         }
         std::fstream file(scratch.file(), std::ios::in | std::ios::out | std::ios::binary);

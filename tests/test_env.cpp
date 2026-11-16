@@ -6,11 +6,13 @@
 #include <condition_variable>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <thread>
 #include <vector>
 
 #include "nosql/nosql.hpp"
+#include "nosql/internal/format.hpp"
 #include "nosql/internal/io_observer.hpp"
 #include "tests/test_util.hpp"
 
@@ -621,6 +623,178 @@ TEST(waitForCommitDoesNotSleepThroughARaceWithTheCommit)
         e.write([&](Txn& t) { t.mainDb().put("k", tst::keyOf(std::uint64_t(round))); });
         CHECK(e.waitForCommit(seen, std::chrono::milliseconds(0)) > seen);
     }
+}
+
+namespace {
+
+/// The newest valid meta record in `file`, read from the file.
+internal::Meta newestMetaOf(const std::filesystem::path& file, std::size_t ps)
+{
+    std::ifstream in(file, std::ios::binary);
+    internal::Meta best{};
+    for (unsigned slot = 0; slot < 2; ++slot) {
+        internal::Meta m{};
+        in.seekg(std::streamoff(slot * ps + internal::kPageHdr));
+        in.read(reinterpret_cast<char*>(&m), sizeof m);
+        if (internal::metaValid(m, ps) && m.txnid >= best.txnid)
+            best = m;
+    }
+    return best;
+}
+
+struct Barriers
+{
+    unsigned data = 0, meta = 0;
+};
+
+/// Device flushes a commit of `puts` small values makes.
+Barriers barriersOf(Env& env, int puts, int seed)
+{
+    Barriers b;
+    internal::os::ScopedIoObserver watch([&](internal::os::IoEvent event, std::size_t) {
+        b.data += event == internal::os::IoEvent::DataBarrier;
+        b.meta += event == internal::os::IoEvent::MetaBarrier;
+    });
+    env.write([&](Txn& t) {
+        for (int i = 0; i < puts; ++i)
+            t.mainDb().put(tst::keyOf(std::uint64_t(seed) * 100000 + i), tst::blob(300, i));
+    });
+    return b;
+}
+
+}  // namespace
+
+/// Options::sealedCommits(): one flush per commit where the commit's pages fit the meta
+/// page's manifest, two where they do not or where a meta page has no room for one; the
+/// store is at format 9 from its first sealed commit, and opens with or without the option.
+TEST(sealedCommitsFlushOnceWhereTheManifestFits)
+{
+    tst::Scratch s("sealed");
+    {
+        Env e = Env::configure().sealedCommits(false).open(s.file());
+        const Barriers plain = barriersOf(e, 5, 0);
+        CHECK_EQ(plain.data, 1u);
+        CHECK_EQ(plain.meta, 1u);
+    }
+    CHECK_EQ(internal::metaVersion(newestMetaOf(s.file(), 4096)), internal::kOldestFormatVersion);
+    {
+        Env e = Env::configure().sealedCommits().open(s.file());
+        for (int i = 1; i < 6; ++i) {
+            const Barriers sealed = barriersOf(e, 5, i);
+            CHECK_EQ(sealed.data, 1u);
+            CHECK_EQ(sealed.meta, 0u);
+            CHECK(internal::metaSealed(newestMetaOf(s.file(), 4096)));
+            CHECK_EQ(e.stats().durableTxn, e.stats().lastTxn);
+        }
+        // More pages than a meta page lists: flushed as before, and not marked sealed.
+        const Barriers wide = barriersOf(e, 6000, 7);
+        CHECK_EQ(wide.data, 1u);
+        CHECK_EQ(wide.meta, 1u);
+        const internal::Meta m = newestMetaOf(s.file(), 4096);
+        CHECK(!internal::metaSealed(m));
+        CHECK_EQ(internal::metaVersion(m), internal::kFormatSealed);
+        CHECK_EQ(barriersOf(e, 5, 8).meta, 0u);
+    }
+    {
+        // Without the option: the sealed meta is read, the next commit flushes twice.
+        Env e = Env::configure().sealedCommits(false).open(s.file());
+        CHECK_EQ(e.stats().rolledBackTxn, 0u);
+        e.read([](Txn& t) {
+            checkIntegrity(t);
+            CHECK_EQ(t.mainDb().count(), std::uint64_t(5 * 6 + 6000 + 5));
+        });
+        CHECK_EQ(barriersOf(e, 5, 9).meta, 1u);
+        CHECK_EQ(internal::metaVersion(newestMetaOf(s.file(), 4096)), internal::kFormatSealed);
+    }
+    {
+        // Durability modes that keep the meta back, and pipelined commits, do not seal.
+        tst::Scratch other("sealed-modes");
+        Env lazy = Env::configure().sealedCommits().sync(Durability::NoMetaSync).open(other.file());
+        barriersOf(lazy, 5, 0);
+        lazy.close();
+        CHECK_EQ(internal::metaVersion(newestMetaOf(other.file(), 4096)),
+                 internal::kOldestFormatVersion);
+        Env piped = Env::configure().sealedCommits().pipelineCommits().open(other.file());
+        barriersOf(piped, 5, 1);
+        piped.close();
+        CHECK(!internal::metaSealed(newestMetaOf(other.file(), 4096)));
+    }
+    {
+        // A 1 KiB meta page has no room for a manifest: the option changes nothing.
+        tst::Scratch small("sealed-small");
+        Env e = Env::configure().pageSize(1024).sealedCommits().open(small.file());
+        const Barriers b = barriersOf(e, 5, 0);
+        CHECK_EQ(b.meta, 1u);
+        e.close();
+        CHECK_EQ(internal::metaVersion(newestMetaOf(small.file(), 1024)),
+                 internal::kOldestFormatVersion);
+    }
+}
+
+/// A sealed commit counts only with every page it wrote. One with a damaged page is passed
+/// over when the store is opened, which is how a commit cut short by a power failure is
+/// told; the store opens on the commit before it and reports the one it passed over.
+TEST(sealedCommitWithADamagedPageIsPassedOver)
+{
+    tst::Scratch s("sealed-damage");
+    std::uint64_t lost = 0;
+    {
+        Env e = Env::configure().sealedCommits().open(s.file());
+        e.write([](Txn& t) { t.mainDb().put("key", "old"); });
+        e.write([](Txn& t) { t.mainDb().put("key", "new"); });
+        lost = e.stats().lastTxn;
+    }
+    const internal::Meta m = newestMetaOf(s.file(), 4096);
+    CHECK(internal::metaSealed(m));
+    CHECK_EQ(std::uint64_t(m.txnid), lost);
+    {
+        std::fstream file(s.file(), std::ios::in | std::ios::out | std::ios::binary);
+        file.seekg(std::streamoff(std::uint64_t(m.mainTree.root) * 4096 + 200));
+        const int c = file.get();
+        file.seekp(std::streamoff(std::uint64_t(m.mainTree.root) * 4096 + 200));
+        file.put(char(c ^ 0x5a));
+    }
+    {
+        Env e = Env::configure().sealedCommits().open(s.file());
+        CHECK_EQ(e.stats().rolledBackTxn, lost);
+        CHECK_EQ(e.stats().lastTxn, lost - 1);
+        e.read([](Txn& t) {
+            checkIntegrity(t);
+            CHECK_EQ(t.mainDb().at("key").string(), std::string("old"));
+        });
+        // The store goes on from there: the passed-over meta's slot is the next one written.
+        e.write([](Txn& t) { t.mainDb().put("key", "newer"); });
+        CHECK_EQ(e.stats().lastTxn, lost);
+    }
+    Env e = Env::configure().open(s.file());
+    CHECK_EQ(e.stats().rolledBackTxn, 0u);
+    e.read([](Txn& t) {
+        checkIntegrity(t);
+        CHECK_EQ(t.mainDb().at("key").string(), std::string("newer"));
+    });
+}
+
+/// A flush that fails leaves no trace of a sealed commit: its meta page, written before
+/// the flush, is taken back, and the store reopens on the commit before.
+TEST(sealedCommitWhoseFlushFailsIsTakenBack)
+{
+    tst::Scratch s("sealed-fault");
+    Env e = Env::configure().sealedCommits().open(s.file());
+    e.write([](Txn& t) { t.mainDb().put("key", "old"); });
+    const std::uint64_t before = e.stats().lastTxn;
+    {
+        internal::os::ScopedIoObserver fault([](internal::os::IoEvent event, std::size_t) {
+            if (event == internal::os::IoEvent::DataBarrier)
+                throw Error(ErrorCode::IoError, "injected flush failure");
+        });
+        CHECK_THROWS(e.write([](Txn& t) { t.mainDb().put("key", "new"); }), ErrorCode::IoError);
+    }
+    CHECK_THROWS(e.writeTxn(), ErrorCode::BadTransaction);  // poisoned, as without the option
+    e.close();
+    e = Env::configure().sealedCommits().open(s.file());
+    CHECK_EQ(e.stats().lastTxn, before);
+    CHECK_EQ(e.stats().rolledBackTxn, 0u);
+    e.read([](Txn& t) { CHECK_EQ(t.mainDb().at("key").string(), std::string("old")); });
 }
 
 int main()

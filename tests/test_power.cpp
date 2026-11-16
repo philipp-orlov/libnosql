@@ -22,6 +22,7 @@
 
 #include "nosql/nosql.hpp"
 #include "nosql/replication.hpp"
+#include "nosql/internal/core.hpp"
 #include "nosql/internal/os.hpp"
 #include "tests/power_model.hpp"
 #include "tests/test_util.hpp"
@@ -83,7 +84,8 @@ struct Replay
 /// snapshots in `committed`. With `honourDurable` off, an image may open on
 /// any committed snapshot, as long as it opens on one.
 Replay replay(const tst::Scratch& scratch, const std::string& base, const std::vector<Op>& log,
-              const std::map<std::uint64_t, State>& committed, bool honourDurable)
+              const std::map<std::uint64_t, State>& committed, bool honourDurable,
+              unsigned thorough = 1)
 {
     Replay r;
     Device device(base);
@@ -102,8 +104,8 @@ Replay replay(const tst::Scratch& scratch, const std::string& base, const std::v
             continue;
         std::vector<Lose> ways = {Lose::All, Lose::None};
         if (!device.settled()) {
-            ways.insert(ways.end(), 8, Lose::AnySector);
-            ways.insert(ways.end(), 4, Lose::WholePages);
+            ways.insert(ways.end(), 8 * thorough, Lose::AnySector);
+            ways.insert(ways.end(), 4 * thorough, Lose::WholePages);
         }
         for (const Lose lose : ways) {
             ++r.images;
@@ -138,11 +140,12 @@ struct Workload
     std::string name;
     std::uint64_t dirtyLimit = 0;  // small enough to spill, or none
     bool shrinks = false;          // Env::shrink() every few rounds
+    bool sealed = false;           // Options::sealedCommits(): meta and data under one flush
 };
 
 /// Commits that grow, rewrite and shrink the tree, with values from a few
 /// bytes to several pages, so pages split, merge, overflow and get reused.
-void step(Env& env, int round, State& expect)
+void step(Env& env, int round, State& expect, bool wide = false)
 {
     std::mt19937_64 rng(std::uint64_t(round) * 7919u + 1);
     env.write([&](Txn& txn) {
@@ -160,6 +163,17 @@ void step(Env& env, int round, State& expect)
             const std::string key = tst::keyOf(rng() % 300);
             if (expect.erase(key))
                 db.erase(key);
+        }
+        // Now and then more pages than a sealed commit's meta page can list, so that
+        // a store with sealed commits also makes one the two-flush way.
+        if (wide && round % 6 == 5) {
+            Db d = txn.db("wide", DbFlags::Create);
+            for (int i = 0; i < 2600; ++i) {
+                const std::string key = tst::keyOf(std::uint64_t(i));
+                const std::string value = tst::blob(280, rng());
+                d.put(key, value);
+                expect["wide/" + key] = value;
+            }
         }
         // A named tree and a prefix-compressed one, their catalog entries and
         // P_PREFIX leaves under the same cuts.
@@ -196,6 +210,7 @@ Recorded record(const tst::Scratch& scratch, const Workload& w)
             .pageSize(kPage)
             .sync(w.mode)
             .pipelineCommits(w.pipelined)
+            .sealedCommits(w.sealed)
             .dirtyLimit(w.dirtyLimit)
             .syncInterval(std::chrono::hours(1));
     };
@@ -204,7 +219,7 @@ Recorded record(const tst::Scratch& scratch, const Workload& w)
     {
         Env env = options().open(file);
         for (int round = 0; round < 4; ++round)
-            step(env, round, expect);
+            step(env, round, expect, w.sealed);
         env.sync();
     }
     out.base = readFile(file);
@@ -214,7 +229,7 @@ Recorded record(const tst::Scratch& scratch, const Workload& w)
         out.committed[env.commitGeneration()] = expect;
         recorder.durable(env.stats().durableTxn);
         for (int round = 4; round < 40; ++round) {
-            step(env, round, expect);
+            step(env, round, expect, w.sealed);
             out.committed[env.commitGeneration()] = expect;
             if (w.shrinks && round % 9 == 8) {
                 // Its commits move pages and cut the file, the contents stay.
@@ -246,7 +261,12 @@ const Workload kWorkloads[] = {
     {Durability::Safe, false, "Safe, shrinking", 0, true},
     {Durability::Lazy, false, "Lazy, shrinking", 0, true},
     {Durability::None, false, "None, shrinking", 0, true},
+    // One flush per commit: the meta page may land without some of the pages it names.
+    {Durability::Safe, false, "Safe, sealed", 0, false, true},
+    {Durability::Safe, false, "Safe, sealed, spilling", 48u << 10, false, true},
+    {Durability::Safe, false, "Safe, sealed, shrinking", 0, true, true},
 };
+constexpr std::size_t kSealedWorkload = 10;
 
 /// Watches every file written while a replacement is built: at the rename
 /// that publishes it, nothing written to any file may still be waiting for a
@@ -314,11 +334,16 @@ TEST(everyPowerCutOpensOnADurableSnapshot)
         tst::Scratch scratch("power-replay");
         const Recorded rec = record(scratch, w);
         CHECK(rec.log.size() > 100);
-        const Replay r = replay(scratch, rec.base, rec.log, rec.committed, true);
+        // A sealed commit is one run of writes and one flush: fewer places to cut, and
+        // at each of them the meta page and the data are lost in more ways.
+        const Replay r = replay(scratch, rec.base, rec.log, rec.committed, true, w.sealed ? 6 : 1);
         if (r.failures)
             std::fprintf(stderr, "%s: %u of %u images failed; first %s\n", w.name.c_str(),
                          r.failures, r.images, r.first.c_str());
         CHECK_EQ(r.failures, 0u);
+        std::printf("    %-26s %u images, %zu flushes\n", w.name.c_str(), r.images,
+                    std::size_t(std::count_if(rec.log.begin(), rec.log.end(),
+                                              [](const Op& op) { return op.kind == Op::Flush; })));
         CHECK(r.images > 1000);
     }
 }
@@ -336,6 +361,35 @@ TEST(replayWithoutFlushesFindsTornSnapshots)
             unordered.push_back(std::move(op));
     const Replay r = replay(scratch, rec.base, unordered, rec.committed, false);
     CHECK(r.failures > 0);
+}
+
+/// A sealed commit's meta page reaches the device under the same flush as its pages, so
+/// some cuts leave a meta whose pages are not all there. The manifest check at open is
+/// what turns those away: with it switched off, the same record must show images that
+/// open on a commit with pages missing. If none did, the test above would prove nothing
+/// about sealed commits.
+TEST(sealedMetasAreOnlyAsGoodAsTheirManifestCheck)
+{
+    const Workload& w = kWorkloads[kSealedWorkload];
+    CHECK(w.sealed);
+    tst::Scratch scratch("power-sealed");
+    const Recorded rec = record(scratch, w);
+    // The workload did seal: far fewer flushes than commits would need at two each.
+    std::size_t flushes = 0, durables = 0;
+    for (const Op& op : rec.log) {
+        flushes += op.kind == Op::Flush;
+        durables += op.kind == Op::Durable;
+    }
+    CHECK(flushes < durables * 3 / 2);
+    internal::sealedMetaChecked.store(false);
+    const Replay unchecked = replay(scratch, rec.base, rec.log, rec.committed, true);
+    internal::sealedMetaChecked.store(true);
+    CHECK(unchecked.failures > 0);
+    const Replay checked = replay(scratch, rec.base, rec.log, rec.committed, true);
+    if (checked.failures)
+        std::fprintf(stderr, "%s: %u of %u images failed; first %s\n", w.name.c_str(),
+                     checked.failures, checked.images, checked.first.c_str());
+    CHECK_EQ(checked.failures, 0u);
 }
 
 /// Compaction and a replica's apply build a new file and rename it over the

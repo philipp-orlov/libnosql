@@ -49,7 +49,7 @@ in the "Terminology" section of `docs/design.md`.
 * **Little-endian metadata, opaque user bytes.** Format 7 fields are explicitly
   little-endian. User values and integer keys written as native object bytes are
   not automatically converted. Big-endian runtime is not yet validated.
-  Store formats 7 and 8 are supported (format 8 once a store uses `PrefixKeys`).
+  Store formats 7 to 9 are supported (format 8 once a store uses `PrefixKeys`, format 9 once it has made a sealed commit).
 * **Keys are capped** at roughly a quarter page (1004 bytes at 4 KiB); see
   `Env::maxKeySize()`. Values are capped at 4 GiB. Empty keys are rejected.
 * **64-bit only.** The design maps the whole file and, on POSIX, reserves
@@ -183,6 +183,14 @@ strike against it; libsql adds one on top), the storage-engine-level gaps are re
   update pages in place and defer the expensive full-page write to a
   checkpoint, decoupled from commit latency. Skewed hot-key writes or large
   multi-row transactions cost structurally more here.
+* **A sealed commit that is damaged afterwards is lost quietly.** With
+  `sealedCommits()` a store being opened takes its newest commit only if every page that
+  commit wrote is in the file and matches its checksum; that is how a commit cut short by a
+  power failure is told. A page of the newest commit damaged later looks the same, so the
+  store opens on the commit before and reports the one it passed over in
+  `EnvStats::rolledBackTxn`, where without the option the damage would surface as
+  `Corrupted` on the read that meets it. Older commits are not affected. Check
+  `rolledBackTxn` after opening if a lost newest commit must not go unnoticed.
 * **Checksum verification has a read cost.** Format 7 verifies leaf/branch XXH3-64 hashes
   and whole-overflow-run hashes on every committed-page access by default.
   `cacheReadChecksums()` opts readers into an environment-wide bitmap of

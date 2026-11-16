@@ -265,7 +265,7 @@ TEST(reverseOrderSharesSuffixes)
             CHECK(txn.db("suffixed").stats().leafPages * 10 <
                   txn.db("plain").stats().leafPages * 8);
     });
-    CHECK_EQ(versionOf(copy, 4096), internal::kFormatVersion);
+    CHECK_EQ(versionOf(copy, 4096), internal::kFormatPrefix);
 }
 
 /// Seeks, ranges, prefix scans, counts, ranks and backward walks see the keys
@@ -391,7 +391,7 @@ TEST(compactionKeepsPrefixKeys)
         CHECK(contentsOf(db) == expect);
         CHECK(db.stats().leafPages <= leaves);
     });
-    CHECK_EQ(versionOf(copy, 4096), internal::kFormatVersion);
+    CHECK_EQ(versionOf(copy, 4096), internal::kFormatPrefix);
 }
 
 /// A store stays at the format older builds read until it holds a PrefixKeys
@@ -404,12 +404,12 @@ TEST(theFormatVersionRisesOnlyWithPrefixKeys)
     tst::Scratch scratch("prefix-version");
     const auto file = scratch.file();
     {
-        Env env = Env::configure().pageSize(4096).open(file);
+        Env env = Env::configure().pageSize(4096).sealedCommits(false).open(file);
         env.write([](Txn& txn) { txn.db("plain", DbFlags::Create).put("k", "v"); });
     }
     CHECK_EQ(versionOf(file, 4096), internal::kOldestFormatVersion);
     {
-        Env env = Env::configure().pageSize(4096).open(file);
+        Env env = Env::configure().pageSize(4096).sealedCommits(false).open(file);
         // Created and dropped by a nested transaction that aborts: no raise.
         env.write([](Txn& txn) {
             CHECK_THROWS(txn.nested([](Txn& child) {
@@ -421,12 +421,12 @@ TEST(theFormatVersionRisesOnlyWithPrefixKeys)
     }
     CHECK_EQ(versionOf(file, 4096), internal::kOldestFormatVersion);
     {
-        Env env = Env::configure().pageSize(4096).open(file);
+        Env env = Env::configure().pageSize(4096).sealedCommits(false).open(file);
         env.write(
             [](Txn& txn) { txn.db("p", DbFlags::Create | DbFlags::PrefixKeys).put("k", "v"); });
         env.write([](Txn& txn) { txn.dropDb("p"); });
     }
-    CHECK_EQ(versionOf(file, 4096), internal::kFormatVersion);
+    CHECK_EQ(versionOf(file, 4096), internal::kFormatPrefix);
     {
         Env env = Env::configure().open(file);
         env.read([](Txn& txn) { checkIntegrity(txn); });
@@ -443,7 +443,7 @@ TEST(theFormatVersionRisesOnlyWithPrefixKeys)
     }
     const auto kept = scratch.file("kept.db");
     compact(file, kept);
-    CHECK_EQ(versionOf(kept, 4096), internal::kFormatVersion);
+    CHECK_EQ(versionOf(kept, 4096), internal::kFormatPrefix);
     Env env = Env::configure().open(copy);
     env.read([](Txn& txn) {
         checkIntegrity(txn);

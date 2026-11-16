@@ -183,6 +183,13 @@ struct EnvImpl
     Meta unflushedMeta{};
     /// Safe with Options::pipelineCommits(): see writeMeta() in txn.cpp.
     bool pipelined = false;
+    /// Options::sealedCommits(), under Safe without pipelining and where a meta page has
+    /// room for a manifest: a commit flushes once. See writeMeta() and format.hpp.
+    bool sealed = false;
+    std::vector<std::byte> metaUndo;  ///< a page: the slot a sealed commit is writing, as it was
+    /// A sealed commit newer than the one the store opened on, whose pages were not all
+    /// in the file (EnvStats::rolledBackTxn); zero when there was none.
+    TxnId rolledBackTxn = 0;
     /// Writers holding or waiting for the writer slot, and how long the last
     /// data flush took: what a pipelined commit judges whether to wait for a
     /// successor to carry its meta by.
@@ -448,6 +455,10 @@ struct EnvImpl
     void releaseStaleRegions();  // caller holds mtx
 };
 
+/// For the power-cut tests alone: cleared, a store being opened takes a sealed meta
+/// without checking its manifest, which is what the tests must be able to tell apart.
+extern std::atomic<bool> sealedMetaChecked;
+
 /// Make the newest commit durable (see Env::sync). Caller holds `syncMtx`.
 void syncEnv(EnvImpl& e, bool force);
 
@@ -549,6 +560,10 @@ struct TxnImpl
     std::vector<std::pair<PageNo, Page*>> flushList;
     std::vector<std::pair<PageNo, PageNo>> flushRuns;
     std::vector<os::Span> flushSpans;
+    /// Sealed commits: what writePages() wrote, for the meta page's manifest, and
+    /// whether it all fits there.
+    std::vector<ManifestEntry> manifest;
+    bool manifestFits = false;
 
     std::vector<PageNo> loose;         ///< ours, freed, immediately reusable
     std::vector<PageNo> retiredLocal;  ///< an ancestor's dirty page we replaced

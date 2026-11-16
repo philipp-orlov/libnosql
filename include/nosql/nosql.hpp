@@ -34,6 +34,11 @@
 #ifndef NOSQL_WRITER_CACHE_DEFAULT
 #define NOSQL_WRITER_CACHE_DEFAULT 0
 #endif
+/// Whether Env::Options::sealedCommits() defaults to on (CMake option
+/// NOSQL_SEALED_COMMITS_DEFAULT), for running the suite that way.
+#ifndef NOSQL_SEALED_COMMITS_DEFAULT
+#define NOSQL_SEALED_COMMITS_DEFAULT 0
+#endif
 #ifndef NOSQL_PIPELINE_COMMITS_DEFAULT
 #define NOSQL_PIPELINE_COMMITS_DEFAULT 0
 #endif
@@ -153,6 +158,12 @@ struct EnvStats
     std::uint64_t capturedTxnid = 0;
     std::uint64_t dirtyBytes = 0;
     std::uint64_t durableTxn = 0;  ///< newest commit known to be on stable storage
+    /// Sealed commits: the id of a commit newer than the one the store opened on, whose
+    /// meta page was in the file but not all of its pages, so that it was passed over.
+    /// After a power cut that is a commit that never finished, and never returned. With
+    /// no power cut in between it means a page of the newest commit was damaged since:
+    /// that commit is lost, and this is the only report of it. Zero otherwise.
+    std::uint64_t rolledBackTxn = 0;
     /// OptimisticTxn::commit() calls in progress, and how many of them wait
     /// in the queue behind the group being applied.
     std::uint32_t optimisticCommits = 0;
@@ -544,6 +555,33 @@ public:
             pipelineCommits_ = on;
             return *this;
         }
+        /// Under Durability::Safe, make a commit durable with one device flush
+        /// instead of two. A commit otherwise flushes its pages and then, separately,
+        /// the meta page that names them, so that the meta can never reach the device
+        /// before the pages. A sealed commit writes both and flushes once; its meta
+        /// page lists every page the commit wrote with that page's checksum, and a
+        /// store being opened takes such a meta only if every listed page is there,
+        /// falling back to the commit before it otherwise, as it does for a torn meta
+        /// page. The guarantee is unchanged: a commit that has returned is durable,
+        /// and the store always opens on a whole commit. Still no log, and nothing to
+        /// replay: opening checks the newest commit's pages, a few hundred at most.
+        ///
+        /// A commit that wrote more pages or runs than its meta page can list (192 at
+        /// 4 KiB pages; none at 1 KiB) flushes twice as before. Without effect under
+        /// the other durability modes and with pipelineCommits(). The first sealed
+        /// commit raises the store to format 9, which older builds refuse.
+        ///
+        /// One difference to know: a store being opened cannot tell a sealed commit
+        /// that never reached the device from one that did and has a damaged page
+        /// since. Either way it opens on the commit before and says so in
+        /// EnvStats::rolledBackTxn, where without this option the damaged page would
+        /// be reported as ErrorCode::Corrupted when it is read. Only the newest commit
+        /// is ever in question. Off by default.
+        Options& sealedCommits(bool on = true)
+        {
+            sealedCommits_ = on;
+            return *this;
+        }
         /// Under Durability::Lazy, the first commit at least this long after
         /// the last sync runs the next one. Only commits (and Env::sync())
         /// sync unless backgroundSync() is on, so a store that stops
@@ -682,6 +720,7 @@ public:
         bool allowNetworkFilesystem_ = false;
         Durability durability_ = Durability::Safe;
         bool pipelineCommits_ = NOSQL_PIPELINE_COMMITS_DEFAULT;
+        bool sealedCommits_ = NOSQL_SEALED_COMMITS_DEFAULT;
         unsigned commitSpins_ = 256;
         std::chrono::milliseconds syncInterval_{1000};
         std::chrono::milliseconds lagAge_{0}, lagInterval_{0};
