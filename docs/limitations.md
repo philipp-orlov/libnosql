@@ -190,7 +190,8 @@ strike against it; libsql adds one on top), the storage-engine-level gaps are re
   dropped every `revalidateAfter()` interval. External corruption after a check
   may be missed until that interval passes or `checkIntegrity` runs. The bitmap
   covers `maxSize` up to 4 MiB of bits; higher pages, writes, and explicit
-  integrity checks always use strict validation.
+  integrity checks always use strict validation. `writerUsesReadCache()` extends the
+  cache to what a write transaction only reads; pages it copies forward are still verified.
   Large overflow values preserve contiguous slices by placing one checksum at
   the end of the run; an uncached read verifies the full run, not only the requested bytes.
   Vectorised XXH3-64 (NEON, SSE2, AVX2) reduces CPU cost but cannot eliminate

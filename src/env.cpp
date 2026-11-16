@@ -548,6 +548,7 @@ Env Env::Options::open(const std::filesystem::path& path) const
     e->spill = spillDirtyPages_ && ps >= os::systemPageSize();
     if (cacheReadChecksums_)
         e->validation.configure(ps, std::max<std::uint64_t>(maxSize_, 16 * ps), revalidateAfter_);
+    e->writerCache = writerUsesReadCache_ && cacheReadChecksums_;
     // One page copy plus its entry list, with room for a recursive split.
     e->writeScratch.setChunkSize(ps * 8);
     e->sizeUpper = std::max<std::uint64_t>(maxSize_, 16 * ps);

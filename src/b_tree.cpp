@@ -429,7 +429,7 @@ std::byte* overflowCreate(TxnImpl* t, std::size_t vsize, PageNo* out)
 
 void overflowRelease(TxnImpl* t, Tree& tr, PageNo p0)
 {
-    const unsigned n = ovPages(t->getPage(p0, false, TxnImpl::PageKind::Overflow));
+    const unsigned n = ovPages(t->getPageForWrite(p0, TxnImpl::PageKind::Overflow));
     t->freePage(p0, n);
     tr.overflowPages -= n;
 }
@@ -449,6 +449,7 @@ Page* touchLevel(CursorImpl& c, int lvl)
         c.pg[lvl] = back;  // the same page number: the parent needs no update
         return back;
     }
+    t->verifyBeforeCopy(p);
     const PageNo np = t->allocPages(1);
     Page* d = t->allocBuffer(np, p->flags, 1);
     std::memcpy(d, p, t->pageSize());
@@ -1017,7 +1018,7 @@ void rebalance(CursorImpl& c)
             --tr.branchPages;
             tr.root = ch;
             --tr.depth;
-            p = t->getPage(ch);
+            p = t->getPageForWrite(ch);
         }
         c.top = -1;
         c.positioned = false;
@@ -1038,6 +1039,7 @@ void rebalance(CursorImpl& c)
     if (Page* back = t->isOwnDirty(spgno) ? nullptr : t->unspill(spgno)) {
         sib = back;
     } else if (!t->isOwnDirty(spgno)) {
+        t->verifyBeforeCopy(sib);
         const PageNo np = t->allocPages(1);
         Page* d = t->allocBuffer(np, sib->flags, 1);
         std::memcpy(d, sib, ps);
@@ -1701,7 +1703,7 @@ bool treePut(CursorImpl& c, Slice key, Slice value, PutMode mode, WritableSlice*
         }
         if (oldbig && big) {
             const PageNo oldp = bigPgno(n);
-            Page* ovp = t->getOverflow(oldp, n->vsize);
+            Page* ovp = t->getOverflow(oldp, n->vsize, true);
             const bool fits = ovPages(ovp) == overflowRun(ps, value.size());
             if (fits && !t->isOwnDirty(oldp))
                 if (Page* back = t->unspill(oldp))
@@ -1736,7 +1738,7 @@ bool treePut(CursorImpl& c, Slice key, Slice value, PutMode mode, WritableSlice*
             s = Slice(copy, s.size());
         };
         const Page* oldRun =
-            oldbig ? t->getPage(bigPgno(n), false, TxnImpl::PageKind::Overflow) : nullptr;
+            oldbig ? t->getPageForWrite(bigPgno(n), TxnImpl::PageKind::Overflow) : nullptr;
         const std::size_t runBytes = oldRun ? std::size_t(ovPages(oldRun)) * ps : 0;
         if (inside(key, p, ps) || (oldRun && inside(key, oldRun, runBytes)))
             keep(key);
@@ -2038,7 +2040,7 @@ void freeSubtree(TxnImpl* t, Tree& tr, PageNo pn, int depth = 0)
     // A damaged child pointer can make a cycle, which must not recurse forever.
     if (depth >= kMaxDepth)
         throw Error(ErrorCode::Corrupted, "b-tree exceeded maximum depth");
-    Page* p = t->getPage(pn);
+    Page* p = t->getPageForWrite(pn);
     validateNodes(p, t->pageSize());
     if (isBranch(p)) {
         for (unsigned i = 0; i < p->nkeys; ++i)
@@ -2049,7 +2051,7 @@ void freeSubtree(TxnImpl* t, Tree& tr, PageNo pn, int depth = 0)
             const LeafNode* n = lnode(p, i);
             if (n->flags & N_BIGDATA) {
                 const PageNo ov = bigPgno(n);
-                const unsigned run = ovPages(t->getPage(ov, false, TxnImpl::PageKind::Overflow));
+                const unsigned run = ovPages(t->getPageForWrite(ov, TxnImpl::PageKind::Overflow));
                 t->freePage(ov, run);
                 tr.overflowPages -= run;
             }
@@ -2102,7 +2104,7 @@ std::uint64_t treeRelocate(TxnImpl* t, unsigned dbi, PageNo limit)
             const LeafNode* n = checkedLeafNode(leaf, i, nodeTop(leaf, ps));
             if ((n->flags & N_BIGDATA) && bigPgno(n) >= limit && !t->isOwnDirty(bigPgno(n)))
                 runBytes += t->env->buffers.allocationSize(
-                    ovPages(t->getOverflow(bigPgno(n), n->vsize)));
+                    ovPages(t->getOverflow(bigPgno(n), n->vsize, true)));
         }
         if (high || runBytes) {
             // Copies go below `limit` or not at all: with too few free pages
@@ -2137,7 +2139,7 @@ std::uint64_t treeRelocate(TxnImpl* t, unsigned dbi, PageNo limit)
                 const PageNo old = bigPgno(n);
                 if (!(n->flags & N_BIGDATA) || old < limit || t->isOwnDirty(old))
                     continue;
-                const Page* run = t->getOverflow(old, n->vsize);
+                const Page* run = t->getOverflow(old, n->vsize, true);
                 const unsigned count = ovPages(run);
                 if (t->overBudget(t->env->buffers.allocationSize(count))) {
                     wanted = t->env->buffers.allocationSize(count);

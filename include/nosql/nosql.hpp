@@ -29,6 +29,11 @@
 /// The default of Env::Options::pipelineCommits(). A build can turn it on for
 /// every store (CMake option NOSQL_PIPELINE_COMMITS_DEFAULT), which is how the
 /// whole test suite runs pipelined.
+/// Whether Env::Options::writerUsesReadCache() defaults to on (CMake option
+/// NOSQL_WRITER_CACHE_DEFAULT); it takes effect on stores opened with cacheReadChecksums().
+#ifndef NOSQL_WRITER_CACHE_DEFAULT
+#define NOSQL_WRITER_CACHE_DEFAULT 0
+#endif
 #ifndef NOSQL_PIPELINE_COMMITS_DEFAULT
 #define NOSQL_PIPELINE_COMMITS_DEFAULT 0
 #endif
@@ -582,10 +587,25 @@ public:
         /// every reader for the life of the environment. What it cannot see is
         /// the file changing underneath the process -- media or memory faults
         /// -- so every remembered check is dropped after `revalidateAfter()`.
-        /// Off by default: then every access verifies. Writers always verify.
+        /// Off by default: then every access verifies. Writers always verify,
+        /// unless writerUsesReadCache() is set as well.
         Options& cacheReadChecksums(bool on = true)
         {
             cacheReadChecksums_ = on;
+            return *this;
+        }
+        /// Let a write transaction trust a page check remembered by cacheReadChecksums()
+        /// when it only reads the page: its gets, seeks and scans then cost what a
+        /// reader's do instead of a checksum per page per access. Whatever a writer
+        /// carries into the next snapshot is still verified when it does so: a page is
+        /// checked at the moment it is copied forward, and an overflow run when it is
+        /// moved or released, so damage is never sealed under a new checksum. What the
+        /// option gives up is the check on bytes the writer hands to the caller, exactly
+        /// as cacheReadChecksums() does for readers. Off by default, and without effect
+        /// unless cacheReadChecksums() is on.
+        Options& writerUsesReadCache(bool on = true)
+        {
+            writerUsesReadCache_ = on;
             return *this;
         }
         /// How long a cached page check may be trusted before the next access
@@ -668,6 +688,7 @@ public:
         std::function<void(const ReaderLag&)> lagCallback_;
         bool backgroundSync_ = false;
         bool cacheReadChecksums_ = false;
+        bool writerUsesReadCache_ = NOSQL_WRITER_CACHE_DEFAULT;
         std::chrono::milliseconds revalidateAfter_{60000};
         std::size_t bufferCache_ = 32u << 20;
         std::uint64_t dirtyLimit_ = 256ull << 20;

@@ -560,6 +560,15 @@ covering pages actually checked become resident, and a reset clears only up to
 the highest word ever set rather than the whole bitmap. Overflow runs cache only their starting page after checking the whole run.
 Failed validation never populates the cache.
 
+A write transaction ignores the cache unless `writerUsesReadCache()` is also set. Then its
+descents (`TxnImpl::getPage`) trust and set the bits like a reader's, and the verification
+moves to where committed bytes enter the next snapshot: `verifyBeforeCopy` in `touchLevel` and
+in the rebalance that copies a sibling, and `getPageForWrite` (or a forced `getOverflow`)
+wherever an overflow run's header decides what is freed, reused or moved and where a subtree
+is walked to be freed. A page an ancestor transaction holds dirty has no seal and is not
+checked. The property kept is the one the writer's re-verification exists for: damage is never
+given a fresh checksum.
+
 Bits survive transactions and are shared by every thread, which is what makes the
 cache useful to a caller that opens a transaction per request. What it cannot see
 is the file changing underneath the process, so all bits are dropped once the

@@ -62,7 +62,7 @@ TEST(readChecksumCacheIsOptInAndPersistsUntilInvalidated)
             tst::Scratch scratch("checksum-cache");
             auto options = Env::configure();
             if (cached)
-                options.cacheReadChecksums();
+                options.cacheReadChecksums().writerUsesReadCache(false);
             Env env = options.open(scratch.file());
             env.write([&](Txn& txn) { txn.mainDb().put("key", std::string(size, 'a')); });
             std::fstream file(scratch.file(), std::ios::in | std::ios::out | std::ios::binary);
@@ -161,6 +161,60 @@ TEST(readChecksumCacheForgetsPagesTheWriterRewrites)
     // though its page number was checked before.
     flipByte(scratch.file(), reused * 4096 + internal::kPageHdr + 40);
     env.read([](Txn& txn) { CHECK_THROWS(txn.mainDb().get("key"), ErrorCode::Corrupted); });
+}
+
+/// With writerUsesReadCache() a write transaction reads through the remembered checks, and
+/// still verifies whatever it carries into the next snapshot: a page when it copies it, an
+/// overflow run when it replaces or releases it. Damage never gets a new checksum.
+TEST(writerReadCacheVerifiesWhatItCarriesForward)
+{
+    for (std::size_t size : {10u, 10000u}) {
+        tst::Scratch scratch("checksum-cache-writer-reads");
+        Env env = Env::configure().cacheReadChecksums().writerUsesReadCache().open(scratch.file());
+        env.write([&](Txn& txn) {
+            txn.mainDb().put("key", std::string(size, 'a'));
+            txn.mainDb().put("other", "x");
+        });
+        const auto root = readMeta(scratch.file()).mainTree.root;
+        std::vector<std::uint64_t> storage(4096 / 8);
+        {
+            std::ifstream in(scratch.file(), std::ios::binary);
+            in.seekg(std::streamoff(std::uint64_t(root) * 4096));
+            in.read(reinterpret_cast<char*>(storage.data()), 4096);
+        }
+        const auto* page = reinterpret_cast<const internal::Page*>(storage.data());
+        const auto* node = internal::lnode(page, 0);
+        const std::uint64_t offset = (node->flags & internal::N_BIGDATA)
+            ? internal::bigPgno(node) * 4096 + internal::kPageHdr
+            : std::uint64_t(root) * 4096 + internal::slots(page)[0] + sizeof(*node) + node->ksize;
+        // A reader's check is what the writer will trust.
+        env.read([&](Txn& txn) { CHECK_EQ(txn.mainDb().at("key").string(), std::string(size, 'a')); });
+        flipByte(scratch.file(), offset);
+        for (int action = 0; action < 3; ++action) {
+            Txn txn = env.writeTxn();
+            // Read only: trusted, like a reader's.
+            CHECK(txn.mainDb().at("key").data()[0] != std::byte('a'));
+            // Anything that would write the damage into the next snapshot is refused.
+            if (action == 0)
+                CHECK_THROWS(txn.mainDb().put("key", std::string(size, 'c')), ErrorCode::Corrupted);
+            else if (action == 1)
+                CHECK_THROWS(txn.mainDb().erase("key"), ErrorCode::Corrupted);
+            else if (size > 4096)
+                CHECK_THROWS(txn.mainDb().clear(), ErrorCode::Corrupted);
+            else
+                CHECK_THROWS(txn.mainDb().put("other", "y"), ErrorCode::Corrupted);
+            txn.abort();
+        }
+        flipByte(scratch.file(), offset);  // put the byte back
+        env.write([&](Txn& txn) {
+            CHECK_EQ(txn.mainDb().at("key").string(), std::string(size, 'a'));
+            txn.mainDb().put("key", std::string(size, 'c'));
+        });
+        env.read([&](Txn& txn) {
+            CHECK_EQ(txn.mainDb().at("key").string(), std::string(size, 'c'));
+            checkIntegrity(txn);
+        });
+    }
 }
 
 TEST(readChecksumCacheExpiresAfterTheRevalidationInterval)

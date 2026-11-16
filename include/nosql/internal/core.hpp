@@ -316,6 +316,9 @@ struct EnvImpl
     /// when Options::cacheReadChecksums() asked for it. Empty (disabled)
     /// otherwise. See internal/validation_cache.hpp.
     ValidationCache validation;
+    /// Options::writerUsesReadCache(): a write transaction's descents trust `validation` too;
+    /// see TxnImpl::getPage and verifyBeforeCopy.
+    bool writerCache = false;
 
     /// Live read snapshots as a sorted (txnid, count) histogram; the front
     /// entry is the one pinning reclamation. A sorted vector rather than a map
@@ -612,9 +615,11 @@ struct TxnImpl
         if ((kind == PageKind::Tree && overflow) || (kind == PageKind::Overflow && !overflow))
             throw Error(ErrorCode::Corrupted, "page is not of the kind that points to it");
         // Readers may trust a check this process already made since the page
-        // was last written; writers always re-verify what they are about to
-        // copy forward, so damage can never be sealed under a fresh checksum.
-        if (!forceValidation && readOnly && env->validation.enabled()) {
+        // was last written. A writer re-verifies, so damage can never be
+        // sealed under a fresh checksum; with Options::writerUsesReadCache()
+        // it does that where it copies a page forward (verifyBeforeCopy) or
+        // asks for it here, and its descents trust the cache like a reader's.
+        if (!forceValidation && (readOnly || env->writerCache) && env->validation.enabled()) {
             if (env->validation.isValidated(p))
                 return page;
             // Checked once for many reads: every node, not just the header.
@@ -644,6 +649,25 @@ struct TxnImpl
             validateHeader(page, pageSize());
     }
     bool isOwnDirty(PageNo p) const noexcept { return dirty.find(p) != nullptr; }
+    /// A write transaction's fetch of a page it will act on rather than hand to the
+    /// caller: one whose bytes or run length go into what it writes or frees. Verified
+    /// whatever the cache remembers.
+    Page* getPageForWrite(PageNo p, PageKind kind = PageKind::Tree) const
+    {
+        return getPage(p, true, kind);
+    }
+    /// `p`, which is not this transaction's own, is about to be copied forward. A descent
+    /// under Options::writerUsesReadCache() may have trusted a remembered check; the
+    /// bytes are verified now. A page an ancestor holds dirty has no seal yet.
+    void verifyBeforeCopy(const Page* p) const
+    {
+        if (!env->writerCache)
+            return;
+        for (const TxnImpl* a = parent; a; a = a->parent)
+            if (a->dirty.find(p->pgno))
+                return;
+        validateFetched(p, p->pgno);
+    }
 
     /// Allocate (or recycle) a dirty buffer of `npages` contiguous pages.
     Page* allocBuffer(PageNo p, std::uint16_t flags, unsigned npages);

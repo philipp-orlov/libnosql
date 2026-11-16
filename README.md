@@ -236,6 +236,7 @@ default, so `nosql::Env store("app.db")` works too.
 | `sync(Durability)` | `Durability::Safe` | see below. |
 | `syncInterval(d)` | 1 second | under `Durability::Lazy`, the first commit this long after the last sync runs the next one; zero syncs every commit. |
 | `cacheReadChecksums(b)` | off | let readers trust a page check this process already made; see the integrity tradeoff below. |
+| `writerUsesReadCache(b)` | off | with `cacheReadChecksums()`, let a write transaction's reads trust those checks too; what it copies forward is still verified. |
 | `revalidateAfter(d)` | 1 minute | how long a cached page check may be trusted; zero means for ever. |
 | `bufferCache(n)` | 32 MiB | page buffers kept recycled between transactions. |
 | `dirtyLimit(n)` | 256 MiB | active dirty page buffers; a transaction past it spills pages to the file early; zero disables. |
@@ -255,7 +256,15 @@ later one, on every thread, until the page really changes. What the cache cannot
 see is the file changing underneath the process -- a media or memory fault --
 so every remembered check is dropped after `revalidateAfter()` (default one
 minute), and `Env::invalidateReadCache()` drops them on demand. Write
-transactions and `checkIntegrity(txn)` always verify. The bitmap costs one bit
+transactions and `checkIntegrity(txn)` always verify. With `writerUsesReadCache()`
+as well, a write transaction's gets, seeks and scans trust the remembered checks
+like a reader's (200,000 random gets over 500,000 entries: 865 ns each in a
+write transaction without it, 430 ns with it, the same as in a read
+transaction), and it verifies instead at the points where bytes would enter the
+next snapshot: a page when it is copied forward, an overflow run when it is
+replaced, moved or released. Damage is therefore still never sealed under a new
+checksum; what is given up is the check on bytes handed to the caller, as for
+readers. The bitmap costs one bit
 per page number of `maxSize` (2 MiB for the 64 GiB default at 4 KiB pages,
 capped at 4 MiB); pages beyond the cap verify on every access. The default keeps
 every-read verification. This option does not change format-7 files, checksum
