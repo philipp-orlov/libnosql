@@ -508,7 +508,23 @@ A commit that retired at most 16 pages lists those in the meta record instead
 tree. The next writer absorbs the inline entry first, so a run of small
 commits needs nothing from the tree and writes no free-list page; a reader
 that pins the entry makes the next commit move it into the tree under a
-reserved chunk number. Likewise the descriptors of up to six recently written
+reserved chunk number.
+
+Under `Lazy` and `None` the same holds for exempt pages, which is the usual case
+for a store that is rewritten between syncs: a commit whose retired pages are all
+exempt, and at most 16, lists them inline rather than in an exempt chunk, and
+the environment remembers that this entry is one (`EnvImpl::inlineExemptTxn`,
+with the durable commit it was written under). The next writer of this process
+takes it by the rule for an exempt chunk -- every live snapshot is at or past
+the retiring commit, and the durable commit has not changed -- and if it took
+nothing from the tree and retires as little, its own pages and whatever it did
+not spend go inline again and the free tree is not touched: an autocommit update
+then writes its tree path and nothing else, where it used to write one to three
+free-tree pages as well. In the file the entry is an ordinary inline entry under
+its transaction's id, so a process that opens the store later, or after a
+crash, waits for the retiring commit to be durable before reusing the pages,
+which is only more cautious. An entry a reader holds back moves into the tree
+as an exempt chunk of its transaction, which wrote none of its own. Likewise the descriptors of up to six recently written
 sub-databases live in the meta record (root slots), so such a commit does not
 rewrite the catalog leaf either. A small commit then writes its tree path and
 the meta page and nothing else.
@@ -664,8 +680,10 @@ moves to where committed bytes enter the next snapshot: `verifyBeforeCopy` in `t
 in the rebalance that copies a sibling, and `getPageForWrite` (or a forced `getOverflow`)
 wherever an overflow run's header decides what is freed, reused or moved and where a subtree
 is walked to be freed. A page an ancestor transaction holds dirty has no seal and is not
-checked. The property kept is the one the writer's re-verification exists for: damage is never
-given a fresh checksum.
+checked. A page the same write transaction fetched unverified, and so checked in full a moment
+ago, is not hashed a second time when it is copied (the transaction keeps the last few page
+numbers it verified itself). The property kept is the one the writer's re-verification exists
+for: damage is never given a fresh checksum.
 
 Bits survive transactions and are shared by every thread, which is what makes the
 cache useful to a caller that opens a transaction per request. What it cannot see

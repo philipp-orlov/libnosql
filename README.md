@@ -356,7 +356,13 @@ and a run of nearby lookups gets cheaper; a cursor whose seeks keep missing
 stops trying for a while. In a read transaction a seek that misses the leaf
 but lands under a branch page of the cursor's path starts from that page
 instead of the root, so lookups in key order that are a few leaves apart skip
-the levels above it.
+the levels above it. When the key is past the cursor's leaf, the parent's
+separators are tried outwards from the slot the cursor took (the next leaf, two
+on, four on) before the page is searched whole, which is what stepping from one
+distinct index value to the next amounts to. The first probe of a page is
+interpolated from the keys either side of it; a cursor whose keys do not spread
+evenly, so that those guesses keep landing far off, searches by halves for a
+while instead.
 
 Every branch slot records how many entries lie under it, so
 `Db::countRange(lo, hi)` counts a key range and `Cursor::skip(n)` moves `n`

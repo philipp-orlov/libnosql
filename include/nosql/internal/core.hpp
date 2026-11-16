@@ -223,6 +223,16 @@ struct EnvImpl
     /// such a page, so once retired it waits for readers, not for a sync.
     std::vector<std::uint64_t> born;
     TxnId bornEpoch = 0;
+    /// Writer only (guarded by `mtx`): the inline free-list entry of the newest commit,
+    /// Meta::inlineTxn == inlineExemptTxn, lists only pages that no durable snapshot
+    /// names -- born under durable commit `inlineExemptEpoch` and retired since, or
+    /// free before that. In the file it is an ordinary entry, which is only more
+    /// cautious; this process may reuse its pages as it does an exempt chunk's, as
+    /// soon as readers allow and while that commit is still the durable one. A small
+    /// commit under Lazy or None then finds its pages there and writes no free-tree
+    /// page. Zero when the entry is not such a one.
+    TxnId inlineExemptTxn = 0;
+    TxnId inlineExemptEpoch = 0;
     void noteBorn(PageNo first, unsigned count)
     {
         const std::size_t need = std::size_t((first + count - 1) / 64 + 1);
@@ -608,6 +618,10 @@ struct TxnImpl
     /// This commit's entry went inline: these pages under our txnid.
     bool inlineOurs = false;
     std::vector<PageNo> inlinePages;
+    /// The snapshot's inline entry is one this writer may take as it would an
+    /// exempt chunk (EnvImpl::inlineExemptTxn), and ours will be one for the next.
+    bool inlineExempt = false;
+    bool inlineOursExempt = false;
     /// Set while the commit rewrites the GC tree. It stops the allocator
     /// absorbing *new* GC entries (which would need deleting after the delete
     /// pass has already run), but pages already absorbed stay spendable -- if
@@ -708,11 +722,31 @@ struct TxnImpl
             if (!overflow)
                 validateNodes(page, pageSize());
             env->validation.markValidated(p);
+            if (!readOnly)
+                noteChecked(p);
             return page;
         }
         validateFetched(page, p);
+        if (!readOnly)
+            noteChecked(p);
         return page;
     }
+    /// The pages this write transaction last verified itself, so copying one
+    /// of them forward does not hash it a second time.
+    void noteChecked(PageNo p) const noexcept
+    {
+        checkedHere[checkedAt++ % kCheckedHere] = p;
+    }
+    bool checkedByThis(PageNo p) const noexcept
+    {
+        for (PageNo q : checkedHere)
+            if (q == p)
+                return true;
+        return false;
+    }
+    static constexpr unsigned kCheckedHere = 8;
+    mutable PageNo checkedHere[kCheckedHere] = {};
+    mutable unsigned checkedAt = 0;
     /// The first page of the overflow run holding `vsize` value bytes.
     Page* getOverflow(PageNo p, std::uint64_t vsize, bool forceValidation = false) const
     {
@@ -739,10 +773,11 @@ struct TxnImpl
     }
     /// `p`, which is not this transaction's own, is about to be copied forward. A descent
     /// under Options::writerUsesReadCache() may have trusted a remembered check; the
-    /// bytes are verified now. A page an ancestor holds dirty has no seal yet.
+    /// bytes are verified now, unless this transaction's own fetch just did. A page an
+    /// ancestor holds dirty has no seal yet.
     void verifyBeforeCopy(const Page* p) const
     {
-        if (!env->writerCache)
+        if (!env->writerCache || checkedByThis(p->pgno))
             return;
         for (const TxnImpl* a = parent; a; a = a->parent)
             if (a->dirty.find(p->pgno))
@@ -868,6 +903,11 @@ struct CursorImpl
     /// (b_tree.cpp, seekFromPath).
     std::uint8_t pathMisses = 0;
     std::uint8_t pathSkip = 0;
+    /// Leaf searches whose interpolated first probe landed far from the key
+    /// (keys that do not spread evenly between their bounds: an index value
+    /// followed by a row id), and how many descents search by halves instead.
+    std::uint8_t guessMisses = 0;
+    std::uint8_t guessSkip = 0;
 
     Tree& tree() const
     {

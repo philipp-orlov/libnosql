@@ -505,6 +505,7 @@ void formatStore(EnvImpl& e)
     os::syncFile(e.fd, true);
     e.meta = m;
     e.writerMeta = m;
+    e.inlineExemptTxn = 0;
     e.durableTxn = 0;
     e.durableSlot = 0;
 }
@@ -606,6 +607,7 @@ void loadMeta(EnvImpl& e)
         throw Error(ErrorCode::Corrupted, "no usable meta page in " + e.path.string());
     e.meta = *best;
     e.writerMeta = *best;
+    e.inlineExemptTxn = 0;
     e.durableTxn = best->txnid;
     e.durableSlot = bestSlot;
     if (std::uint64_t(e.meta.deferredCount) + e.meta.inlineCount > e.meta.deferredPages.size())

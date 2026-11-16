@@ -356,7 +356,10 @@ spend still goes into the tree under its id. The next writer absorbs the
 inline entry before any tree chunk when `inlineTxn` is no newer than the
 oldest live snapshot; otherwise, at commit, it moves the entry into the tree
 under `(inlineTxn, 2^64 - 1)` -- a chunk number no commit writes for itself --
-before recording its own.
+before recording its own. Under `Durability::Lazy` and `None` the entry may
+list pages of the third kind below instead; that is knowledge of the process
+that wrote it and not in the file, where it reads as any inline entry, and
+moved into the tree it is the chunk `(inlineTxn, 01 E 0)`.
 
 The top two bits of the chunk number name two further kinds of entry, written
 only under `Durability::Lazy` and `None` (a store written by an older build has

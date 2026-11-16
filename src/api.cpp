@@ -254,6 +254,8 @@ Txn Env::beginWriter()
             t->oldest = e->oldestSnapshot();
             t->readersOldest = t->oldest;
             t->exemptEpoch = 0;
+            t->inlineExempt = false;
+            t->inlineOursExempt = false;
             if (e->deferredMeta()) {
                 const TxnId newest = e->writerMeta.txnid;
                 const EnvImpl::LiveReaders live = e->liveReaders();
@@ -262,6 +264,9 @@ Txn Env::beginWriter()
                 // A sync beside us is still making a newer commit durable: its pages stay put.
                 if (e->syncTarget > e->durableTxn)
                     t->readersOldest = t->oldest;
+                t->inlineExempt = e->inlineExemptTxn != 0 && e->writerMeta.inlineCount != 0 &&
+                                  e->inlineExemptTxn == e->writerMeta.inlineTxn &&
+                                  e->inlineExemptEpoch == t->exemptEpoch;
             }
         }
         // Pages handed out under an older durable commit may be named by the

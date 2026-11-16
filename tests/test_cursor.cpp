@@ -449,11 +449,23 @@ TEST(seeksThatStartBelowTheRootFindWhatAFullSearchFinds)
     // Trees of four levels or so, so a seek that leaves the cursor's leaf can
     // start from a branch page of its path: eight-byte keys as a row id is
     // stored, and keys long enough that few fit a page.
-    for (int shape = 0; shape < 2; ++shape) {
+    // The third shape is an index entry's: a value many keys share, then a
+    // number that does not spread evenly, so a slot guessed from a page's
+    // bounds lands far off and the search goes back to halving.
+    for (int shape = 0; shape < 3; ++shape) {
         tst::Scratch s("cursor");
         Env e = Env::configure().open(s.file());
         auto keyOf = [&](std::uint64_t i) {
             std::string k;
+            if (shape == 2) {
+                const std::uint64_t group = i / 600, j = i % 600;
+                for (int b = 2; b >= 0; --b)
+                    k.push_back(char(group >> (8 * b)));
+                const std::uint64_t skewed = j * j * j * 1000;
+                for (int b = 7; b >= 0; --b)
+                    k.push_back(char(skewed >> (8 * b)));
+                return k;
+            }
             if (shape == 1)
                 k.assign(300, 'k');
             for (int b = 7; b >= 0; --b)
@@ -462,7 +474,7 @@ TEST(seeksThatStartBelowTheRootFindWhatAFullSearchFinds)
                 k.append(std::to_string(i % 7));
             return k;
         };
-        const std::uint64_t n = shape == 0 ? 400000 : 30000;
+        const std::uint64_t n = shape == 0 ? 400000 : shape == 1 ? 30000 : 300000;
         e.write([&](Txn& t) {
             Db d = t.mainDb();
             for (std::uint64_t i = 0; i < n; ++i)

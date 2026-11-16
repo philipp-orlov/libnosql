@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <vector>
 
+#include "nosql/inspect.hpp"
 #include "nosql/nosql.hpp"
 #include "nosql/internal/free_list.hpp"
 #include "tests/test_util.hpp"
@@ -456,6 +457,89 @@ TEST(skippedFreeEntriesAreReusedOnceASyncReleasesThem)
         for (int i = 0; i < keys; ++i)
             CHECK(d.get(tst::keyOf(i)).value() == Slice(tst::blob(60, version[i] ? version[i] * keys + i : i)));
     });
+}
+
+/// Under None and Lazy the pages a small commit retires are ones no durable snapshot names,
+/// most often: they go into the meta page's inline entry and the next commit takes them from
+/// there (EnvImpl::inlineExemptTxn), so such commits in a row write no free-tree page. A
+/// reader holds the entry back, a sync makes it an ordinary one, and neither loses a page or
+/// lists one twice.
+TEST(smallCommitsWithoutSyncLeaveTheFreeTreeAlone)
+{
+    tst::Scratch s("reclaim");
+    const int keys = 3000;
+    std::vector<int> version(keys, 0);
+    std::mt19937_64 rng(23);
+    {
+        Env e = Env::configure().pageSize(1024).maxSize(1ull << 30).sync(Durability::None).open(s.file());
+        e.write([&](Txn& t) {
+            auto d = t.mainDb();
+            for (int i = 0; i < keys; ++i)
+                d.put(tst::keyOf(i), tst::blob(60, i));
+        });
+        const auto rewrite = [&](int commits) {
+            for (int n = 0; n < commits; ++n) {
+                const int k = int(rng() % keys);
+                e.write([&](Txn& t) { t.mainDb().put(tst::keyOf(k), tst::blob(60, ++version[k] * keys + k)); });
+            }
+        };
+        const auto freeRoot = [&] {
+            std::uint64_t root = 0;
+            e.read([&](Txn& t) { root = inspect::trees(t).at(0).root; });
+            return root;
+        };
+        rewrite(50);
+        const std::uint64_t root = freeRoot();
+        const std::uint64_t used = e.stats().usedPages;
+        rewrite(3000);
+        CHECK_EQ(freeRoot(), root);
+        CHECK_EQ(e.stats().usedPages, used);
+        e.read([&](Txn& t) { checkIntegrity(t); });
+
+        // A reader holds every entry back; what piled up is found again after it.
+        {
+            Txn reader = e.readTxn();
+            rewrite(300);
+            CHECK(e.stats().usedPages > used);
+            e.read([&](Txn& t) { checkIntegrity(t); });
+            reader.abort();
+        }
+        rewrite(600);
+        const std::uint64_t settled = e.stats().usedPages;
+        rewrite(3000);
+        CHECK(e.stats().usedPages <= settled + 8);
+        e.read([&](Txn& t) { checkIntegrity(t); });
+
+        // A sync: the durable snapshot names every page, and the entry of the commit before
+        // it is no longer one to take early.
+        for (int round = 0; round < 4; ++round) {
+            e.sync();
+            rewrite(1500);
+            e.read([&](Txn& t) { checkIntegrity(t); });
+        }
+        CHECK(e.stats().usedPages <= settled + settled / 4);
+        // Aborts in between give back what they took.
+        for (int n = 0; n < 200; ++n) {
+            Txn t = e.writeTxn();
+            for (int j = 0; j < 5; ++j)
+                t.mainDb().put(tst::keyOf(int(rng() % keys)), tst::blob(60, 7));
+            t.abort();
+            rewrite(3);
+        }
+        e.read([&](Txn& t) { checkIntegrity(t); });
+        e.sync();
+        rewrite(40);
+        e.sync();
+    }
+    Env e = Env::configure().pageSize(1024).open(s.file());
+    e.read([&](Txn& t) {
+        checkIntegrity(t);
+        auto d = t.mainDb();
+        for (int i = 0; i < keys; ++i)
+            CHECK(d.get(tst::keyOf(i)).value() == Slice(tst::blob(60, version[i] ? version[i] * keys + i : i)));
+    });
+    e.write([&](Txn& t) { t.mainDb().put(tst::keyOf(1), tst::blob(60, 1)); });
+    e.read([&](Txn& t) { checkIntegrity(t); });
 }
 
 int main()

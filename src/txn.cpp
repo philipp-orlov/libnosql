@@ -138,6 +138,9 @@ void TxnImpl::reset()
     inlineAbsorbed = false;
     inlineOurs = false;
     inlinePages.clear();
+    inlineExempt = false;
+    inlineOursExempt = false;
+    std::fill(std::begin(checkedHere), std::end(checkedHere), PageNo(0));
     noAbsorb = false;
     noSpend = false;
     occTrack = false;
@@ -286,26 +289,38 @@ PageNo freePageNumber(const TxnImpl* t, PageNo p)
     return p;
 }
 
+/// Absorbs the snapshot's inline entry into the reclaim list if this writer
+/// may: it was retired at or before `oldest`, or it lists only pages no
+/// durable snapshot names (TxnImpl::inlineExempt) and readers allow it, the
+/// rule for an exempt chunk. Costs no tree access.
+bool absorbInline(TxnImpl* t)
+{
+    if (t->inlineAbsorbed || !t->meta.inlineCount)
+        return false;
+    if (t->meta.inlineTxn > t->oldest && !(t->inlineExempt && t->meta.inlineTxn <= t->readersOldest))
+        return false;
+    const std::size_t d = t->meta.deferredCount, n = t->meta.inlineCount;
+    if (d + n > t->meta.deferredPages.size())
+        throw Error(ErrorCode::Corrupted, "invalid inline free-list count");
+    const std::size_t joined = t->reclaim.size();
+    t->reclaim.resize(joined + n);
+    for (std::size_t i = 0; i < n; ++i)
+        t->reclaim[joined + i] = freePageNumber(t, t->meta.deferredPages[d + i]);
+    std::sort(t->reclaim.begin() + std::ptrdiff_t(joined), t->reclaim.end());
+    mergeReclaimed(t, joined);
+    t->inlineAbsorbed = true;
+    return true;
+}
+
 /// Absorb the next GC entry into the reclaim list. Only entries retired by a
 /// transaction no live snapshot can still see are eligible.
 bool reclaimMore(TxnImpl* t)
 {
     if (t->noAbsorb)
         return false;
-    // The snapshot's inline entry first: absorbing it costs no tree access.
-    if (!t->inlineAbsorbed && t->meta.inlineCount && t->meta.inlineTxn <= t->oldest) {
-        const std::size_t d = t->meta.deferredCount, n = t->meta.inlineCount;
-        if (d + n > t->meta.deferredPages.size())
-            throw Error(ErrorCode::Corrupted, "invalid inline free-list count");
-        const std::size_t joined = t->reclaim.size();
-        t->reclaim.resize(joined + n);
-        for (std::size_t i = 0; i < n; ++i)
-            t->reclaim[joined + i] = freePageNumber(t, t->meta.deferredPages[d + i]);
-        std::sort(t->reclaim.begin() + std::ptrdiff_t(joined), t->reclaim.end());
-        mergeReclaimed(t, joined);
-        t->inlineAbsorbed = true;
+    // The snapshot's inline entry first.
+    if (absorbInline(t))
         return true;
-    }
     if (t->reclaimDrained)
         return false;
     CursorImpl c;
@@ -546,7 +561,36 @@ void updateFreelist(TxnImpl* t)
     // than an inline entry, about half a page per chunk. Otherwise small
     // commits can spend the inline free entry, then extend the file for GC
     // bookkeeping while older free chunks go unused.
-    if (t->treeAt(kFreeDbi).root != kInvalidPage) {
+    // At most this many of our retired pages go inline, leaving room in the
+    // meta page's shared array for pages a commit frees too late (deferred).
+    constexpr std::size_t kInlineMax = 16;
+    // Under Lazy and None, what this commit absorbed and did not spend goes
+    // back under `oldest`, which no absorbed entry is newer than, instead of
+    // under our own id: there it would wait for the next sync although no
+    // snapshot that matters names it. The chunk numbers carry our id, so no
+    // other commit writes the same keys (see remainderChunk).
+    const bool keepReusable = t->env->deferredMeta() && t->txnid < kRemainderTxnLimit;
+
+    // A small commit under Lazy or None whose retired pages no durable
+    // snapshot names, and which took nothing from the tree, leaves the tree
+    // alone: those pages and the unspent ones go into the inline entry, which
+    // the next writer may take as it would an exempt chunk. Such commits in a
+    // row then write no free-tree page at all.
+    bool offTree = false;
+    if (keepReusable && t->consumed.empty()) {
+        absorbInline(t);
+        if (t->inlineAbsorbed || !t->meta.inlineCount) {
+            const std::vector<PageNo>& carried = t->env->carryOver;
+            const std::size_t unspent = t->reclaim.size() - t->reclaimPos;
+            offTree = t->pending.size() + t->loose.size() + carried.size() + unspent <= kInlineMax;
+            const auto born = [t](PageNo p) { return t->env->isBorn(p); };
+            offTree = offTree && std::all_of(t->pending.begin(), t->pending.end(), born) &&
+                      std::all_of(t->loose.begin(), t->loose.end(), born) &&
+                      std::all_of(carried.begin(), carried.end(), born);
+        }
+    }
+
+    if (!offTree && t->treeAt(kFreeDbi).root != kInvalidPage) {
         const std::size_t chunkPages = freeChunkPages(t->pageSize());
         const std::size_t retired = t->pending.size() + t->loose.size();
         const std::size_t chunkReserve =
@@ -588,7 +632,10 @@ void updateFreelist(TxnImpl* t)
         if (d + n > t->meta.deferredPages.size())
             throw Error(ErrorCode::Corrupted, "invalid inline free-list count");
         WritableSlice w;
-        if (!treePut(c, freeKey(t->meta.inlineTxn, kInlineChunk).slice(), Slice(nullptr, n * sizeof(PageNo)),
+        // One that lists only pages no durable snapshot names stays what it
+        // is, an exempt chunk of its transaction, which wrote none itself.
+        const std::uint64_t chunk = t->inlineExempt ? exemptChunk(t->exemptEpoch, 0) : kInlineChunk;
+        if (!treePut(c, freeKey(t->meta.inlineTxn, chunk).slice(), Slice(nullptr, n * sizeof(PageNo)),
                      PutMode::InsertUnique, &w))
             throw Error(ErrorCode::Corrupted, "inline free-list entry is already in the tree");
         for (std::size_t i = 0; i < n; ++i)
@@ -612,17 +659,9 @@ void updateFreelist(TxnImpl* t)
     const bool runs = metaVersion(t->meta) >= kFormatPrefix || t->prefixFormat;
     std::size_t written = 0;  ///< chunks currently recorded under our id
     constexpr int kMaxRounds = 8;
-    // At most this many of our retired pages go inline, leaving room in the
-    // meta page's shared array for pages a commit frees too late (deferred).
-    constexpr std::size_t kInlineMax = 16;
     bool inlineFreed = false;
+    bool inlineExempt = false;  ///< what goes inline is reusable as an exempt chunk is
     std::vector<PageNo>& remainder = t->gcRemainder;
-    // Under Lazy and None, what this commit absorbed and did not spend goes
-    // back under `oldest`, which no absorbed entry is newer than, instead of
-    // under our own id: there it would wait for the next sync although no
-    // snapshot that matters names it. The chunk numbers carry our id, so no
-    // other commit writes the same keys (see remainderChunk).
-    const bool keepReusable = t->env->deferredMeta() && t->txnid < kRemainderTxnLimit;
     std::size_t writtenOld = 0;     ///< chunks currently recorded under `oldest`
     std::size_t writtenExempt = 0;  ///< exempt chunks currently recorded under our id
     std::size_t listed = 0;         ///< pages the chunks written so far list
@@ -672,6 +711,22 @@ void updateFreelist(TxnImpl* t)
                 (t->env->isBorn(p) ? exempt : pinned).push_back(p);
         } else {
             assignGrowing(pinned, freed.begin(), freed.end());
+        }
+        if (offTree && round == 0 && useOldKeys && pinned.empty() && acc.size() <= kInlineMax) {
+            // Nothing was taken from the tree and nothing goes into it: `acc`,
+            // the retired pages with the unspent ones, is the inline entry.
+            assignGrowing(pinned, acc.begin(), acc.end());
+            retired = &pinned;
+            inlineFreed = !pinned.empty();
+            inlineExempt = true;
+            break;
+        }
+        // Retired pages that are all exempt, and few, go inline as pinned ones
+        // do: the next writer takes them from there without a tree access.
+        inlineExempt = useOldKeys && pinned.empty() && !exempt.empty() && exempt.size() <= kInlineMax;
+        if (inlineExempt) {
+            pinned.swap(exempt);
+            exempt.clear();
         }
         retired = useOldKeys ? &pinned : &freed;
         inlineFreed = !retired->empty() && retired->size() <= kInlineMax;
@@ -723,6 +778,7 @@ void updateFreelist(TxnImpl* t)
     if (inlineFreed) {
         assignGrowing(t->inlinePages, retired->begin(), retired->end());
         t->inlineOurs = true;
+        t->inlineOursExempt = inlineExempt;
     }
 
     // Pages freed too late to make it into the entry above roll into the next
@@ -739,6 +795,7 @@ void updateFreelist(TxnImpl* t)
         carry.insert(carry.end(), t->inlinePages.begin(), t->inlinePages.end());
         t->inlinePages.clear();
         t->inlineOurs = false;
+        t->inlineOursExempt = false;
     }
     t->pending.clear();
     t->loose.clear();
@@ -948,6 +1005,11 @@ void publishToWritersLocked(EnvImpl& e, TxnImpl* t, const Meta& m)
     e.reclaimSkip.from = t->reclaimSkip;
     e.reclaimSkip.valid = true;
     e.carryOver.swap(t->carryNext);
+    // The inline entry is ours, gone, or the snapshot's carried forward as it was.
+    if (t->inlineOurs || !m.inlineCount) {
+        e.inlineExemptTxn = t->inlineOurs && t->inlineOursExempt ? TxnId(m.inlineTxn) : 0;
+        e.inlineExemptEpoch = t->exemptEpoch;
+    }
     e.freeTreePages = std::uint64_t(std::int64_t(e.freeTreePages) + t->freeTreeDelta);
     e.occLog.record(m.txnid, t->occTrack && !t->occUnknown ? &t->occWritten : nullptr);
     // Every snapshot still validated against, a reader's or an optimistic

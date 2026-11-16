@@ -398,17 +398,22 @@ unsigned branchSearchIn(const Page* p, Slice key, CompareFn cmp, const Bounds& b
            1;
 }
 
+/// `far`, when given, is set if the guess was tried and landed further from
+/// the key than a search by halves would have cost to cover.
 unsigned leafLowerBoundIn(const Page* p, Slice key, CompareFn cmp, const Bounds& b, bool* exact,
-                          std::size_t ps)
+                          std::size_t ps, bool* far = nullptr)
 {
     const unsigned n = p->nkeys;
     if (cmp != &cmpLexicographic || !b.known() || n < 8 || (p->flags & P_SHARED))
         return leafLowerBound(p, key, cmp, exact, ps);
     const LexCmp lex;
     const std::size_t top = nodeTop(p, ps);
-    const unsigned i = searchFrom(0, n, guessSlot(b, key, n), [&](unsigned j) {
+    const unsigned guess = guessSlot(b, key, n);
+    const unsigned i = searchFrom(0, n, guess, [&](unsigned j) {
         return lex(checkedLeafKey(p, j, top), key) < 0;
     });
+    if (far)
+        *far = (i > guess ? i - guess : guess - i) > 8;
     *exact = i < n && lex(checkedLeafKey(p, i, top), key) == 0;
     return i;
 }
@@ -1342,7 +1347,7 @@ Slice leafValueOverflow(TxnImpl* t, const Page* p, unsigned i)
 namespace {
 /// Descends from c.pg[c.top], a page `key` belongs under, to the leaf slot
 /// where `key` is or would be.
-void descendTo(CursorImpl& c, Slice key, CompareFn cmp, bool* exact);
+void descendTo(CursorImpl& c, Slice key, CompareFn cmp, bool* exact, Bounds b = {});
 }  // namespace
 
 bool treeSearch(CursorImpl& c, Slice key, bool* exact)
@@ -1367,15 +1372,19 @@ bool treeSearch(CursorImpl& c, Slice key, bool* exact)
 
 namespace {
 
-void descendTo(CursorImpl& c, Slice key, CompareFn cmp, bool* exact)
+void descendTo(CursorImpl& c, Slice key, CompareFn cmp, bool* exact, Bounds b)
 {
-    Bounds b;
+    // A cursor whose guesses keep landing far off searches by halves for a
+    // while: bounds are not passed down, so no page interpolates.
+    const bool guess = c.guessSkip == 0;
+    if (!guess)
+        --c.guessSkip;
     while (isBranch(c.pg[c.top])) {
         const Page* p = c.pg[c.top];
         if (p->nkeys == 0)
             throw Error(ErrorCode::Corrupted, "empty branch page");
         const std::size_t ps = c.txn->pageSize();
-        const unsigned i = branchSearchIn(p, key, cmp, b, ps);
+        const unsigned i = guess ? branchSearchIn(p, key, cmp, b, ps) : branchSearch(p, key, cmp, ps);
         c.idx[c.top] = std::uint16_t(i);
         if (c.top + 1 >= kMaxDepth)
             throw Error(ErrorCode::Corrupted, "b-tree exceeded maximum depth");
@@ -1393,8 +1402,19 @@ void descendTo(CursorImpl& c, Slice key, CompareFn cmp, bool* exact)
         c.pg[c.top + 1] = c.txn->getPage(checkedChild(p, i, ps));
         ++c.top;
     }
+    if (!guess) {
+        c.idx[c.top] = std::uint16_t(leafLowerBound(c.pg[c.top], key, cmp, exact, c.txn->pageSize()));
+        return;
+    }
+    bool far = false;
     c.idx[c.top] =
-        std::uint16_t(leafLowerBoundIn(c.pg[c.top], key, cmp, b, exact, c.txn->pageSize()));
+        std::uint16_t(leafLowerBoundIn(c.pg[c.top], key, cmp, b, exact, c.txn->pageSize(), &far));
+    if (!far) {
+        c.guessMisses = 0;
+    } else if (++c.guessMisses >= 2) {
+        c.guessMisses = 0;
+        c.guessSkip = 64;
+    }
 }
 
 void checkIntegerKey(const Tree& tr, Slice key)
@@ -1938,6 +1958,52 @@ bool seekFromPath(CursorImpl& c, Slice key, bool* exact)
         return false;
     const std::size_t ps = c.txn->pageSize();
     const LexCmp lex;
+    {
+        // The cursor's own leaf or one a few after it, most often: probes in
+        // key order land there, and the parent's separators next to the slot
+        // taken say so in fewer steps than a search of the whole page.
+        const Page* p = c.pg[c.top - 1];
+        const unsigned i = c.idx[c.top - 1], n = p->nkeys;
+        if (isBranch(p) && !(p->flags & P_SHARED) && i >= 1 && i + 2u < n) {
+            const std::size_t top = nodeTop(p, ps);
+            unsigned child = n;
+            if (lex(checkedBranchKey(p, i + 1, top), key) <= 0) {
+                // Gallop right: `at` is the last separator known <= key.
+                unsigned at = i + 1, end = n;
+                for (unsigned step = 1; at + step < n; step *= 2) {
+                    if (lex(checkedBranchKey(p, at + step, top), key) > 0) {
+                        end = at + step;
+                        break;
+                    }
+                    at += step;
+                }
+                while (at + 1 < end) {
+                    const unsigned mid = at + (end - at) / 2;
+                    if (lex(checkedBranchKey(p, mid, top), key) <= 0)
+                        at = mid;
+                    else
+                        end = mid;
+                }
+                // The last child's upper end is not this page's to know.
+                if (at + 1 < n)
+                    child = at;
+            } else if (lex(checkedBranchKey(p, i, top), key) <= 0) {
+                child = i;
+            }
+            if (child < n) {
+                Bounds b;
+                b.low = checkedBranchKey(p, child, top);
+                b.high = checkedBranchKey(p, child + 1, top);
+                c.pathMisses = 0;
+                if (child != i) {
+                    c.idx[c.top - 1] = std::uint16_t(child);
+                    c.pg[c.top] = c.txn->getPage(checkedChild(p, child, ps));
+                }
+                descendTo(c, key, &cmpLexicographic, exact, b);
+                return true;
+            }
+        }
+    }
     for (int lvl = c.top - 1; lvl >= 1; --lvl) {
         const Page* p = c.pg[lvl];
         const unsigned n = p->nkeys;
