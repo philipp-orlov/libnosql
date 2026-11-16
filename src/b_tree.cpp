@@ -172,6 +172,13 @@ struct LexCmp
     {
         const std::byte* pa = a.data();
         const std::byte* pb = b.data();
+        // Two eight-byte keys -- a row id, most often -- are one comparison.
+        if (a.size() == 8 && b.size() == 8) {
+            std::uint64_t x, y;
+            std::memcpy(&x, pa, 8);
+            std::memcpy(&y, pb, 8);
+            return x == y ? 0 : (memoryOrder(x) < memoryOrder(y) ? -1 : 1);
+        }
         const std::size_t n = std::min(a.size(), b.size());
         if (n >= 8) {
             std::uint64_t x, y;
@@ -313,6 +320,11 @@ unsigned guessSlot(const Bounds& b, Slice key, unsigned n) noexcept
     while (at < m && lo[at] == hi[at])
         ++at;
     auto word = [at](Slice s) {
+        if (at + 8 <= s.size()) {
+            std::uint64_t v;
+            std::memcpy(&v, s.data() + at, 8);
+            return memoryOrder(v);
+        }
         std::uint64_t v = 0;
         for (std::size_t j = 0; j < 8; ++j)
             v = (v << 8) |
@@ -1327,6 +1339,12 @@ Slice leafValueOverflow(TxnImpl* t, const Page* p, unsigned i)
     return Slice(reinterpret_cast<const std::byte*>(ov) + kPageHdr, n->vsize);
 }
 
+namespace {
+/// Descends from c.pg[c.top], a page `key` belongs under, to the leaf slot
+/// where `key` is or would be.
+void descendTo(CursorImpl& c, Slice key, CompareFn cmp, bool* exact);
+}  // namespace
+
 bool treeSearch(CursorImpl& c, Slice key, bool* exact)
 {
     *exact = false;
@@ -1343,6 +1361,14 @@ bool treeSearch(CursorImpl& c, Slice key, bool* exact)
     }
     c.top = 0;
     c.pg[0] = c.txn->getPage(tr.root);
+    descendTo(c, key, cmp, exact);
+    return true;
+}
+
+namespace {
+
+void descendTo(CursorImpl& c, Slice key, CompareFn cmp, bool* exact)
+{
     Bounds b;
     while (isBranch(c.pg[c.top])) {
         const Page* p = c.pg[c.top];
@@ -1369,10 +1395,7 @@ bool treeSearch(CursorImpl& c, Slice key, bool* exact)
     }
     c.idx[c.top] =
         std::uint16_t(leafLowerBoundIn(c.pg[c.top], key, cmp, b, exact, c.txn->pageSize()));
-    return true;
 }
-
-namespace {
 
 void checkIntegerKey(const Tree& tr, Slice key)
 {
@@ -1893,12 +1916,64 @@ bool seekInLeaf(CursorImpl& c, Slice key, bool* exact)
     return true;
 }
 
+/// A seek that missed the cursor's leaf but lands near it: the search starts
+/// at the lowest branch page of the cursor's path that `key` certainly
+/// belongs under -- its key lies between that page's first and last
+/// separator -- instead of at the root. Lookups in key order (the rows an
+/// index range names, a join's probes, the probes of an IN list) seldom leave
+/// the branch page above the last leaf, so they skip the levels over it.
+///
+/// Read transactions only: their pages never change, so the path the last
+/// seek left is still the tree. Probes that keep missing stop being tried for
+/// a while, as in seekInLeaf.
+bool seekFromPath(CursorImpl& c, Slice key, bool* exact)
+{
+    if (c.pathSkip) {
+        --c.pathSkip;
+        return false;
+    }
+    if (!c.txn->readOnly || !c.positioned || c.top < 2 || c.seqSeen != c.txn->root()->seq)
+        return false;
+    if (comparatorFor(c.tree().flags) != &cmpLexicographic || !isLeaf(c.pg[c.top]))
+        return false;
+    const std::size_t ps = c.txn->pageSize();
+    const LexCmp lex;
+    for (int lvl = c.top - 1; lvl >= 1; --lvl) {
+        const Page* p = c.pg[lvl];
+        const unsigned n = p->nkeys;
+        if (!isBranch(p) || (p->flags & P_SHARED) || n < 3)
+            continue;
+        const std::size_t top = nodeTop(p, ps);
+        // Slot 0 has no key (it stands for everything below slot 1), so the
+        // page's own range is only known to hold [key 1, key n-1).
+        if (lex(checkedBranchKey(p, 1, top), key) <= 0 && lex(key, checkedBranchKey(p, n - 1, top)) < 0) {
+            c.pathMisses = 0;
+            c.top = lvl;
+            descendTo(c, key, &cmpLexicographic, exact);
+            return true;
+        }
+    }
+    if (++c.pathMisses >= 4) {
+        c.pathMisses = 0;
+        c.pathSkip = 32;
+    }
+    return false;
+}
+
 }  // namespace
 
 bool cursorSeek(CursorImpl& c, Slice key)
 {
     bool exact = false;
     if (seekInLeaf(c, key, &exact)) {
+        setAnchor(c);
+        return true;
+    }
+    if (seekFromPath(c, key, &exact)) {
+        if (!normalizeForward(c)) {
+            c.unposition();
+            return false;
+        }
         setAnchor(c);
         return true;
     }
@@ -1916,6 +1991,14 @@ bool cursorSeekExact(CursorImpl& c, Slice key)
 {
     bool exact = false;
     if (seekInLeaf(c, key, &exact)) {
+        if (!exact) {
+            c.unposition();
+            return false;
+        }
+        setAnchor(c);
+        return true;
+    }
+    if (seekFromPath(c, key, &exact)) {
         if (!exact) {
             c.unposition();
             return false;

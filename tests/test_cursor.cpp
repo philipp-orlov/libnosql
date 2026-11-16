@@ -444,6 +444,85 @@ TEST(seeksNearTheLastOneStayCorrect)
     CHECK(!stale.boundTo(r2.mainDb()));
 }
 
+TEST(seeksThatStartBelowTheRootFindWhatAFullSearchFinds)
+{
+    // Trees of four levels or so, so a seek that leaves the cursor's leaf can
+    // start from a branch page of its path: eight-byte keys as a row id is
+    // stored, and keys long enough that few fit a page.
+    for (int shape = 0; shape < 2; ++shape) {
+        tst::Scratch s("cursor");
+        Env e = Env::configure().open(s.file());
+        auto keyOf = [&](std::uint64_t i) {
+            std::string k;
+            if (shape == 1)
+                k.assign(300, 'k');
+            for (int b = 7; b >= 0; --b)
+                k.push_back(char((i ^ 0x8000000000000000ull) >> (8 * b)));
+            if (shape == 1)
+                k.append(std::to_string(i % 7));
+            return k;
+        };
+        const std::uint64_t n = shape == 0 ? 400000 : 30000;
+        e.write([&](Txn& t) {
+            Db d = t.mainDb();
+            for (std::uint64_t i = 0; i < n; ++i)
+                d.put(keyOf(i * 3), "v" + std::to_string(i * 3));
+        });
+        e.read([&](Txn& t) {
+            Db d = t.mainDb();
+            CHECK(d.stats().depth >= 3);
+            Cursor c = d.cursor();
+            std::uint64_t checked = 0;
+            auto probe = [&](std::uint64_t target) {
+                const std::string k = keyOf(target);
+                // What a search from the root finds, through a cursor of its own.
+                Cursor fresh = d.cursor();
+                const bool want = fresh.seek(k);
+                const bool got = c.seek(k);
+                CHECK_EQ(got, want);
+                if (got && want) {
+                    CHECK(c.key().string() == fresh.key().string());
+                    CHECK(c.value().string() == fresh.value().string());
+                }
+                Slice v;
+                const bool exact = c.seekExact(k, v);
+                CHECK_EQ(exact, target % 3 == 0 && target < n * 3);
+                if (exact)
+                    CHECK_EQ(v.string(), "v" + std::to_string(target));
+                // After an exact miss the cursor is unpositioned; a scan step from a hit goes on.
+                if (exact && c.next())
+                    CHECK(c.key().string() == keyOf(target + 3));
+                ++checked;
+            };
+            std::mt19937_64 rng(11);
+            const std::uint64_t top = n * 3;
+            // strides that leave the leaf but seldom the branch page above it, up and down
+            for (std::uint64_t stride : {50ull, 400ull, 3000ull, 40000ull}) {
+                for (std::uint64_t at = 1000; at < top && at < 1000 + stride * 400; at += stride)
+                    probe(at);
+                for (std::uint64_t at = top - 7; at > stride * 2 && at > top - stride * 400; at -= stride)
+                    probe(at);
+            }
+            // around the ends of the key space, and past them
+            for (std::uint64_t at = 0; at < 40; ++at)
+                probe(at);
+            for (std::uint64_t at = top - 40; at < top + 40; ++at)
+                probe(at);
+            // near seeks and far ones mixed, so the path is used, missed and left alone in turn
+            std::uint64_t at = top / 2;
+            for (int i = 0; i < 20000; ++i) {
+                const std::uint64_t r = rng();
+                if (r % 16 == 0)
+                    at = r % (top + 100);
+                else
+                    at = (at + r % 2000) % (top + 100);
+                probe(at);
+            }
+            CHECK(checked > 20000);
+        });
+    }
+}
+
 int main()
 {
     return tst::runAll("cursor");

@@ -864,6 +864,10 @@ struct CursorImpl
     /// misses, and how many seeks to skip trying after a run of them.
     std::uint8_t hintMisses = 0;
     std::uint8_t hintSkip = 0;
+    /// The same for seeks that start from a branch page of the cursor's path
+    /// (b_tree.cpp, seekFromPath).
+    std::uint8_t pathMisses = 0;
+    std::uint8_t pathSkip = 0;
 
     Tree& tree() const
     {
