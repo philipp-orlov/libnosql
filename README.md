@@ -371,7 +371,7 @@ when the tree shape changes underneath them.
 
 | mode | on commit | after a process crash | after power loss |
 |---|---|---|---|
-| `Durability::Safe` (default) | flush data, write meta, flush meta | last commit intact | last commit intact |
+| `Durability::Safe` (default) | write data and meta, flush once (`sealedCommits()`, the default); with `sealedCommits(false)`, or for a commit too wide to seal: flush data, write meta, flush meta | last commit intact | last commit intact |
 | `Durability::NoMetaSync` | flush data, write meta | last commit intact | consistent, may lose recent commits |
 | `Durability::Lazy` | nothing, but a commit at least `syncInterval` after the last sync syncs | opens on the last sync | opens on the last sync |
 | `Durability::None` | nothing; only `Env::sync()` and closing sync | opens on the last sync | opens on the last sync |
@@ -379,7 +379,11 @@ when the tree shape changes underneath them.
 Every mode is *consistent* — the store always opens on some committed
 snapshot, never on a half-written one, after a process crash and after a power
 loss alike. The modes differ only in how many recent commits a crash can take
-with it. Under `Lazy` and `None` the newest meta lives in memory until a sync:
+with it. A sealed `Safe` commit's meta page lists the pages the commit wrote,
+and a store being opened takes that meta only if they are all in the file, so
+one flush is as safe against a power cut as two (`docs/design.md`, "Sealed
+commits"; what it means for a page damaged later is in `docs/limitations.md`).
+Under `Lazy` and `None` the newest meta lives in memory until a sync:
 flush the data, write the meta, flush its page. `Lazy` is group commit: two
 device flushes per interval however many commits land in it. Nothing syncs on a
 timer, so call `Env::sync()` on an idle `Lazy` store to bound what a crash can

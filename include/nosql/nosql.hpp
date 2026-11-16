@@ -119,8 +119,10 @@ enum class PutMode
 /// file stays within about twice the data the last sync held.
 enum class Durability
 {
-    Safe = 0,    ///< flush data, then the meta page, on every commit:
-                 ///< nothing committed is ever lost
+    Safe = 0,    ///< every commit is on stable storage when it returns:
+                 ///< nothing committed is ever lost. One flush of data and
+                 ///< meta together with Options::sealedCommits() (the
+                 ///< default), else data, then the meta page
     NoMetaSync,  ///< flush data on every commit, the meta page with the next
                  ///< one: a crash may lose the last commit
     None,        ///< flush only on Env::sync() and when the store closes; a
