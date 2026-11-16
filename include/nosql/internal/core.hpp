@@ -229,6 +229,18 @@ struct EnvImpl
         const std::size_t w = std::size_t(p / 64);
         return w < born.size() && ((born[w] >> (p % 64)) & 1u);
     }
+    /// Writer only: where the free-tree scan of the commit that produced snapshot `commit` stopped
+    /// finding anything it could reuse. Under Lazy and None the entries a sync holds back sit
+    /// ahead of the ones a commit may take; without this every commit would walk all of them
+    /// again. It holds while the next writer builds on that commit with the same bounds: `from`
+    /// on, entries are examined as before; between `oldest` and `from` none is reusable.
+    struct ReclaimSkip
+    {
+        Identity commit{};
+        TxnId oldest = 0, epoch = 0;
+        std::pair<TxnId, std::uint64_t> from{0, 0};
+        bool valid = false;
+    } reclaimSkip;
     /// The one-run page list a whole-store data flush passes to os::flushData.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> syncRuns;
 
@@ -417,6 +429,9 @@ struct TxnImpl
     bool broken = false;
 
     TxnId txnid = 0;
+    /// A free-list chunk: the transaction that retired its pages, and its
+    /// number within that transaction's entries.
+    using GcKey = std::pair<TxnId, std::uint64_t>;
     std::shared_ptr<MappedRegion> region;
     /// Root write transaction only: mappings this transaction tree moved off
     /// after a growth that had to remap. Slices and page pointers taken
@@ -482,10 +497,6 @@ struct TxnImpl
     std::vector<DbSlot> dbs;
     std::vector<std::string> spareNames;  ///< see resizeDbs
 
-    /// A free-list chunk: the transaction that retired its pages, and its
-    /// number within that transaction's entries.
-    using GcKey = std::pair<TxnId, std::uint64_t>;
-
     /// Free-list update scratch, kept here so a commit reuses its capacity.
     std::vector<GcKey> gcKeys;
     std::vector<PageNo> gcRemainder;  ///< updateFreelist scratch, kept between commits
@@ -504,6 +515,9 @@ struct TxnImpl
     std::vector<GcKey> consumed;  ///< GC chunks absorbed into `reclaim`
     TxnId reclaimNext = 0;        ///< scan cursor into the GC tree ...
     std::uint64_t reclaimNextChunk = 0;  ///< ... and the chunk to resume at
+    /// No entry above `oldest` and below this is reusable by this transaction, other than
+    /// those it absorbed (EnvImpl::reclaimSkip); the scan jumps to it.
+    GcKey reclaimSkip{0, 0};
     TxnId oldest = 0;             ///< newest GC key we may touch
     /// Lazy and None: newest GC key readers alone allow, and the durable
     /// commit that exempt chunks must name to be reusable up to it.

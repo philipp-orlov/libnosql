@@ -277,6 +277,13 @@ Txn Env::beginWriter()
         t->owned.reserve(16);
         t->loose.reserve(16);
         t->txnid = t->meta.txnid + 1;
+        // Writer only, like the bitmap above: where the last commit's scan of the free tree
+        // found nothing more to take, if this transaction scans under the same bounds.
+        const EnvImpl::ReclaimSkip& skip = e->reclaimSkip;
+        t->reclaimSkip = skip.valid && skip.commit == t->meta.commitId && skip.oldest == t->oldest &&
+                                 skip.epoch == t->exemptEpoch
+                             ? skip.from
+                             : TxnImpl::GcKey(0, 0);
     } catch (...) {
         e->writersPending.fetch_sub(1, std::memory_order_relaxed);
         e->writeMtx.unlock();

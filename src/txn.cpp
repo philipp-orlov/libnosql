@@ -126,6 +126,7 @@ void TxnImpl::reset()
     reclaimPos = 0;
     reclaimNext = 0;
     reclaimNextChunk = 0;
+    reclaimSkip = {0, 0};
     oldest = 0;
     readersOldest = 0;
     exemptEpoch = 0;
@@ -314,6 +315,15 @@ bool reclaimMore(TxnImpl* t)
     }
     TxnId key;
     std::uint64_t chunk;
+    // The entry after (k, ch) in key order.
+    const auto after = [](TxnId k, std::uint64_t ch) {
+        return ch == ~std::uint64_t(0) ? TxnImpl::GcKey(k + 1, 0) : TxnImpl::GcKey(k, ch + 1);
+    };
+    // Everything the scan passes over is above `oldest` and waits for a sync or
+    // for another durable commit's epoch; the next scan under the same bounds
+    // starts where this one stops (EnvImpl::reclaimSkip).
+    const auto passedTo = [t](TxnImpl::GcKey to) { t->reclaimSkip = std::max(t->reclaimSkip, to); };
+    bool jumped = false;
     for (;;) {
         const Slice k = cursorKey(c);
         if (k.size() != kFreeKeyBytes)
@@ -321,17 +331,29 @@ bool reclaimMore(TxnImpl* t)
         key = freeKeyTxn(k);
         chunk = freeKeyChunk(k);
         if (key > t->readersOldest) {
+            passedTo({key, chunk});
             t->reclaimDrained = true;
             return false;
         }
         if (reclaimable(t, key, chunk))
             break;
         // Waits for the next sync; this transaction passes over it.
+        if (!jumped && TxnImpl::GcKey(key, chunk) < t->reclaimSkip) {
+            jumped = true;
+            if (!cursorSeek(c, freeKey(t->reclaimSkip.first, t->reclaimSkip.second).slice())) {
+                t->reclaimDrained = true;
+                return false;
+            }
+            continue;
+        }
         if (!cursorNext(c)) {
+            passedTo(after(key, chunk));
             t->reclaimDrained = true;
             return false;
         }
     }
+    if (key > t->oldest)
+        passedTo(after(key, chunk));
     const Slice v = cursorValue(c);
     std::size_t n = 0;
     const std::size_t joined = t->reclaim.size();
@@ -883,6 +905,11 @@ void publishToReadersLocked(EnvImpl& e, const Meta& m)
 void publishToWritersLocked(EnvImpl& e, TxnImpl* t, const Meta& m)
 {
     e.writerMeta = m;
+    e.reclaimSkip.commit = m.commitId;
+    e.reclaimSkip.oldest = t->oldest;
+    e.reclaimSkip.epoch = t->exemptEpoch;
+    e.reclaimSkip.from = t->reclaimSkip;
+    e.reclaimSkip.valid = true;
     e.carryOver.swap(t->carryNext);
     e.freeTreePages = std::uint64_t(std::int64_t(e.freeTreePages) + t->freeTreeDelta);
     e.occLog.record(m.txnid, t->occTrack && !t->occUnknown ? &t->occWritten : nullptr);

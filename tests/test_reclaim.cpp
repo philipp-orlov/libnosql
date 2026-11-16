@@ -407,6 +407,57 @@ TEST(dropReturnsEveryPage)
     e.read([&](Txn& t) { checkIntegrity(t); });
 }
 
+/// Under None and Lazy a commit's scan of the free tree starts where the last one stopped
+/// finding anything (EnvImpl::reclaimSkip). What it skipped must be found again once a sync or
+/// a departing reader makes it reusable, and an aborted transaction must not move the mark.
+TEST(skippedFreeEntriesAreReusedOnceASyncReleasesThem)
+{
+    tst::Scratch s("reclaim");
+    Env e = Env::configure().pageSize(1024).maxSize(1ull << 30).sync(Durability::None).open(s.file());
+    const int keys = 3000;
+    std::vector<int> version(keys, 0);
+    e.write([&](Txn& t) {
+        auto d = t.mainDb();
+        for (int i = 0; i < keys; ++i)
+            d.put(tst::keyOf(i), tst::blob(60, i));
+    });
+    e.sync();
+    std::mt19937_64 rng(11);
+    const auto churn = [&](int commits) {
+        for (int n = 0; n < commits; ++n) {
+            const int k = int(rng() % keys);
+            if (n % 7 == 3) {
+                // Takes pages from the free list, then gives everything back.
+                Txn t = e.writeTxn();
+                for (int j = 0; j < 20; ++j)
+                    t.mainDb().put(tst::keyOf((k + j) % keys), tst::blob(60, 999));
+                t.abort();
+                continue;
+            }
+            Txn held = n % 500 == 100 ? e.readTxn() : Txn();
+            for (int extra = 0; extra < (n % 500 == 100 ? 20 : 1); ++extra) {
+                const int kk = (k + extra) % keys;
+                e.write([&](Txn& t) { t.mainDb().put(tst::keyOf(kk), tst::blob(60, ++version[kk] * keys + kk)); });
+            }
+        }
+    };
+    churn(4000);
+    const std::uint64_t settled = e.stats().usedPages;
+    // Each round the sync releases what the scans had been passing over; if a scan kept
+    // skipping it the file would have to grow by about that much every round.
+    for (int round = 0; round < 6; ++round) {
+        e.sync();
+        churn(4000);
+    }
+    CHECK(e.stats().usedPages < settled + settled / 4);
+    e.read([&](Txn& t) {
+        checkIntegrity(t);
+        auto d = t.mainDb();
+        for (int i = 0; i < keys; ++i)
+            CHECK(d.get(tst::keyOf(i)).value() == Slice(tst::blob(60, version[i] ? version[i] * keys + i : i)));
+    });
+}
+
 int main()
 {
     return tst::runAll("reclaim");
