@@ -353,7 +353,10 @@ nanoseconds. A seek that lands in the leaf the cursor is already on is
 answered there, without descending from the root -- keep the cursor
 (`Cursor::boundTo(db)` says whether it still reads `db` in a live transaction)
 and a run of nearby lookups gets cheaper; a cursor whose seeks keep missing
-stops trying for a while.
+stops trying for a while. In a read transaction a seek that misses the leaf
+but lands under a branch page of the cursor's path starts from that page
+instead of the root, so lookups in key order that are a few leaves apart skip
+the levels above it.
 
 Every branch slot records how many entries lie under it, so
 `Db::countRange(lo, hi)` counts a key range and `Cursor::skip(n)` moves `n`
