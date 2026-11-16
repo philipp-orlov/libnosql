@@ -195,6 +195,49 @@ Pooled transactions clear all snapshot state before reuse. Cursors track structu
 mutation and re-seek their anchor when necessary. Single-shot lookups avoid that
 anchor bookkeeping.
 
+### Read transactions without the lock
+
+A caller that opens a read transaction per request from many threads used to take the store's
+mutex twice per transaction, and to move two shared reference counts; sixteen threads together
+did a third of what one did alone (0.6 against 1.8 million transactions a second). A read
+transaction now begins and ends without the mutex where it can (`EnvImpl::readerSlots`,
+`Env::readTxn`, `finishReader`):
+
+* **Snapshots readers may take** are kept in a small ring, `EnvImpl::published`: the meta and
+  the mapping to read it through. `publishSnapshotLocked()` writes the next one into an entry
+  that is neither the newest nor named by a slot, and then stores its word (a publication
+  count and the entry's index) into the atomic `pubWord`.
+* **A reader** claims one of 64 slots, loads `pubWord`, stores it into its slot, and loads
+  `pubWord` again. Unchanged, the snapshot is its own: the entry cannot be rewritten while the
+  slot names it. Changed, it tries again.
+* **Writers and statistics** ask `liveReaders()`, under the mutex as before, which counts the
+  slots as well as the readers registered under the mutex.
+* **Why no page a reader needs is reused.** A writer takes its reclamation bounds under the
+  mutex: from the readers it sees, or else from the newest published snapshot. A reader pins
+  only a snapshot it found still newest *after* writing its slot. With both stores and loads
+  sequentially consistent, either the writer saw the slot, or the reader's snapshot is no older
+  than the one the writer took its bounds from; a page retired by a commit at or before that
+  snapshot is not one the snapshot names.
+* **The transaction object** stays with the slot between transactions and holds a reference to
+  the store (`TxnImpl::envKeep`); the transaction's handles share ownership of the object, so
+  beginning and ending one touches no count other threads share. That is a cycle, which
+  `dropIdleReaderObjects()` breaks: `Env` handles are counted (`EnvImpl::handles`), the last
+  one to go lets the idle slots' objects go, and a reader that ends after it does the same.
+  The store therefore still closes with the last handle or the last transaction handle,
+  whichever is later (`storeClosesWithTheLastHandleOrTheLastReaderWhicheverIsLater`).
+* **The fallback** is the old path, unchanged: with all slots taken, or with no ring entry to
+  be had, a reader registers under the mutex in `EnvImpl::readers`.
+
+Measured with a 200,000-key store and the read cache on, one random get per transaction:
+
+| threads | before, million txn/s | after |
+|--:|--:|--:|
+| 1 | 1.81 | 2.00 |
+| 2 | 0.76 | 3.97 |
+| 4 | 0.83 | 8.27 |
+| 8 | 0.70 | 17.2 |
+| 16 | 0.60 | 29.8 |
+
 The id of the newest published commit is mirrored into an atomic
 (`Env::commitGeneration()`), and `Env::waitForCommit(seen, timeout)` blocks on the
 metadata mutex, never on the writer mutex, until it changes. The commit path
@@ -474,6 +517,9 @@ bitmap. Cleanup keeps capacities that fit and releases the rest without new
 allocations. This avoids repeatedly discarding useful buffers at an arbitrary
 element count. The 8 pooled transactions can retain at most 16 MiB of this
 scratch; active or externally retained handles can add transaction objects.
+A reader slot keeps one transaction object as well; a read transaction fills none of that
+scratch, so such an object stays near its bare size. The ring of published snapshots holds up
+to 66 metas of 1 KiB, allocated as readers pin older ones.
 Named-database slots, arena chunks, mappings and OS cache remain separate costs.
 
 `tests/test_memory.cpp` replaces ordinary C++ allocation operators and, in Linux

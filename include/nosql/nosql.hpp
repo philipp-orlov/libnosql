@@ -702,7 +702,7 @@ public:
 
     Env() noexcept = default;
     Env(Env&&) noexcept = default;
-    Env& operator=(Env&&) noexcept = default;
+    Env& operator=(Env&& other) noexcept;
     Env(const Env&) = delete;
     Env& operator=(const Env&) = delete;
     ~Env();
@@ -814,7 +814,8 @@ private:
     friend class Options;
     friend class Txn;
     friend class OptimisticTxn;  // commit publishes the keys it wrote
-    explicit Env(std::shared_ptr<internal::EnvImpl> e) noexcept : impl_(std::move(e)) {}
+    explicit Env(std::shared_ptr<internal::EnvImpl> e) noexcept;
+    void release() noexcept;  // gives this handle's share of the store back
     /// Shared so that a transaction (and any handle it produced) keeps the file
     /// and its mapping alive even if the `Env` object is destroyed first.
     std::shared_ptr<internal::EnvImpl> impl_;

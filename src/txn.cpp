@@ -119,6 +119,7 @@ void TxnImpl::reset()
     env = nullptr;
     readOnly = false;
     finished = false;
+    readerSlot = -1;
     broken = false;
     txnid = 0;
     lastPgno = 0;
@@ -898,6 +899,7 @@ void syncTo(EnvImpl& e, const os::Mapping& view, const Meta& m)
 void publishToReadersLocked(EnvImpl& e, const Meta& m)
 {
     e.meta = m;
+    e.publishSnapshotLocked();
     e.commitGen.store(m.txnid, std::memory_order_release);
 }
 
@@ -917,7 +919,8 @@ void publishToWritersLocked(EnvImpl& e, TxnImpl* t, const Meta& m)
     // commit's, is at or after the oldest one held, and a new one starts at
     // the newest readers may see; entries at or before that can no longer
     // conflict with anything.
-    TxnId oldest = e.readers.empty() ? TxnId(e.meta.txnid) : TxnId(e.readers.front().first);
+    const EnvImpl::LiveReaders live = e.liveReaders();
+    TxnId oldest = live.count ? live.oldest : TxnId(e.meta.txnid);
     if (!e.occPins.empty())
         oldest = std::min(oldest, TxnId(e.occPins.front().first));
     e.occLog.trim(oldest);
@@ -1187,6 +1190,19 @@ void finishReader(TxnImpl* t)
 {
     EnvImpl* e = t->env;
     t->region.reset();
+    if (t->readerSlot >= 0) {
+        // Registered without the lock, and gone without it: the slot is free once
+        // nothing of the snapshot is read any more. A mapping a growth replaced waits
+        // for the next transaction that ends under the lock.
+        EnvImpl::ReaderSlot& slot = e->readerSlots[t->readerSlot];
+        t->readerSlot = -1;
+        finish(t);
+        slot.pin.store(0, std::memory_order_seq_cst);
+        // The last handle went while this ran, and passed over the slot.
+        if (e->handles.load(std::memory_order_seq_cst) == 0)
+            e->dropIdleReaderObjects();
+        return;
+    }
     std::lock_guard<std::mutex> lk(e->mtx);
     e->readerRelease(t->txnid);
     e->releaseStaleRegions();
@@ -1328,14 +1344,15 @@ void reportReaderLag(EnvImpl& e)
     ReaderLag lag;
     {
         std::lock_guard<std::mutex> lk(e.mtx);
-        if (e.readerSince.empty() || e.readers.empty() || e.readers.front().first >= e.meta.txnid)
+        const EnvImpl::LiveReaders live = e.liveReaders();
+        if (!live.count || live.oldest >= e.meta.txnid)
             return;
-        if (now - e.readerSince.front().second < e.lagAgeNs)
+        if (now - live.since < e.lagAgeNs)
             return;
         if (now - e.lagLastNs.load(std::memory_order_relaxed) < e.lagIntervalNs)
             return;
-        lag.snapshot = e.readers.front().first;
-        lag.ageMs = std::uint64_t((now - e.readerSince.front().second) / 1000000);
+        lag.snapshot = live.oldest;
+        lag.ageMs = std::uint64_t((now - live.since) / 1000000);
         lag.pinnedPages = e.carryOver.size() + e.writerMeta.inlineCount + e.freeTreePages;
         lag.fileSize = e.region->m.size;
         e.lagLastNs.store(now, std::memory_order_relaxed);

@@ -87,6 +87,7 @@ EnvImpl::~EnvImpl()
     // Pooled transactions hand their buffers back to `buffers`, so they must go
     // first. Any still referenced by a stray handle simply outlives the pool.
     txnPool.clear();
+    readerSlots.reset();
     buffers.purge();
     staleRegions.clear();
     region.reset();
@@ -155,9 +156,119 @@ void backgroundSyncLoop(EnvImpl* e)
 TxnId EnvImpl::oldestSnapshot() const
 {
     const TxnId durable = std::min<TxnId>(durableTxn, writerMeta.txnid);
-    if (readers.empty())
+    const LiveReaders live = liveReaders();
+    if (!live.count)
         return durable;
-    return std::min<TxnId>(readers.front().first, durable);
+    return std::min<TxnId>(live.oldest, durable);
+}
+
+EnvImpl::LiveReaders EnvImpl::liveReaders() const
+{
+    LiveReaders live;
+    for (const auto& r : readers)
+        live.count += r.second;
+    if (!readers.empty()) {
+        live.oldest = readers.front().first;
+        live.since = readerSince.empty() ? 0 : readerSince.front().second;
+    }
+    const unsigned used = readerSlots ? readerSlotsUsed.load(std::memory_order_seq_cst) : 0;
+    for (unsigned i = 0; i < used; ++i) {
+        const std::uint64_t word = readerSlots[i].pin.load(std::memory_order_seq_cst);
+        if (word <= 1)
+            continue;
+        // A word its entry no longer carries was written by a reader that has yet to
+        // find out the snapshot moved on; it reads nothing and will try again.
+        const Published* entry = published[word & 0xff].get();
+        if (!entry || entry->word != word)
+            continue;
+        const TxnId id = entry->meta.txnid;
+        const std::int64_t began = readerSlots[i].since.load(std::memory_order_relaxed);
+        if (!live.count || id < live.oldest) {
+            live.oldest = id;
+            live.since = began;
+        } else if (id == live.oldest && began < live.since) {
+            live.since = began;
+        }
+        ++live.count;
+    }
+    return live;
+}
+
+void EnvImpl::publishSnapshotLocked() noexcept
+{
+    if (!readerSlots)
+        return;
+    const std::uint64_t current = pubWord.load(std::memory_order_seq_cst);
+    const unsigned used = readerSlotsUsed.load(std::memory_order_seq_cst);
+    const auto pinned = [&](std::uint64_t word) {
+        for (unsigned i = 0; i < used; ++i)
+            if (readerSlots[i].pin.load(std::memory_order_seq_cst) == word)
+                return true;
+        return false;
+    };
+    for (unsigned i = 0; i < kPublished; ++i) {
+        if (current && (current & 0xff) == i)
+            continue;
+        if (!published[i]) {
+            try {
+                published[i] = std::make_unique<Published>();
+            } catch (const std::bad_alloc&) {
+                break;
+            }
+        } else if (pinned(published[i]->word)) {
+            continue;
+        }
+        Published& entry = *published[i];
+        entry.meta = meta;
+        entry.region = region;
+        entry.word = (++pubCount << 8) | i;
+        pubWord.store(entry.word, std::memory_order_seq_cst);
+        return;
+    }
+    // No entry to be had: what readers would take is out of date, so they must not.
+    pubWord.store(0, std::memory_order_seq_cst);
+}
+
+void EnvImpl::dropIdleReaderObjects() noexcept
+{
+    if (!readerSlots)
+        return;
+    const unsigned used = readerSlotsUsed.load(std::memory_order_seq_cst);
+    for (unsigned i = 0; i < used; ++i) {
+        std::uint64_t expected = 0;
+        if (!readerSlots[i].pin.compare_exchange_strong(expected, 1, std::memory_order_seq_cst))
+            continue;  // in use: its reader does this when it ends
+        // Out of the slot before it goes: letting go of the last reference to the store
+        // from inside the slot would destroy the slot under its own member.
+        std::shared_ptr<TxnImpl> gone = std::move(readerSlots[i].txn);
+        readerSlots[i].pin.store(0, std::memory_order_seq_cst);
+    }
+}
+
+EnvImpl::ReaderSlot* EnvImpl::claimReaderSlot(int& index) noexcept
+{
+    if (!readerSlots)
+        return nullptr;
+    // A thread comes back to the slot it used last: its transaction object is there, and
+    // the slot's cache line is already this core's.
+    static thread_local unsigned hint = 0;
+    const auto take = [&](unsigned i) {
+        std::uint64_t expected = 0;
+        return readerSlots[i].pin.load(std::memory_order_relaxed) == 0 &&
+               readerSlots[i].pin.compare_exchange_strong(expected, 1, std::memory_order_seq_cst);
+    };
+    unsigned i = hint < kReaderSlots ? hint : 0;
+    if (!take(i)) {
+        for (i = 0; i < kReaderSlots && !take(i); ++i) {}
+        if (i == kReaderSlots)
+            return nullptr;
+        hint = i;
+    }
+    unsigned used = readerSlotsUsed.load(std::memory_order_relaxed);
+    while (used <= i &&
+           !readerSlotsUsed.compare_exchange_weak(used, i + 1, std::memory_order_seq_cst)) {}
+    index = int(i);
+    return &readerSlots[i];
 }
 
 /// Reuse a pooled transaction object, or add one to the pool. A pooled entry
@@ -312,6 +423,7 @@ void EnvImpl::growLocked(std::uint64_t needed)
     // into the outgoing mapping, and readers hold whole snapshots of it.
     staleRegions.push_back(std::move(region));
     region = std::move(fresh);
+    publishSnapshotLocked();  // new readers map through the new one
 }
 
 /// Cut the file to `bytes` (Env::shrink()). A reserved mapping keeps its
@@ -331,12 +443,29 @@ void EnvImpl::shrinkLocked(std::uint64_t bytes)
     fresh->m = os::mapFile(fd, std::size_t(bytes), !readOnly);
     staleRegions.push_back(std::move(region));
     region = std::move(fresh);
+    publishSnapshotLocked();
 }
 
 /// Drop mappings nobody references any more. Safe only at a transaction
 /// boundary, where the last raw pointers into them have gone out of scope.
 void EnvImpl::releaseStaleRegions()
 {
+    if (staleRegions.empty())
+        return;
+    // Entries of the ring no reader is on keep the mapping they were published with.
+    if (readerSlots) {
+        const std::uint64_t current = pubWord.load(std::memory_order_seq_cst);
+        const unsigned used = readerSlotsUsed.load(std::memory_order_seq_cst);
+        for (auto& entry : published) {
+            if (!entry || entry->word == current || !entry->region)
+                continue;
+            bool pinned = false;
+            for (unsigned i = 0; i < used && !pinned; ++i)
+                pinned = readerSlots[i].pin.load(std::memory_order_seq_cst) == entry->word;
+            if (!pinned)
+                entry->region.reset();
+        }
+    }
     staleRegions.erase(
         std::remove_if(staleRegions.begin(), staleRegions.end(),
                        [](const std::shared_ptr<MappedRegion>& r) { return r.use_count() == 1; }),
@@ -581,6 +710,8 @@ Env Env::Options::open(const std::filesystem::path& path) const
     else
         loadMeta(*e);
     e->freeTreePages = countFreeTreePages(*e);
+    e->readerSlots = std::make_unique<EnvImpl::ReaderSlot[]>(EnvImpl::kReaderSlots);
+    e->publishSnapshotLocked();
     // A tail left by a growth that failed, or by a build without this check, may have no blocks behind it.
     if (!fresh && !readOnly_ && preallocate_) {
         const std::uint64_t used = (e->meta.lastPgno + 1) * std::uint64_t(ps);
@@ -607,11 +738,42 @@ Env Env::Options::open(const std::filesystem::path& path) const
     return Env(std::move(e));
 }
 
-Env::~Env() = default;
+// Handles are counted apart from the references transactions and their handles hold: when
+// the last one goes, the transaction objects idle reader slots keep, each with a reference
+// to the store of its own (TxnImpl::envKeep), are let go, so the store closes once the
+// transactions still running have ended.
+Env::Env(std::shared_ptr<internal::EnvImpl> e) noexcept : impl_(std::move(e))
+{
+    if (impl_)
+        impl_->handles.fetch_add(1, std::memory_order_seq_cst);
+}
+
+void Env::release() noexcept
+{
+    if (!impl_)
+        return;
+    if (impl_->handles.fetch_sub(1, std::memory_order_seq_cst) == 1)
+        impl_->dropIdleReaderObjects();
+    impl_.reset();
+}
+
+Env::~Env()
+{
+    release();
+}
+
+Env& Env::operator=(Env&& other) noexcept
+{
+    if (this != &other) {
+        release();
+        impl_ = std::move(other.impl_);
+    }
+    return *this;
+}
 
 void Env::close()
 {
-    impl_.reset();
+    release();
 }
 
 Env Env::share() const

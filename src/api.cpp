@@ -256,8 +256,8 @@ Txn Env::beginWriter()
             t->exemptEpoch = 0;
             if (e->deferredMeta()) {
                 const TxnId newest = e->writerMeta.txnid;
-                t->readersOldest =
-                    e->readers.empty() ? newest : std::min<TxnId>(e->readers.front().first, newest);
+                const EnvImpl::LiveReaders live = e->liveReaders();
+                t->readersOldest = live.count ? std::min<TxnId>(live.oldest, newest) : newest;
                 t->exemptEpoch = std::min<TxnId>(e->durableTxn, newest);
                 // A sync beside us is still making a newer commit durable: its pages stay put.
                 if (e->syncTarget > e->durableTxn)
@@ -315,10 +315,52 @@ Txn Env::readTxn()
         }
     }
     std::shared_ptr<TxnImpl> t;
+    // A request-per-transaction caller begins thousands of these a second from
+    // several threads: without the lock where a slot is free (EnvImpl::readerSlots).
+    int index = -1;
+    if (EnvImpl::ReaderSlot* slot = e->claimReaderSlot(index)) {
+        std::uint64_t word;
+        for (;;) {
+            word = e->pubWord.load(std::memory_order_seq_cst);
+            if (!word)
+                break;
+            slot->pin.store(word, std::memory_order_seq_cst);
+            // Still the newest: every writer from here on sees the slot, and none
+            // before took its bounds from a newer snapshot.
+            if (e->pubWord.load(std::memory_order_seq_cst) == word)
+                break;
+        }
+        if (word) {
+            try {
+                if (slot->txn && slot->txn.use_count() == 1)
+                    slot->txn->reset();
+                else
+                    slot->txn = std::make_shared<TxnImpl>();  // a handle outlived the last one
+            } catch (...) {
+                slot->pin.store(0, std::memory_order_seq_cst);
+                throw;
+            }
+            const EnvImpl::Published& snapshot = *e->published[word & 0xff];
+            t = slot->txn;
+            if (!t->envKeep)
+                t->envKeep = impl_;
+            t->env = e;
+            t->readOnly = true;
+            // The entry holds the mapping for as long as the slot names it: no count to share.
+            t->loadSnapshot(snapshot.meta, std::shared_ptr<MappedRegion>(std::shared_ptr<MappedRegion>(),
+                                                                         snapshot.region.get()));
+            t->readerSlot = index;
+            slot->since.store(now, std::memory_order_relaxed);
+            t->txnid = t->meta.txnid;
+            // The handle owns the transaction object, which owns the store.
+            std::shared_ptr<EnvImpl> env(t, e);
+            return Txn(std::move(env), std::move(t));
+        }
+        slot->pin.store(0, std::memory_order_seq_cst);
+    }
     {
         // One critical section for the pool, the snapshot and the reader
-        // table: a request-per-transaction caller begins thousands of these a
-        // second from several threads.
+        // table.
         std::lock_guard<std::mutex> lk(e->mtx);
         t = e->acquireTxnLocked();
         t->env = e;
@@ -342,11 +384,12 @@ EnvStats Env::stats() const
         s.mapSize = e->region->m.size;
         s.usedPages = e->meta.lastPgno + 1;
         s.lastTxn = e->meta.txnid;
-        s.readers = e->readerCount();
-        s.oldestReader = e->readers.empty() ? 0 : e->readers.front().first;
-        if (!e->readerSince.empty()) {
-            s.oldestReaderAgeMs = std::uint64_t(std::max<std::int64_t>(0, steadyNowNs() - e->readerSince.front().second) / 1000000);
-        }
+        const EnvImpl::LiveReaders live = e->liveReaders();
+        s.readers = live.count;
+        s.oldestReader = live.count ? live.oldest : 0;
+        if (live.count)
+            s.oldestReaderAgeMs =
+                std::uint64_t(std::max<std::int64_t>(0, steadyNowNs() - live.since) / 1000000);
         s.bufferBytes = e->buffers.retainedBytes();
         s.dirtyBytes = e->dirtyBytes.load();
         s.optimisticCommits = e->occInCommit.load(std::memory_order_relaxed);
@@ -362,7 +405,7 @@ EnvStats Env::stats() const
         // them), the free-list entry kept in the meta page, and the tree: all
         // of the commit writers build on, a pipelined one not yet durable too.
         s.freePages = e->carryOver.size() + e->writerMeta.inlineCount + e->freeTreePages;
-        if (!e->readers.empty() && e->readers.front().first < e->meta.txnid)
+        if (live.count && live.oldest < e->meta.txnid)
             s.pinnedPages = s.freePages;
     }
     return s;

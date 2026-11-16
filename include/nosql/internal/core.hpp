@@ -320,7 +320,72 @@ struct EnvImpl
     /// see TxnImpl::getPage and verifyBeforeCopy.
     bool writerCache = false;
 
-    /// Live read snapshots as a sorted (txnid, count) histogram; the front
+    // ---- read transactions that begin and end without `mtx` ----
+    //
+    // A reader opened per request from many threads otherwise takes `mtx` twice, and the
+    // threads spend their time handing it to each other. Instead a reader claims a slot,
+    // writes into it which published snapshot it reads, and checks that this is still the
+    // newest one. Everything that asks which snapshots are live looks at the slots as well
+    // as at `readers` (liveReaders), under `mtx` as before.
+    //
+    // Why a writer never reuses a page such a reader needs: a writer takes its bounds
+    // under `mtx` from the readers it sees, or else from the newest published snapshot,
+    // and a reader pins only a snapshot it found still newest after writing its slot.
+    // So either the writer saw the slot, or the reader's snapshot is no older than the one
+    // the writer took its bounds from. Both orders are sequentially consistent.
+
+    /// A snapshot readers may take, with the mapping to read it through. Entries are
+    /// written under `mtx` and only while nothing can read them: not the newest one, and
+    /// none a slot names.
+    struct Published
+    {
+        Meta meta{};
+        std::shared_ptr<MappedRegion> region;
+        std::uint64_t word = 0;  ///< what `pubWord` held while this was the newest
+    };
+    /// 0: free. 1: claimed, nothing pinned yet. Otherwise the `pubWord` of the entry of
+    /// `published` its reader is on, or is about to check it may be on.
+    struct alignas(64) ReaderSlot
+    {
+        std::atomic<std::uint64_t> pin{0};
+        std::atomic<std::int64_t> since{0};  ///< when its reader began (steady clock, ns)
+        /// The transaction object the slot's holder uses, kept for the next one.
+        std::shared_ptr<TxnImpl> txn;
+    };
+    static constexpr unsigned kReaderSlots = 64;
+    /// One per snapshot the slots can pin, the newest one, and one to write the next into.
+    static constexpr unsigned kPublished = kReaderSlots + 2;
+    std::unique_ptr<ReaderSlot[]> readerSlots;
+    /// Slots ever claimed are below this: what a scan has to look at.
+    std::atomic<unsigned> readerSlotsUsed{0};
+    std::array<std::unique_ptr<Published>, kPublished> published;
+    /// The newest entry of `published`: a count of publications above, its index in the
+    /// low byte. Zero while there is none, and readers then register under `mtx`.
+    std::atomic<std::uint64_t> pubWord{0};
+    std::uint64_t pubCount = 0;  // guarded by mtx
+    /// Makes `meta` and `region` what lock-free readers take. Caller holds mtx (or is
+    /// opening the store). Never throws: without memory for an entry, readers fall back
+    /// to `mtx` until a later call succeeds.
+    void publishSnapshotLocked() noexcept;
+    /// Public Env handles alive. Transactions keep the store alive too, but only a handle
+    /// can begin one.
+    std::atomic<unsigned> handles{0};
+    /// Lets go of the transaction objects idle slots keep. Called when the last handle
+    /// goes, and by a slot's reader that ends after that.
+    void dropIdleReaderObjects() noexcept;
+    /// A free slot, claimed, or null when all are taken.
+    ReaderSlot* claimReaderSlot(int& index) noexcept;
+    /// What is known of the live read transactions; caller holds mtx.
+    struct LiveReaders
+    {
+        unsigned count = 0;
+        TxnId oldest = 0;          ///< valid when count != 0
+        std::int64_t since = 0;    ///< when the first reader of `oldest` began
+    };
+    LiveReaders liveReaders() const;
+
+    /// Live read snapshots registered under `mtx` (the readers no slot was free for, and
+    /// every reader while `pubWord` is zero) as a sorted (txnid, count) histogram; the front
     /// entry is the one pinning reclamation. A sorted vector rather than a map
     /// because there are only ever a handful of distinct snapshots, and this
     /// way the table stops allocating after the first few transactions.
@@ -340,13 +405,6 @@ struct EnvImpl
     std::vector<std::pair<TxnId, unsigned>> occPins;
     void occPinAcquire(TxnId id);           // caller holds mtx
     void occPinRelease(TxnId id) noexcept;  // caller holds mtx
-    unsigned readerCount() const noexcept
-    {  // caller holds mtx
-        unsigned n = 0;
-        for (const auto& r : readers)
-            n += r.second;
-        return n;
-    }
 
     /// Transaction objects held for reuse. Beginning a transaction otherwise
     /// means a dozen small allocations for its containers; recycling the whole
@@ -428,6 +486,8 @@ struct TxnImpl
     std::array<RootSlot, 6> savedRoots{};
     bool readOnly = false;
     bool finished = false;
+    /// A read transaction registered in EnvImpl::readerSlots rather than under `mtx`.
+    int readerSlot = -1;
     /// A tree change threw part-way; the transaction can only be aborted.
     bool broken = false;
 
@@ -565,6 +625,12 @@ struct TxnImpl
     std::uint64_t seq = 1;
 
     ~TxnImpl();
+
+    /// Only in an object a reader slot keeps: the store, held from one transaction to the
+    /// next so that beginning one touches no reference count other threads share. The
+    /// transaction's handles share ownership of this object instead (Env::readTxn).
+    /// EnvImpl::dropIdleReaderObjects() breaks the cycle this makes.
+    std::shared_ptr<EnvImpl> envKeep;
 
     /// Give back everything heavy once the transaction is over. Handles that
     /// outlive it keep only a husk, enough to report ErrorCode::BadTransaction.

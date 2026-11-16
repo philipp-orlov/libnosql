@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <atomic>
 #include <mutex>
+#include <optional>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -375,6 +377,170 @@ TEST(smallCommitsKeepTheirFreeListInTheMetaPage)
 TEST(smallCommitsAfterLargeOnesStayConsistent)
 {
     smallCommitWorkload(true);
+}
+
+/// Read transactions opened per request register without the store's lock (EnvImpl::readerSlots).
+/// A writer that reuses pages as fast as it may must still never take one a reader is on: every
+/// reader sees one whole commit, whether it looks once or holds its snapshot across many commits.
+TEST(readersPerRequestSeeWholeCommitsWhileTheWriterReusesPages)
+{
+    tst::Scratch s("mvcc-slots");
+    Env e = Env::configure().pageSize(1024).sync(Durability::None).open(s.file());
+    const int keys = 300;
+    const auto fill = [&](std::uint64_t generation) {
+        e.write([&](Txn& t) {
+            auto d = t.mainDb();
+            for (int i = 0; i < keys; ++i)
+                d.put(tst::keyOf(i), std::to_string(generation) + ":" + tst::blob(40, generation));
+        });
+    };
+    fill(1);
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> newest{1}, looks{0};
+    std::atomic<unsigned> torn{0};
+    // One whole commit: every key there, all of one generation, none older than `floor`.
+    const auto look = [&](Txn& t, std::uint64_t floor, std::uint64_t* seen) {
+        std::string first;
+        int n = 0;
+        for (auto [k, v] : t.mainDb().all()) {
+            if (n++ == 0)
+                first = v.string();
+            else if (v.string() != first)
+                ++torn;
+        }
+        const std::uint64_t generation = first.empty() ? 0 : std::stoull(first);
+        if (n != keys || generation < floor || (*seen && generation != *seen))
+            ++torn;
+        *seen = generation;
+        ++looks;
+    };
+    std::vector<std::thread> readers;
+    for (int r = 0; r < 12; ++r)
+        readers.emplace_back([&, r] {
+            try {
+                while (!stop.load()) {
+                    const std::uint64_t floor = newest.load();
+                    Txn t = e.readTxn();
+                    std::uint64_t seen = 0;
+                    look(t, floor, &seen);
+                    // Every third reader stays on its snapshot while the writer goes on.
+                    for (int again = 0; r % 3 == 0 && again < 20 && !stop.load(); ++again) {
+                        std::this_thread::yield();
+                        look(t, floor, &seen);
+                    }
+                }
+            } catch (const std::exception&) {
+                ++torn;  // a page reused under a reader fails its checksum
+            }
+        });
+    for (std::uint64_t generation = 2; generation < 1500; ++generation) {
+        fill(generation);
+        newest.store(generation);
+    }
+    stop.store(true);
+    for (auto& t : readers)
+        t.join();
+    CHECK_EQ(torn.load(), 0u);
+    CHECK(looks.load() > 100);
+    CHECK_EQ(e.stats().readers, 0u);
+    e.read([](Txn& t) { checkIntegrity(t); });
+}
+
+/// More read transactions at once than there are slots: the rest register under the lock, and
+/// the store counts and protects both kinds alike.
+TEST(moreReadersThanSlotsAreCountedAndProtected)
+{
+    tst::Scratch s("mvcc-slots");
+    Env e = Env::configure().pageSize(1024).sync(Durability::None).open(s.file());
+    std::vector<Txn> held;
+    for (int i = 0; i < 150; ++i) {
+        e.write([&](Txn& t) {
+            for (int k = 0; k < 40; ++k)
+                t.mainDb().put(tst::keyOf(k), std::to_string(i));
+        });
+        held.push_back(e.readTxn());
+        CHECK_EQ(e.stats().readers, std::uint64_t(i + 1));
+        CHECK_EQ(e.stats().oldestReader, held.front().id());
+    }
+    for (int i = 0; i < 150; ++i)
+        for (int k = 0; k < 40; ++k)
+            CHECK_EQ(held[i].mainDb().at(tst::keyOf(k)).string(), std::to_string(i));
+    // Ended oldest first: the oldest reader the store reports moves with them.
+    for (int i = 0; i < 150; ++i) {
+        CHECK_EQ(e.stats().oldestReader, held[i].id());
+        held[i].abort();
+        CHECK_EQ(e.stats().readers, std::uint64_t(149 - i));
+    }
+    const std::uint64_t used = e.stats().usedPages;
+    for (int i = 0; i < 300; ++i)
+        e.write([&](Txn& t) {
+            for (int k = 0; k < 40; ++k)
+                t.mainDb().put(tst::keyOf(k), std::to_string(i));
+        });
+    CHECK(e.stats().usedPages <= used + 16);  // what the readers held back is reused
+    e.read([](Txn& t) { checkIntegrity(t); });
+}
+
+/// A read transaction, or a handle left over from one, keeps the store open after the last Env
+/// handle; the store closes when the last of them goes, although reader slots keep transaction
+/// objects, each with a reference to the store, from one transaction to the next.
+TEST(storeClosesWithTheLastHandleOrTheLastReaderWhicheverIsLater)
+{
+    tst::Scratch s("mvcc-slots");
+    const auto isOpen = [&] {
+        try {
+            Env second = Env::configure().open(s.file());
+            return false;
+        } catch (const Error& err) {
+            CHECK(err.code() == ErrorCode::Busy);
+            return true;
+        }
+    };
+    {
+        Env e = Env::configure().open(s.file());
+        e.write([](Txn& t) { t.mainDb().put("k", "v"); });
+        for (int i = 0; i < 10; ++i)
+            e.read([](Txn& t) { CHECK(t.mainDb().contains("k")); });
+        CHECK(isOpen());
+    }
+    CHECK(!isOpen());  // idle slots held nothing back
+    {
+        Env e = Env::configure().open(s.file());
+        Txn reader = e.readTxn();
+        Env other = e.share();
+        e.close();
+        CHECK(isOpen());
+        other.close();
+        CHECK(isOpen());  // the reader alone
+        CHECK_EQ(reader.mainDb().at("k").string(), std::string("v"));
+        reader.abort();
+        CHECK(!isOpen());
+    }
+    {
+        Env e = Env::configure().open(s.file());
+        std::optional<Db> stray;
+        {
+            Txn reader = e.readTxn();
+            stray = reader.mainDb();
+        }
+        e.read([](Txn& t) { CHECK(t.mainDb().contains("k")); });  // the slot takes a new object
+        e = Env();
+        CHECK(isOpen());  // the stray handle alone
+        CHECK_THROWS(stray->get("k"), ErrorCode::BadTransaction);
+        stray.reset();
+        CHECK(!isOpen());
+    }
+    {
+        // A reader on another thread ends while the last handle goes.
+        for (int round = 0; round < 200; ++round) {
+            Env e = Env::configure().open(s.file());
+            Txn reader = e.readTxn();
+            std::thread ender([r = std::move(reader)]() mutable { r.abort(); });
+            e.close();
+            ender.join();
+            CHECK(!isOpen());
+        }
+    }
 }
 
 int main()
